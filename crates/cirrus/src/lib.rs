@@ -538,7 +538,11 @@ impl Cirrus {
             let result: CirrusResult<T> = loop {
                 let request = make_request(&token)?;
 
-                match request.send().await {
+                // Both a request that never got a response and a
+                // response whose body dies mid-stream are transport
+                // failures with the same ambiguity, so they share one
+                // retry decision below.
+                let transport_error: CirrusError = match request.send().await {
                     Ok(response) => {
                         let status = response.status().as_u16();
                         let headers = response.headers().clone();
@@ -564,26 +568,25 @@ impl Cirrus {
 
                         match response.bytes().await {
                             Ok(bytes) => break parse(status, headers, bytes),
-                            Err(e) => break Err(e.into()),
+                            Err(e) => e.into(),
                         }
                     }
-                    Err(e) => {
-                        let err: CirrusError = e.into();
-                        if retry::should_retry_network(
-                            &self.retry_policy,
-                            method,
-                            replay,
-                            &err,
-                            attempt,
-                        ) {
-                            let delay = retry::compute_delay(&self.retry_policy, attempt, None);
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue;
-                        }
-                        break Err(err);
-                    }
+                    Err(e) => e.into(),
+                };
+
+                if retry::should_retry_network(
+                    &self.retry_policy,
+                    method,
+                    replay,
+                    &transport_error,
+                    attempt,
+                ) {
+                    let delay = retry::compute_delay(&self.retry_policy, attempt, None);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
                 }
+                break Err(transport_error);
             };
 
             // 401 → invalidate the cached token and try once more with
@@ -1533,6 +1536,46 @@ mod tests {
             let sf = fixture_with_policy(server.uri(), RetryPolicy::none());
             let err = sf.get::<Value>("limits").await.unwrap_err();
             assert!(matches!(err, CirrusError::Api { status: 429, .. }));
+        }
+
+        #[tokio::test]
+        async fn retries_a_response_body_that_stops_mid_stream() {
+            // wiremock always sends a complete body, so this serves the
+            // truncated response from a raw socket: headers promising 40
+            // bytes, 5 bytes of body, then a hang-up. Replaying the GET
+            // is safe, and the retry budget is untouched at that point.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"ok\"",
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+                drop(sock);
+
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let sf = fixture_with_policy(format!("http://{addr}"), fast_retry_policy());
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+            server.await.unwrap();
         }
 
         #[tokio::test]
