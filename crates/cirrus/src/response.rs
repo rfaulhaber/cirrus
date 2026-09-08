@@ -295,8 +295,8 @@ pub enum BulkJobState {
     JobComplete,
     /// Job was aborted by the caller or an admin.
     Aborted,
-    /// Job failed at the platform level. For query jobs, see
-    /// [`BulkQueryJob::error_message`] for the reason.
+    /// Job failed at the platform level. For ingest jobs, see
+    /// [`BulkIngestJob::error_message`] for the reason.
     Failed,
 }
 
@@ -491,8 +491,15 @@ pub struct BulkQueryJob {
     /// Populated on GET responses only (not CREATE).
     #[serde(rename = "isPkChunkingSupported", default)]
     pub is_pk_chunking_supported: Option<bool>,
-    /// Error message for jobs in `Failed` state. `None` for healthy
-    /// jobs.
+    /// Error message accompanying a `Failed` job, when the response
+    /// carries one. `None` otherwise — including on healthy jobs.
+    //
+    // Wire-shape provenance (api_asynch doc page IDs): unlike the ingest
+    // side, `query_get_one_job` lists no `errorMessage` in its response
+    // parameters and neither of its example bodies contains one. The
+    // field is modelled as always-optional so a query job that does
+    // carry it stays readable; callers must not treat its absence as
+    // meaningful.
     #[serde(rename = "errorMessage", default)]
     pub error_message: Option<String>,
 }
@@ -1591,6 +1598,11 @@ mod tests {
 
     #[test]
     fn parses_bulk_query_job_failed_with_error_message() {
+        // Envelope fields mirror the GET-job example at
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_one_job.htm
+        // `errorMessage` is NOT in that page's response parameters or its
+        // examples — see the provenance note on the field. This pins the
+        // optionality, not a documented shape.
         let body = json!({
             "id": "750xx",
             "operation": "query",
@@ -1614,6 +1626,34 @@ mod tests {
             job.error_message.as_deref(),
             Some("MALFORMED_QUERY: unexpected token")
         );
+    }
+
+    #[test]
+    fn bulk_query_job_without_error_message_deserializes() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_one_job.htm
+        // The documented example response carries no `errorMessage`.
+        let body = json!({
+            "id": "750R0000000zxikIAA",
+            "operation": "query",
+            "object": "Account",
+            "createdById": "005R0000000GiwjIAC",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "JobComplete",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 46.0,
+            "jobType": "V2Query",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA",
+            "numberRecordsProcessed": 740003,
+            "retries": 0,
+            "totalProcessingTime": 21046,
+            "isPkChunkingSupported": true
+        })
+        .to_string();
+        let job: BulkQueryJob = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert!(job.error_message.is_none());
     }
 
     #[test]
