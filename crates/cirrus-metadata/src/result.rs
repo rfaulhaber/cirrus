@@ -26,17 +26,18 @@ use serde::Deserialize;
 
 /// Adapter that maps empty strings to `None`.
 ///
-/// Salesforce's SOAP responses encode null `Option<String>` fields as
-/// `<field xsi:nil="true"/>` self-closing elements. quick-xml's serde
-/// adapter surfaces these as `Some("")` rather than `None` — the
-/// `xsi:nil` attribute carries no semantics at the serde layer. Without
-/// this adapter, downstream code that branches on `.is_none()` would
-/// instead see `Some("")` for unnamespaced components, types with no
-/// file suffix, etc. — which are the common cases.
+/// Salesforce encodes a null `Option<String>` as either an empty
+/// `<field></field>` element or a self-closing `<field xsi:nil="true"/>`,
+/// and both reach serde as `Some("")`. quick-xml does honor `xsi:nil`,
+/// but only where the `xsi` prefix is declared in scope — and the
+/// prefix is declared on the SOAP envelope, which sits outside the
+/// response element the transport hands to the deserializer. Without
+/// this adapter, code branching on `.is_none()` would see `Some("")`
+/// for unnamespaced components, types with no file suffix, and the
+/// other common absent-value cases.
 ///
 /// Apply via `#[serde(default, deserialize_with = "deserialize_nil_string")]`
-/// on every `Option<String>` field that Salesforce can render as
-/// `xsi:nil="true"`.
+/// on every `Option<String>` field Salesforce can render blank.
 fn deserialize_nil_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -659,8 +660,9 @@ pub struct DescribeMetadataResult {
     /// etc. One entry per metadata type the org supports.
     #[serde(default)]
     pub metadata_objects: Vec<DescribeMetadataObject>,
-    /// Namespace prefix for managed packages in this org. Empty
-    /// (`""`) for orgs with no namespace.
+    /// Namespace prefix for managed packages in this org. `None` for
+    /// orgs with no namespace — Salesforce sends a blank element,
+    /// which this field normalizes to `None`.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub organization_namespace: Option<String>,
     /// Whether the org allows partial deployments (`rollbackOnError`

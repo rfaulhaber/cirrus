@@ -279,6 +279,99 @@ async fn describe_metadata_parses_object_catalog() {
 
     let dashboard = &result.metadata_objects[2];
     assert!(dashboard.in_folder);
+
+    // The fixture's `<organizationNamespace></organizationNamespace>`
+    // is the shape an org with no namespace sends. It has to arrive as
+    // None, or `if let Some(ns) = …` prefixing would build names like
+    // "__MyClass".
+    assert_eq!(result.organization_namespace, None);
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+/// FileProperties: "namespacePrefix | string | The namespace prefix of
+/// the component" — present only for components that have one.
+///
+/// The two blank forms Salesforce sends for an absent string both have
+/// to normalize to `None`: a self-closing `xsi:nil` element and an
+/// empty one. The `xsi` prefix is declared on the SOAP envelope, which
+/// is outside the response element the transport hands the
+/// deserializer, so neither form carries nil semantics by the time it
+/// is parsed.
+#[tokio::test]
+async fn blank_string_elements_normalize_to_none() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:listMetadata>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <soapenv:Body>
+    <listMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <createdById>005xx0000abc</createdById>
+        <createdByName>Stephanie</createdByName>
+        <createdDate>2026-01-15T08:00:00.000Z</createdDate>
+        <fileName>classes/Foo.cls</fileName>
+        <fullName>Foo</fullName>
+        <id>01p00000abcDEF</id>
+        <lastModifiedById>005xx0000abc</lastModifiedById>
+        <lastModifiedByName>Stephanie</lastModifiedByName>
+        <lastModifiedDate>2026-05-20T12:00:00.000Z</lastModifiedDate>
+        <namespacePrefix xsi:nil="true"/>
+        <type>ApexClass</type>
+      </result>
+      <result>
+        <createdById>005xx0000abc</createdById>
+        <createdByName>Stephanie</createdByName>
+        <createdDate>2026-01-15T08:00:00.000Z</createdDate>
+        <fileName>classes/Bar.cls</fileName>
+        <fullName>Bar</fullName>
+        <id>01p00000xyzGHI</id>
+        <lastModifiedById>005xx0000abc</lastModifiedById>
+        <lastModifiedByName>Stephanie</lastModifiedByName>
+        <lastModifiedDate>2026-05-20T12:00:00.000Z</lastModifiedDate>
+        <namespacePrefix></namespacePrefix>
+        <type>ApexClass</type>
+      </result>
+      <result>
+        <createdById>005xx0000abc</createdById>
+        <createdByName>Stephanie</createdByName>
+        <createdDate>2026-01-15T08:00:00.000Z</createdDate>
+        <fileName>classes/Baz.cls</fileName>
+        <fullName>acme__Baz</fullName>
+        <id>01p00000jklMNO</id>
+        <lastModifiedById>005xx0000abc</lastModifiedById>
+        <lastModifiedByName>Stephanie</lastModifiedByName>
+        <lastModifiedDate>2026-05-20T12:00:00.000Z</lastModifiedDate>
+        <namespacePrefix>acme</namespacePrefix>
+        <type>ApexClass</type>
+      </result>
+    </listMetadataResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let results = md
+        .list_metadata(
+            vec![ListMetadataQuery {
+                type_name: "ApexClass".into(),
+                folder: None,
+            }],
+            "66.0",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results[0].namespace_prefix, None, "xsi:nil form");
+    assert_eq!(results[1].namespace_prefix, None, "empty-element form");
+    // A real namespace still comes through, so the adapter isn't just
+    // discarding the field.
+    assert_eq!(results[2].namespace_prefix, Some("acme".into()));
 }
 
 // -- describe_value_type -----------------------------------------------------
