@@ -231,6 +231,7 @@ dependencies = [
  "cirrus-auth",
  "dotenvy",
  "getrandom 0.4.3",
+ "httpdate",
  "proptest",
  "quick-xml",
  "reqwest",
