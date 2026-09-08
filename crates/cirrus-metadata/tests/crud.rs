@@ -263,10 +263,16 @@ async fn delete_metadata_returns_one_result_per_full_name() {
 
 // -- read_metadata -----------------------------------------------------------
 
+/// Caller shape for `readMetadata`-of-ApexClass.
+///
+/// Every field is optional, including `fullName`: a requested name the
+/// org doesn't have comes back as a content-free placeholder record,
+/// and one required field would fail the whole document.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ApexClassRecord {
-    full_name: String,
+    #[serde(default)]
+    full_name: Option<String>,
     #[serde(default)]
     api_version: Option<String>,
     #[serde(default)]
@@ -310,10 +316,10 @@ async fn read_metadata_deserializes_records_into_caller_type() {
         .await
         .unwrap();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].full_name, "Foo");
+    assert_eq!(records[0].full_name, Some("Foo".into()));
     assert_eq!(records[0].api_version, Some("66.0".into()));
     assert_eq!(records[0].status, Some("Active".into()));
-    assert_eq!(records[1].full_name, "Bar");
+    assert_eq!(records[1].full_name, Some("Bar".into()));
     assert_eq!(records[1].status, Some("Deleted".into()));
 }
 
@@ -338,6 +344,58 @@ async fn read_metadata_empty_result_yields_empty_vec() {
     let md = client_against(&server);
     let records: Vec<ApexClassRecord> = md.read_metadata("ApexClass", &["NotFound"]).await.unwrap();
     assert!(records.is_empty());
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_readMetadata.htm
+/// The guide's Java sample walks `readResult.getRecords()` and guards
+/// each entry — `if (md != null) { … } else { "Empty metadata." }` —
+/// so a records entry can carry no component. The guide publishes no
+/// response envelope; the `xsi:nil` spelling below is the form live
+/// orgs send (see `tests/integration/crud.rs`).
+///
+/// The placeholder must not cost the caller the names that resolved,
+/// which is why the whole records array has to survive it.
+#[tokio::test]
+async fn read_metadata_tolerates_the_placeholder_for_a_missing_full_name() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:fullNames>Foo</met:fullNames>"))
+        .and(body_string_contains(
+            "<met:fullNames>DoesNotExist</met:fullNames>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <soapenv:Body>
+    <readMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <records>
+          <fullName>Foo</fullName>
+          <apiVersion>66.0</apiVersion>
+          <status>Active</status>
+        </records>
+        <records xsi:nil="true"/>
+      </result>
+    </readMetadataResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let records: Vec<ApexClassRecord> = md
+        .read_metadata("ApexClass", &["Foo", "DoesNotExist"])
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].full_name, Some("Foo".into()));
+    // Every field absent is the "no such component" signal.
+    assert_eq!(records[1].full_name, None);
+    assert_eq!(records[1].api_version, None);
+    assert_eq!(records[1].status, None);
 }
 
 // -- rename_metadata ---------------------------------------------------------

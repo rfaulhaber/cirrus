@@ -226,6 +226,19 @@ struct ReadMetadataResponseWire<T> {
 // `Vec<T>::default()` works for any `T` regardless.
 #[serde(bound(deserialize = "T: serde::de::DeserializeOwned"))]
 struct ReadResultWire<T> {
+    // Wire-shape provenance (api_meta doc page IDs):
+    // - `meta_readMetadata`'s Java sample guards every entry of
+    //   `readResult.getRecords()` with `if (md != null) … else
+    //   "Empty metadata."`, so a records entry can carry no component
+    //   at all. The guide publishes no response envelope, so the
+    //   placeholder's exact XML form isn't documented; live orgs send
+    //   `<records xsi:nil="true"/>`.
+    // - Deserializing the placeholder per element is not available:
+    //   quick-xml applies `xsi:nil` to named `Option` fields, not to
+    //   sequence elements, so `Vec<Option<T>>` reports it as
+    //   `Some(T)` with every field absent rather than `None`. That is
+    //   why the all-optional `T` requirement is on `read_metadata`
+    //   instead.
     #[serde(default = "Vec::new")]
     records: Vec<T>,
 }
@@ -387,15 +400,29 @@ impl MetadataClient {
     /// deserialize sees field names like `fullName`, `apiVersion`,
     /// `status`, etc.
     ///
+    /// **Every field of `T` must be optional** — `Option<_>` or
+    /// `#[serde(default)]`, including `fullName`. A `fullName` that
+    /// doesn't resolve doesn't drop out of the response: Salesforce
+    /// answers it with a content-free placeholder record, which
+    /// deserializes into a `T` with every field absent. A `T` carrying
+    /// one required field turns that placeholder into a
+    /// [`MetadataError::Xml`], losing the components that *did*
+    /// resolve along with it. Treat `full_name.is_some()` as the
+    /// "this component exists" signal.
+    ///
     /// ```no_run
     /// # use cirrus_metadata::{MetadataClient, MetadataError};
     /// # use serde::Deserialize;
     /// #[derive(Deserialize)]
     /// #[serde(rename_all = "camelCase")]
     /// struct ApexClassRecord {
-    ///     full_name: String,
+    ///     #[serde(default)]
+    ///     full_name: Option<String>,
+    ///     #[serde(default)]
     ///     api_version: Option<String>,
+    ///     #[serde(default)]
     ///     status: Option<String>,
+    ///     #[serde(default)]
     ///     content: Option<String>,
     /// }
     ///
@@ -403,9 +430,17 @@ impl MetadataClient {
     /// let classes: Vec<ApexClassRecord> = md
     ///     .read_metadata::<ApexClassRecord, _>("ApexClass", &["Foo", "Bar"])
     ///     .await?;
+    /// for class in &classes {
+    ///     let Some(name) = &class.full_name else {
+    ///         continue; // placeholder for a name the org doesn't have
+    ///     };
+    ///     println!("{name}");
+    /// }
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// [`MetadataError::Xml`]: crate::MetadataError::Xml
     pub async fn read_metadata<T, S>(
         &self,
         type_name: &str,
