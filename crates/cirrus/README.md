@@ -115,6 +115,13 @@ boundary between auth and REST without extra plumbing.
   `Option<T>`; `None` on 304 Not Modified.
 - **Structured `tracing` events** — `cirrus::retry`, `cirrus::auth`,
   `cirrus::limit_info` targets. Never logs tokens or bodies.
+- **Transport defaults** — the HTTP client the builder creates advertises
+  gzip and decompresses responses, applies a 10 s connect timeout and a 30 s
+  per-read timeout (`CirrusBuilder::connect_timeout` / `read_timeout` override
+  either; there's no whole-request deadline, so a long Bulk transfer isn't cut
+  short mid-flight), and doesn't follow redirects — a 3xx surfaces as
+  `CirrusError::Api` rather than re-sending the token to the `Location` host.
+  Supplying your own client via `CirrusBuilder::http_client` replaces all of it.
 
 ### The escape hatch
 
@@ -130,6 +137,12 @@ sf.get::<MyShape>("https://...").await?;                   // fully-qualified
 
 Three-mode path resolution: relative → `/services/data/{version}/...`,
 leading-`/` → instance-rooted, `http(s)://` → passthrough.
+Whichever mode applies, the resolved target must be `https` (loopback hosts
+excepted) because the request carries the org session token — a plaintext
+target is rejected with `CirrusError::InvalidInput` and no request is sent,
+and `Cirrus::builder().build()` fails outright on an `http://` instance URL.
+`CirrusBuilder::allow_insecure_transport(true)` is the opt-out for a
+deliberate plaintext hop, such as a recording proxy on a trusted network.
 
 Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
 `Sforce-Query-Options`, …) go through `send_with_headers_as`, which keeps retry,
