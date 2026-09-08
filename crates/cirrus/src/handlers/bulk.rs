@@ -141,6 +141,10 @@ impl BulkIngestHandler<'_> {
     /// before applying its 150 MB ceiling, and that conversion inflates
     /// the data by roughly 50%. Split larger data across uploads.
     ///
+    /// An upload that size needs a read timeout to match, because the
+    /// deadline covers pushing the body as well as waiting for the
+    /// answer — see [`CirrusBuilder::read_timeout`](crate::CirrusBuilder::read_timeout).
+    ///
     /// A lost response is never retried automatically. Salesforce
     /// documents this `PUT` as uploading job data, not as replacing
     /// data the job already holds, so a replay risks loading the same

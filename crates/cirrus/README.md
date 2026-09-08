@@ -118,12 +118,15 @@ boundary between auth and REST without extra plumbing.
 - **Structured `tracing` events** — `cirrus::retry`, `cirrus::auth`,
   `cirrus::limit_info` targets. Never logs tokens or bodies.
 - **Transport defaults** — the HTTP client the builder creates advertises
-  gzip and decompresses responses, applies a 10 s connect timeout and a 30 s
-  per-read timeout (`CirrusBuilder::connect_timeout` / `read_timeout` override
-  either; there's no whole-request deadline, so a long Bulk transfer isn't cut
-  short mid-flight), and doesn't follow redirects — a 3xx surfaces as
+  gzip and decompresses responses, applies a 10 s connect timeout and a 120 s
+  read timeout, and doesn't follow redirects — a 3xx surfaces as
   `CirrusError::Api` rather than re-sending the token to the `Location` host.
-  Supplying your own client via `CirrusBuilder::http_client` replaces all of it.
+  The read timeout runs until the response head arrives, so it bounds the
+  request-body upload and the org's processing time too, and only then becomes
+  a per-chunk deadline; widen it with `CirrusBuilder::read_timeout` for large
+  Bulk 2.0 / blob **uploads** and for calls the org takes a long time to
+  answer. Supplying your own client via `CirrusBuilder::http_client` replaces
+  all of it.
 
 ### The escape hatch
 

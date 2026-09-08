@@ -104,13 +104,20 @@ pub const DEFAULT_API_VERSION: &str = "v66.0";
 /// creates. Override with [`CirrusBuilder::connect_timeout`].
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-read timeout applied to the HTTP client the builder creates:
-/// the maximum time the client waits for the *next chunk* of a
-/// response, not for the whole response. Bulk 2.0 result pages and
-/// event log files can be large enough that a whole-request deadline
-/// would cut a healthy transfer short, so none is set. Override with
-/// [`CirrusBuilder::read_timeout`].
-pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Read timeout applied to the HTTP client the builder creates.
+///
+/// It runs from the moment the request is dispatched until the response
+/// head arrives — covering the upload of the request body and the org's
+/// own processing time — and from then on bounds the gap between two
+/// chunks of the response body. Only that second phase resets, so this
+/// is a deadline on getting an answer at all, not merely a stall
+/// detector.
+///
+/// Widen it with [`CirrusBuilder::read_timeout`] for a large Bulk 2.0
+/// or blob upload, or for a synchronous call the org takes a long time
+/// to answer; no fixed default covers a 100 MB ingest upload over an
+/// arbitrary link.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default User-Agent header value sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -1034,13 +1041,16 @@ impl CirrusBuilder {
         self
     }
 
-    /// Sets the per-read timeout for the HTTP client this builder
-    /// creates — the maximum wait between two chunks of a response
-    /// body, not a deadline for the whole request. Defaults to
-    /// [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait indefinitely.
+    /// Sets the read timeout for the HTTP client this builder creates.
+    /// Defaults to [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait
+    /// indefinitely.
     ///
-    /// Widen this when draining very large Bulk 2.0 result pages or
-    /// event log files over a slow link.
+    /// The deadline covers the whole in-flight request until the
+    /// response head arrives — request-body upload and org processing
+    /// included — and after that the gap between two response chunks.
+    /// Widen it for a large Bulk 2.0 or blob **upload**, for draining a
+    /// very large result page over a slow link, and for a call the org
+    /// takes a long time to answer.
     ///
     /// Ignored when [`http_client`](Self::http_client) supplies a client.
     pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
@@ -1774,7 +1784,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn read_timeout_aborts_a_stalled_response() {
+        async fn read_timeout_aborts_a_request_the_org_never_answers() {
+            // The deadline is armed at dispatch, so it fires while the
+            // response head is still outstanding — not just between two
+            // chunks of a body that has already started arriving.
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/services/data/v66.0/limits"))
