@@ -480,7 +480,6 @@ fn http_date(since: SystemTime) -> CirrusResult<String> {
 /// blob-field's API name for the binary part, but always verify.
 ///
 /// [Insert or Update Blob Data]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
-#[derive(Debug)]
 pub struct BlobUploadSpec<'a, B: ?Sized> {
     /// Name of the JSON metadata part. See the table on
     /// [`BlobUploadSpec`] for known per-object values.
@@ -506,6 +505,21 @@ pub struct BlobUploadSpec<'a, B: ?Sized> {
     /// Binary payload. `bytes::Bytes` is Arc-backed and zero-copy
     /// across retries.
     pub blob: bytes::Bytes,
+}
+
+impl<B: ?Sized> std::fmt::Debug for BlobUploadSpec<'_, B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neither payload is safe to render: `blob` is the file being
+        // uploaded (up to 2 GB, and `bytes::Bytes` escapes every byte),
+        // and `metadata` is caller record data. Both are summarized.
+        f.debug_struct("BlobUploadSpec")
+            .field("json_part_name", &self.json_part_name)
+            .field("blob_field_name", &self.blob_field_name)
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("blob_len", &self.blob.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -1130,6 +1144,27 @@ mod tests {
                 }
                 other => panic!("expected Api error, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn blob_upload_spec_debug_summarizes_the_payload() {
+            // The blob is the file being shipped to Salesforce and the
+            // metadata is caller record data; neither may reach a log
+            // sink through a `?spec` capture.
+            let spec = BlobUploadSpec {
+                json_part_name: "entity_content",
+                metadata: &json!({"Title": "Signed contract", "OwnerId": "005xx"}),
+                blob_field_name: "VersionData",
+                filename: "contract.pdf",
+                content_type: Some("application/pdf"),
+                blob: bytes::Bytes::from_static(b"%PDF-1.7 secret bytes"),
+            };
+
+            let rendered = format!("{spec:?}");
+            assert!(rendered.contains("blob_len: 21"), "{rendered}");
+            assert!(!rendered.contains("secret"), "{rendered}");
+            assert!(!rendered.contains("Signed contract"), "{rendered}");
+            assert!(!rendered.contains("005xx"), "{rendered}");
         }
 
         #[tokio::test]
