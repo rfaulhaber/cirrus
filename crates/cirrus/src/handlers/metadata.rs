@@ -24,6 +24,13 @@
 //! The SOAP and REST shapes diverge in a few names: e.g., SOAP's
 //! `DeployDetails.runTestResult` is `runTestResults` (plural) on
 //! REST. We model the REST shape here, not the SOAP one.
+//!
+//! The `deployResult` object is not uniform across the four pages:
+//! `meta_rest_deploy` shows an inner `id`, `success` and `done`, while
+//! `meta_rest_deploy_checkstatus` and `meta_rest_deploy_cancel` show
+//! neither an inner `id` nor those flags. Every field on
+//! [`DeployResultDetails`] is therefore optional or defaulted, and the
+//! deploy id is read from [`DeployRequest::id`], which all pages show.
 
 use crate::Cirrus;
 use crate::error::CirrusResult;
@@ -334,8 +341,14 @@ pub struct DeployRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployResultDetails {
-    /// Mirrors [`DeployRequest::id`].
-    pub id: String,
+    /// Mirrors [`DeployRequest::id`] when present.
+    ///
+    /// The kickoff response repeats the deploy id here; the status-check
+    /// and cancellation examples omit it, so treat
+    /// [`DeployRequest::id`] as the authoritative source and this as a
+    /// convenience echo.
+    #[serde(default)]
+    pub id: Option<String>,
 
     /// `true` once Salesforce has finished processing.
     #[serde(default)]
@@ -604,7 +617,9 @@ mod tests {
         assert!(!status.is_terminal());
     }
 
-    /// Wire shape per `meta_rest_deploy` example response body.
+    /// Wire shape per the `meta_rest_deploy` example response body.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy.htm
     #[tokio::test]
     async fn deploy_initiates_with_multipart_and_returns_request() {
         let server = MockServer::start().await;
@@ -651,6 +666,9 @@ mod tests {
         let req = sf.metadata().deploy(&options, zip).await.unwrap();
         assert_eq!(req.id, "0Afxx00000001VPCAY");
         let result = req.deploy_result.expect("deploy_result populated");
+        // The kickoff page is the one example that echoes the id inside
+        // deployResult.
+        assert_eq!(result.id.as_deref(), Some("0Afxx00000001VPCAY"));
         assert_eq!(result.status, Some(DeployStatus::Pending));
         assert!(!result.done);
         // runAllTests field in deploy_options is informational; ensure
@@ -683,8 +701,11 @@ mod tests {
         assert!(opts.get("singlePackage").is_none());
     }
 
-    /// Wire shape per `meta_rest_deploy_checkstatus` example response
-    /// body, with `?includeDetails=true`.
+    /// Wire shape per the `meta_rest_deploy_checkstatus` example
+    /// response body, with `?includeDetails=true`. The example's
+    /// `deployResult` carries no inner `id`.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy_checkstatus.htm
     #[tokio::test]
     async fn check_deploy_status_with_details_parses_full_envelope() {
         let server = MockServer::start().await;
@@ -696,7 +717,6 @@ mod tests {
                 "id": "0Afxx00000000lWCAQ",
                 "url": "https://host/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ?includeDetails=true",
                 "deployResult": {
-                    "id": "0Afxx00000000lWCAQ",
                     "checkOnly": false,
                     "ignoreWarnings": false,
                     "rollbackOnError": false,
@@ -754,6 +774,7 @@ mod tests {
             .unwrap();
         assert_eq!(req.id, "0Afxx00000000lWCAQ");
         let r = req.deploy_result.unwrap();
+        assert!(r.id.is_none());
         assert_eq!(r.status, Some(DeployStatus::InProgress));
         assert_eq!(r.number_components_total, 1032);
         assert_eq!(
@@ -778,7 +799,6 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "0Afxx00000000lWCAQ",
                 "deployResult": {
-                    "id": "0Afxx00000000lWCAQ",
                     "status": "Succeeded",
                     "done": true,
                     "success": true
@@ -794,15 +814,19 @@ mod tests {
             .await
             .unwrap();
         let r = req.deploy_result.unwrap();
+        assert!(r.id.is_none());
         assert_eq!(r.status, Some(DeployStatus::Succeeded));
         assert!(r.done);
         assert!(r.success);
         assert!(r.details.is_none());
     }
 
-    /// Wire shape per `meta_rest_deploy_cancel` example. PATCH body
+    /// Wire shape per the `meta_rest_deploy_cancel` example. PATCH body
     /// is `{"deployResult": {"status": "Canceling"}}`; response is
-    /// 202 Accepted with the full deploy snapshot.
+    /// 202 Accepted with the full deploy snapshot, whose `deployResult`
+    /// carries no inner `id`.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy_cancel.htm
     #[tokio::test]
     async fn cancel_deploy_patches_status_and_returns_snapshot() {
         let server = MockServer::start().await;
@@ -818,7 +842,6 @@ mod tests {
                 "id": "0Afxx00000000lWCAQ",
                 "url": "https://host/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ",
                 "deployResult": {
-                    "id": "0Afxx00000000lWCAQ",
                     "checkOnly": false,
                     "ignoreWarnings": false,
                     "rollbackOnError": false,
@@ -863,12 +886,15 @@ mod tests {
             .await
             .unwrap();
         let r = req.deploy_result.unwrap();
+        assert!(r.id.is_none());
         assert_eq!(r.status, Some(DeployStatus::Canceling));
     }
 
-    /// Wire shape per `meta_rest_deploy_recentvalidation`. Body
-    /// echoes the validated id; response includes a *new* id plus
+    /// Wire shape per the `meta_rest_deploy_recentvalidation` example.
+    /// Body echoes the validated id; response includes a *new* id plus
     /// the original `validatedDeployRequestId`.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy_recentvalidation.htm
     #[tokio::test]
     async fn deploy_recent_validation_posts_validated_id() {
         let server = MockServer::start().await;
