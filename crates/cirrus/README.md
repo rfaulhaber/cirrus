@@ -103,6 +103,8 @@ boundary between auth and REST without extra plumbing.
 
 ### Cross-cutting
 
+- **`CirrusError` is `#[non_exhaustive]`** — match the variants you handle and
+  keep a `_` arm; a new variant in a later release stays an additive change.
 - **Retry + backoff** — `RetryPolicy` covers 429, 503, and transient 5xx with
   full jitter; honors `Retry-After`. Configurable; off by default for non-idempotent 5xx.
 - **Sforce-Limit-Info capture** — every response sent through the typed verb

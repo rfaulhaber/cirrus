@@ -36,7 +36,11 @@ pub struct SalesforceError {
 }
 
 /// Errors produced by the Cirrus client.
+///
+/// Marked `#[non_exhaustive]`: match on the variants you handle and keep
+/// a `_` arm, so a new variant in a later release is an additive change.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CirrusError {
     /// A required builder field was not set.
     #[error("missing required builder field: {0}")]
