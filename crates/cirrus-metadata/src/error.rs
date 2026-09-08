@@ -135,16 +135,26 @@ pub enum MetadataError {
 /// bounds what can end up in the caller's logs via `Display`/`Debug`.
 const RAW_ERROR_BODY_CAP: usize = 2048;
 
-/// Lossily decode an error body, truncating at [`RAW_ERROR_BODY_CAP`]
-/// with a marker.
+/// Decodes an error body for inclusion in an error, bounded by
+/// [`RAW_ERROR_BODY_CAP`] bytes and marked when anything was dropped.
+///
+/// Only the capped byte prefix is decoded, so a multi-megabyte body never
+/// gets a full owned copy. Lossy decoding expands each invalid byte to a
+/// three-byte U+FFFD, which can push even that prefix past the cap, so the
+/// decoded string is trimmed again at a char boundary.
 pub(crate) fn cap_raw_body(bytes: &[u8]) -> String {
-    let mut body = String::from_utf8_lossy(bytes).into_owned();
+    let mut truncated = bytes.len() > RAW_ERROR_BODY_CAP;
+    let head = &bytes[..bytes.len().min(RAW_ERROR_BODY_CAP)];
+    let mut body = String::from_utf8_lossy(head).into_owned();
     if body.len() > RAW_ERROR_BODY_CAP {
         let mut end = RAW_ERROR_BODY_CAP;
         while !body.is_char_boundary(end) {
             end -= 1;
         }
         body.truncate(end);
+        truncated = true;
+    }
+    if truncated {
         body.push_str("… <truncated>");
     }
     body
@@ -184,6 +194,28 @@ mod tests {
         assert!(capped.len() < RAW_ERROR_BODY_CAP + 32);
         // Small bodies pass through untouched.
         assert_eq!(cap_raw_body(b"tiny"), "tiny");
+    }
+
+    #[test]
+    fn cap_raw_body_bounds_a_large_non_utf8_body() {
+        // Each invalid byte decodes to a three-byte U+FFFD, so capping
+        // the decoded string alone would still leave ~3x the cap in the
+        // error value — and decoding first would materialize a copy of
+        // the whole body before any of that.
+        let body = vec![0xffu8; RAW_ERROR_BODY_CAP * 4];
+        let capped = cap_raw_body(&body);
+        assert!(capped.ends_with("… <truncated>"));
+        assert!(
+            capped.len() < RAW_ERROR_BODY_CAP + 32,
+            "capped body is {} bytes",
+            capped.len()
+        );
+    }
+
+    #[test]
+    fn cap_raw_body_keeps_a_body_exactly_at_the_cap_whole() {
+        let body = "x".repeat(RAW_ERROR_BODY_CAP);
+        assert_eq!(cap_raw_body(body.as_bytes()), body);
     }
 
     #[test]
