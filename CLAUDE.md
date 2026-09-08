@@ -109,9 +109,9 @@ Live tests against a real Salesforce sandbox / Developer Edition / scratch org l
 cp .env.example .env
 
 # Run a crate's integration suite (sequential — they share org state)
-cargo nextest run -p cirrus           --test integration --run-ignored only -- --test-threads=1
-cargo nextest run -p cirrus-auth      --test integration --run-ignored only -- --test-threads=1
-cargo nextest run -p cirrus-metadata  --test integration --run-ignored only -- --test-threads=1
+cargo nextest run -p cirrus           --test integration --run-ignored only -j 1
+cargo nextest run -p cirrus-auth      --test integration --run-ignored only -j 1
+cargo nextest run -p cirrus-metadata  --test integration --run-ignored only -j 1
 ```
 
 The harness (`tests/integration/common.rs` in each crate) refuses to run unless `INSTANCE_URL` matches a known sandbox / Developer Edition / scratch My Domain pattern: `.sandbox.`, `.develop.`, `.scratch.`, or `.trailblaze.` infix before `.my.salesforce.com`. The `.trailblaze.` partition is used by free Developer Edition orgs from developer.salesforce.com signup (subdomain typically ends `-dev-ed`). Override with `CIRRUS_INTEGRATION_FORCE=1` only after verifying the target org is safe for destructive writes — the safe-list catches Enhanced Domains URLs but not legacy pre-Spring-'23 sandbox URLs, and Salesforce occasionally introduces new partition infixes (audit when adding orgs in unfamiliar shapes).
@@ -122,7 +122,7 @@ Don't add network-touching tests to the default (`cargo test`) suite — those s
 
 ## Repository Layout
 
-This is a **Cargo workspace**. The repo root holds workspace-level config (`Cargo.toml` workspace manifest, `clippy.toml`, `deny.toml`, `flake.nix`, `rust-toolchain.toml`) plus the `scripts/` directory. Each member crate lives under `crates/<name>/` with the standard `src/lib.rs` layout.
+This is a **Cargo workspace**. The repo root holds workspace-level config (`Cargo.toml` workspace manifest, `clippy.toml`, `deny.toml`, `flake.nix`, `rust-toolchain.toml`). Each member crate lives under `crates/<name>/` with the standard `src/lib.rs` layout.
 
 ```
 cirrus/
@@ -130,7 +130,6 @@ cirrus/
 ├── clippy.toml, deny.toml      # apply to all workspace members
 ├── flake.nix, flake.lock       # Nix dev shell
 ├── rust-toolchain.toml         # toolchain pin
-├── scripts/                    # cross-crate utility scripts
 └── crates/
     ├── cirrus/                 # REST client
     │   ├── Cargo.toml          # depends on cirrus-auth (workspace dep)
