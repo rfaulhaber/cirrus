@@ -5,14 +5,15 @@
 //! 1. [`WebServerFlow::start`] mints a fresh `code_verifier` + `state`,
 //!    derives the `S256` challenge per RFC 7636, and returns the
 //!    authorization URL the caller should redirect the user to. The
-//!    secrets/state needed for completion are returned alongside as a
+//!    secrets needed for completion are returned alongside as a
 //!    [`PendingExchange`] — an opaque, serializable value the caller is
-//!    responsible for persisting (signed cookie, server-side session,
-//!    Redis, etc.) until the user comes back through the callback.
+//!    responsible for persisting until the user comes back through the
+//!    callback.
 //!
-//! 2. On callback, the caller passes the `code` and `state` query
-//!    parameters into [`PendingExchange::complete`]. The state is verified,
-//!    the code is exchanged for tokens at `/services/oauth2/token`, and a
+//! 2. On callback, the caller passes the stored [`PendingExchange`] plus
+//!    the `code` and `state` query parameters into
+//!    [`WebServerFlow::complete`]. The state is verified, the code is
+//!    exchanged for tokens at `/services/oauth2/token`, and a
 //!    [`CompletedSession`] is returned containing the access token,
 //!    instance URL, and (if the connected app's scopes include
 //!    `refresh_token`) a refresh token.
@@ -22,17 +23,22 @@
 //! the caller chooses, and lets multiple in-flight authorizations coexist
 //! without a server-side store the SDK has to manage.
 //!
+//! The connected app's credentials live on the [`WebServerFlow`] and are
+//! never part of the value the caller persists; see [`PendingExchange`]
+//! for where that value may safely be kept.
+//!
 //! ## Wiring back into the SDK
 //!
 //! With a refresh token in hand, build a [`crate::RefreshTokenAuth`]:
 //!
 //! ```no_run
 //! # use cirrus_auth::{RefreshTokenAuth, WebServerFlow};
-//! # async fn ex(http: &reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
 //! # let flow = WebServerFlow::builder()
 //! #     .consumer_key("k").redirect_uri("https://app/cb").build()?;
 //! # let (_url, pending) = flow.start()?;
-//! # let session = pending.complete("code", "state", http).await?;
+//! # let state = pending.state().to_string();
+//! # let session = flow.complete(pending, "code", &state).await?;
 //! let refresh_token = session.refresh_token
 //!     .ok_or("connected app didn't return a refresh token")?;
 //! let auth = RefreshTokenAuth::builder()
@@ -51,7 +57,9 @@
 //! The builder treats `consumer_secret` as optional accordingly.
 
 use crate::error::{AuthError, AuthResult};
-use crate::token_endpoint::exchange;
+use crate::token_endpoint::{
+    default_http_client, exchange, normalize_url, require_secure_login_url,
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -63,12 +71,12 @@ pub const PRODUCTION_LOGIN_URL: &str = "https://login.salesforce.com";
 /// Salesforce sandbox login URL.
 pub const SANDBOX_LOGIN_URL: &str = "https://test.salesforce.com";
 
-/// Number of random bytes for the PKCE `code_verifier`. After base64-url
-/// (no-pad) encoding, 96 bytes → 128 chars, the maximum allowed by
-/// RFC 7636 and the length Salesforce's docs cite verbatim. 32 bytes
-/// (256 bits) of entropy would already be cryptographically sufficient;
-/// matching Salesforce's recommendation keeps the wire shape identical
-/// to their published examples.
+/// Number of random bytes for the PKCE `code_verifier`. RFC 7636 caps the
+/// verifier at 128 characters (`code-verifier = 43*128unreserved`), and 96
+/// raw bytes encode to exactly that, so this is the longest verifier the
+/// grammar admits. 32 bytes is already cryptographically sufficient — the
+/// RFC recommends it — but spending the full width costs nothing and
+/// leaves no headroom question.
 const VERIFIER_BYTES: usize = 96;
 
 /// Number of random bytes for the `state` nonce. 16 bytes → 22 chars
@@ -76,6 +84,10 @@ const VERIFIER_BYTES: usize = 96;
 const STATE_BYTES: usize = 16;
 
 /// Configures the OAuth 2.0 Web Server flow.
+///
+/// Holds the connected app's credentials for the lifetime of the flow and
+/// drives both phases: [`start`](Self::start) builds the authorization
+/// URL, [`complete`](Self::complete) exchanges the returned code.
 ///
 /// Construct via [`WebServerFlow::builder`].
 #[derive(Clone)]
@@ -87,6 +99,7 @@ pub struct WebServerFlow {
     scopes: Vec<String>,
     prompt: Option<String>,
     login_hint: Option<String>,
+    http: reqwest::Client,
 }
 
 // The connected app's client secret (and the key identifying it) must
@@ -104,7 +117,7 @@ impl std::fmt::Debug for WebServerFlow {
             .field("scopes", &self.scopes)
             .field("prompt", &self.prompt)
             .field("login_hint", &self.login_hint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -117,13 +130,19 @@ impl WebServerFlow {
     /// Phase 1 — generate a fresh PKCE verifier + state nonce, build the
     /// authorization URL, and return both. The caller redirects the user
     /// to the URL and persists the [`PendingExchange`] until the callback.
+    ///
+    /// Any path on the configured `login_url` is preserved: an Experience
+    /// Cloud site login such as `https://MyDomainName.my.site.com/fineapps`
+    /// yields `.../fineapps/services/oauth2/authorize`, matching the
+    /// endpoint [`complete`](Self::complete) will POST the code to.
     pub fn start(&self) -> AuthResult<(String, PendingExchange)> {
         let code_verifier = random_b64url(VERIFIER_BYTES)?;
         let state = random_b64url(STATE_BYTES)?;
         let code_challenge = pkce_s256_challenge(&code_verifier);
 
         let mut url = url::Url::parse(&self.login_url)?;
-        url.set_path("/services/oauth2/authorize");
+        let base_path = url.path().trim_end_matches('/').to_string();
+        url.set_path(&format!("{base_path}/services/oauth2/authorize"));
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("response_type", "code");
@@ -144,80 +163,38 @@ impl WebServerFlow {
         }
 
         let pending = PendingExchange {
-            consumer_key: self.consumer_key.clone(),
-            consumer_secret: self.consumer_secret.clone(),
-            redirect_uri: self.redirect_uri.clone(),
-            login_url: self.login_url.clone(),
             code_verifier,
             state,
         };
 
         Ok((url.into(), pending))
     }
-}
 
-/// Opaque, serializable handle holding the PKCE verifier + state nonce
-/// between the authorize and token-exchange phases. The caller must
-/// persist it (signed cookie, session store, etc.) until the OAuth
-/// callback fires.
-///
-/// Treat the contents as a secret — leakage of the `code_verifier` would
-/// let an attacker who intercepts the authorization code complete the
-/// exchange.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct PendingExchange {
-    consumer_key: String,
-    consumer_secret: Option<String>,
-    redirect_uri: String,
-    login_url: String,
-    code_verifier: String,
-    state: String,
-}
-
-// Redact secrets. `consumer_key` is a credential *identifier* (not as
-// sensitive as the secret, but still worth keeping out of logs).
-// `code_verifier` is the PKCE secret — leaking it lets anyone holding
-// the authorization code complete the exchange. `consumer_secret` is
-// the confidential-client secret. `state` is a CSRF nonce — non-secret
-// to the user but better hygiene to keep out of logs.
-impl std::fmt::Debug for PendingExchange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingExchange")
-            .field("consumer_key", &"[redacted]")
-            .field(
-                "consumer_secret",
-                &self.consumer_secret.as_ref().map(|_| "[redacted]"),
-            )
-            .field("redirect_uri", &self.redirect_uri)
-            .field("login_url", &self.login_url)
-            .field("code_verifier", &"[redacted]")
-            .field("state", &"[redacted]")
-            .finish()
-    }
-}
-
-impl PendingExchange {
     /// Phase 2 — verify the returned `state`, exchange `code` for tokens.
     ///
-    /// Returns a [`CompletedSession`] with the access token, instance URL,
-    /// and (if the connected app issued one) refresh token.
+    /// `pending` is the value [`start`](Self::start) handed back, restored
+    /// from wherever the caller stored it. Returns a [`CompletedSession`]
+    /// with the access token, instance URL, and (if the connected app
+    /// issued them) refresh and ID tokens.
+    ///
+    /// Fails with [`AuthError::StateMismatch`] when `returned_state` does
+    /// not match the nonce this flow issued, without contacting the token
+    /// endpoint.
     pub async fn complete(
-        self,
+        &self,
+        pending: PendingExchange,
         code: &str,
         returned_state: &str,
-        http: &reqwest::Client,
     ) -> AuthResult<CompletedSession> {
         // CSRF defense: the state we generated in start() must match what
         // the IdP echoed back. A mismatch typically means a forged callback.
         // Compare in constant time so a network-positioned attacker can't
         // byte-by-byte oracle the state value via callback timing. The
-        // 22-char state is fixed-length per construction (csrf_state()
-        // always emits 22 base64url chars), so a length mismatch is also
-        // a mismatch — short-circuit it without leaking which-byte info.
-        if !constant_time_eq(returned_state.as_bytes(), self.state.as_bytes()) {
-            return Err(AuthError::Other(
-                "state mismatch in OAuth callback".to_string(),
-            ));
+        // 22-char state is fixed-length per construction, so a length
+        // mismatch is also a mismatch — short-circuit it without leaking
+        // which-byte info.
+        if !constant_time_eq(returned_state.as_bytes(), pending.state.as_bytes()) {
+            return Err(AuthError::StateMismatch);
         }
 
         let mut body: Vec<(&str, &str)> = vec![
@@ -225,24 +202,57 @@ impl PendingExchange {
             ("code", code),
             ("client_id", self.consumer_key.as_str()),
             ("redirect_uri", self.redirect_uri.as_str()),
-            ("code_verifier", self.code_verifier.as_str()),
+            ("code_verifier", pending.code_verifier.as_str()),
         ];
         if let Some(secret) = self.consumer_secret.as_deref() {
             body.push(("client_secret", secret));
         }
 
-        let token = exchange(http, &self.login_url, &body).await?;
+        let token = exchange(&self.http, &self.login_url, &body).await?;
         Ok(CompletedSession {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
-            instance_url: token.instance_url,
+            id_token: token.id_token,
+            instance_url: normalize_url(&token.instance_url),
             id: token.id,
             issued_at: token.issued_at,
             signature: token.signature,
             scope: token.scope,
         })
     }
+}
 
+/// Opaque, serializable handle holding the PKCE verifier + state nonce
+/// between the authorize and token-exchange phases. The caller must
+/// persist it until the OAuth callback fires and pass it back to
+/// [`WebServerFlow::complete`].
+///
+/// It carries no connected-app credentials — only the two per-attempt
+/// values the SDK generates. The `code_verifier` inside is still a
+/// secret: anyone holding both it and an intercepted authorization code
+/// can complete the exchange. Keep it somewhere the end user cannot read,
+/// such as a server-side session store, or a cookie that is **encrypted**
+/// rather than merely signed — a signed cookie is integrity-protected but
+/// its contents are plainly readable by the browser.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingExchange {
+    code_verifier: String,
+    state: String,
+}
+
+// Redact the PKCE secret — leaking it lets anyone holding the
+// authorization code complete the exchange. `state` is a CSRF nonce —
+// non-secret to the user but better hygiene to keep out of logs.
+impl std::fmt::Debug for PendingExchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingExchange")
+            .field("code_verifier", &"[redacted]")
+            .field("state", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PendingExchange {
     /// The `state` nonce sent in the authorization URL. Exposed so
     /// integration tests can drive the callback step; production
     /// callers normally don't need to read it. Treat as a CSRF
@@ -260,7 +270,13 @@ pub struct CompletedSession {
     /// Long-lived refresh token. Present only if the connected app's
     /// scopes include `refresh_token` and the user granted it.
     pub refresh_token: Option<String>,
-    /// REST instance URL reported by the token endpoint.
+    /// OpenID Connect ID token. Present only if the requested scopes
+    /// include `openid`.
+    pub id_token: Option<String>,
+    /// REST instance URL reported by the token endpoint, normalized to
+    /// carry no trailing slash — Salesforce's documented sample response
+    /// includes one — so `{instance_url}/services/...` concatenation is
+    /// always well-formed.
     pub instance_url: String,
     /// Salesforce user-identity URL (e.g.
     /// `https://login.salesforce.com/id/{org_id}/{user_id}`). Identifies
@@ -268,9 +284,11 @@ pub struct CompletedSession {
     pub id: Option<String>,
     /// Token-issuance timestamp (milliseconds since epoch as a string).
     pub issued_at: Option<String>,
-    /// Base64-encoded HMAC-SHA256 of `id + issued_at` with the
-    /// connected-app consumer secret as the key — lets the caller
-    /// verify the token came from Salesforce.
+    /// Base64-encoded HMAC-SHA256 of the concatenated `id` and
+    /// `issued_at` values, signed with the connected-app consumer secret.
+    /// Salesforce defines it as an integrity check on the identity URL in
+    /// `id`; `access_token` and `instance_url` are not covered by it, so
+    /// a valid signature says nothing about their provenance.
     pub signature: Option<String>,
     /// Granted scopes, space-separated.
     pub scope: Option<String>,
@@ -286,6 +304,7 @@ impl std::fmt::Debug for CompletedSession {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "[redacted]"),
             )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[redacted]"))
             .field("instance_url", &self.instance_url)
             .field("id", &self.id)
             .field("issued_at", &self.issued_at)
@@ -305,6 +324,7 @@ pub struct WebServerFlowBuilder {
     scopes: Vec<String>,
     prompt: Option<String>,
     login_hint: Option<String>,
+    http_client: Option<reqwest::Client>,
 }
 
 impl std::fmt::Debug for WebServerFlowBuilder {
@@ -344,6 +364,11 @@ impl WebServerFlowBuilder {
 
     /// Authorization host. Defaults to [`PRODUCTION_LOGIN_URL`]. Use
     /// [`SANDBOX_LOGIN_URL`] for sandboxes or your org's My Domain login URL.
+    ///
+    /// A path is honoured, so an Experience Cloud site login URL such as
+    /// `https://MyDomainName.my.site.com/fineapps` addresses that site's
+    /// authorize and token endpoints. Must be `https` (loopback hosts
+    /// excepted, for local test servers).
     pub fn login_url(mut self, url: impl Into<String>) -> Self {
         self.login_url = Some(url.into());
         self
@@ -380,6 +405,19 @@ impl WebServerFlowBuilder {
         self
     }
 
+    /// Supplies a pre-configured `reqwest::Client` for the token exchange.
+    /// Useful for sharing a connection pool.
+    ///
+    /// The client built by default applies connect and request timeouts
+    /// and refuses to follow redirects, so a redirect cannot replay the
+    /// authorization code and PKCE verifier to another host. A client
+    /// supplied here replaces those defaults wholesale — configure both
+    /// on it.
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
     /// Finalizes the builder.
     pub fn build(self) -> AuthResult<WebServerFlow> {
         let consumer_key = self
@@ -388,12 +426,16 @@ impl WebServerFlowBuilder {
         let redirect_uri = self
             .redirect_uri
             .ok_or(AuthError::MissingField("redirect_uri"))?;
-        let mut login_url = self
-            .login_url
-            .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string());
-        if login_url.ends_with('/') {
-            login_url.pop();
-        }
+        let login_url = normalize_url(
+            &self
+                .login_url
+                .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string()),
+        );
+        require_secure_login_url(&login_url)?;
+        let http = match self.http_client {
+            Some(client) => client,
+            None => default_http_client()?,
+        };
         Ok(WebServerFlow {
             consumer_key,
             consumer_secret: self.consumer_secret,
@@ -402,6 +444,7 @@ impl WebServerFlowBuilder {
             scopes: self.scopes,
             prompt: self.prompt,
             login_hint: self.login_hint,
+            http,
         })
     }
 }
@@ -411,7 +454,7 @@ impl WebServerFlowBuilder {
 /// the format we use for `state` to keep it URL-safe.
 fn random_b64url(len: usize) -> AuthResult<String> {
     let mut bytes = vec![0u8; len];
-    getrandom::fill(&mut bytes).map_err(|e| AuthError::Other(format!("CSPRNG failure: {e}")))?;
+    getrandom::fill(&mut bytes).map_err(|e| AuthError::Randomness(e.to_string()))?;
     Ok(URL_SAFE_NO_PAD.encode(&bytes))
 }
 
@@ -445,6 +488,22 @@ mod tests {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    /// Salesforce's documented token response for the web server flow.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_understanding_web_server_oauth_flow.htm
+    /// (doc_version 222.0) — field values copied from the guide's sample
+    /// JSON body, including the trailing slash it puts on `instance_url`.
+    fn documented_token_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "https://login.salesforce.com/id/00Dx0000000BV7z/005x00000012Q9P",
+            "issued_at": "1278448101416",
+            "refresh_token": "5Aep861KIwKdekr...refresh",
+            "instance_url": "https://yourInstance.salesforce.com/",
+            "signature": "CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=",
+            "access_token": "00Dx0000000BV7z!AR8AQP0jITN80ESEsj5EbaZTFG0RNBaT1cyWk7TrqoDjoNIWQ2ME_sTZzBjfmOE6zMHq6y8PIW4eWze9JksNEkWUl.Cju7m4",
+        })
+    }
+
     fn flow_with_required_fields() -> WebServerFlowBuilder {
         WebServerFlow::builder()
             .consumer_key("consumer-key-123")
@@ -464,8 +523,9 @@ mod tests {
         let a = random_b64url(VERIFIER_BYTES).unwrap();
         let b = random_b64url(VERIFIER_BYTES).unwrap();
         assert_ne!(a, b);
-        // 96 bytes encodes to exactly 128 base64-url chars (no padding) —
-        // the RFC 7636 maximum and Salesforce's documented recommendation.
+        // 96 bytes encodes to exactly 128 base64-url chars (no padding),
+        // the ceiling RFC 7636's `code-verifier = 43*128unreserved`
+        // grammar allows.
         assert_eq!(a.len(), 128);
     }
 
@@ -511,6 +571,15 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, AuthError::MissingField("redirect_uri")));
+    }
+
+    #[test]
+    fn builder_rejects_cleartext_login_url() {
+        let err = flow_with_required_fields()
+            .login_url("http://my-org.my.salesforce.com")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
     }
 
     #[test]
@@ -561,6 +630,20 @@ mod tests {
     }
 
     #[test]
+    fn start_keeps_the_login_url_base_path() {
+        // An Experience Cloud site login lives under the site's path; the
+        // authorize URL must extend it rather than replace it, so both
+        // phases address the same endpoint pair.
+        let flow = flow_with_required_fields()
+            .login_url("https://fineapps.my.site.com/fineapps/")
+            .build()
+            .unwrap();
+        let (url, _) = flow.start().unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/fineapps/services/oauth2/authorize");
+    }
+
+    #[test]
     fn start_includes_optional_params_when_set() {
         let flow = flow_with_required_fields()
             .prompt("login")
@@ -596,6 +679,25 @@ mod tests {
         assert_eq!(restored.code_verifier, pending.code_verifier);
     }
 
+    #[test]
+    fn serialized_pending_exchange_carries_no_connected_app_credentials() {
+        // The caller is told to persist this value between the two
+        // phases. Whatever store they choose must never receive the
+        // connected app's key or secret.
+        let flow = flow_with_required_fields()
+            .consumer_secret("super-secret-value")
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let json = serde_json::to_string(&pending).unwrap();
+        assert!(!json.contains("super-secret-value"), "leaked: {json}");
+        assert!(!json.contains("consumer-key-123"), "leaked: {json}");
+        assert!(
+            !json.contains("app.example.com"),
+            "unexpected flow config in the persisted value: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn complete_exchanges_code_for_session() {
         let server = MockServer::start().await;
@@ -605,16 +707,7 @@ mod tests {
             .and(body_string_contains("code=auth-code-xyz"))
             .and(body_string_contains("client_id=consumer-key-123"))
             .and(body_string_contains("code_verifier="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "00DXX!ACCESS",
-                "refresh_token": "5Aep861KIwKdekr",
-                "instance_url": "https://my-org.my.salesforce.com",
-                "token_type": "Bearer",
-                "id": "https://login.salesforce.com/id/00DXX/005XX",
-                "issued_at": "1278448384422",
-                "signature": "2wG3D9w1PzUlP/BEwa0u3D2C/D54p4Nz6tH5e9d0E5Q=",
-                "scope": "api refresh_token",
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
             .mount(&server)
             .await;
 
@@ -627,22 +720,70 @@ mod tests {
         let (_url, pending) = flow.start().unwrap();
         let state = pending.state().to_string();
 
-        let session = pending
-            .complete("auth-code-xyz", &state, &reqwest::Client::new())
+        let session = flow
+            .complete(pending, "auth-code-xyz", &state)
             .await
             .unwrap();
-        assert_eq!(session.access_token, "00DXX!ACCESS");
-        assert_eq!(session.refresh_token.as_deref(), Some("5Aep861KIwKdekr"));
-        assert_eq!(session.instance_url, "https://my-org.my.salesforce.com");
+        assert!(session.access_token.starts_with("00Dx0000000BV7z!"));
+        assert!(
+            session
+                .refresh_token
+                .as_deref()
+                .is_some_and(|t| t.starts_with("5Aep861"))
+        );
+        // The documented body carries a trailing slash; the session
+        // exposes the normalized form so path concatenation is safe.
+        assert_eq!(session.instance_url, "https://yourInstance.salesforce.com");
         // Identity fields propagate through so callers can verify which
         // user authenticated.
         assert_eq!(
             session.id.as_deref(),
-            Some("https://login.salesforce.com/id/00DXX/005XX")
+            Some("https://login.salesforce.com/id/00Dx0000000BV7z/005x00000012Q9P")
         );
-        assert_eq!(session.issued_at.as_deref(), Some("1278448384422"));
-        assert!(session.signature.is_some());
-        assert_eq!(session.scope.as_deref(), Some("api refresh_token"));
+        assert_eq!(session.issued_at.as_deref(), Some("1278448101416"));
+        assert_eq!(
+            session.signature.as_deref(),
+            Some("CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=")
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_sends_the_verifier_behind_the_published_challenge() {
+        // The one property PKCE exists for: the token request must carry
+        // the verifier whose S256 hash was published in the authorization
+        // URL — not the challenge, and not some other value.
+        let server = MockServer::start().await;
+        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(BodyCapturingResponder {
+                captured: captured.clone(),
+                response: ResponseTemplate::new(200).set_body_json(documented_token_response()),
+            })
+            .mount(&server)
+            .await;
+
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let (url, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let verifier = pending.code_verifier.clone();
+
+        let published_challenge = url::Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "code_challenge")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+
+        flow.complete(pending, "c", &state).await.unwrap();
+
+        let body = captured.lock().await;
+        let sent = form_value(&body, "code_verifier").expect("code_verifier must be sent");
+        assert_eq!(sent, verifier);
+        assert_eq!(pkce_s256_challenge(&sent), published_challenge);
     }
 
     #[tokio::test]
@@ -655,11 +796,11 @@ mod tests {
             .unwrap();
         let (_url, pending) = flow.start().unwrap();
 
-        let err = pending
-            .complete("code", "wrong-state", &reqwest::Client::new())
+        let err = flow
+            .complete(pending, "code", "wrong-state")
             .await
             .unwrap_err();
-        assert!(matches!(err, AuthError::Other(_)));
+        assert!(matches!(err, AuthError::StateMismatch), "{err:?}");
     }
 
     #[tokio::test]
@@ -668,10 +809,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .and(body_string_contains("client_secret=hunter2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "tok",
-                "instance_url": "https://my-org.my.salesforce.com"
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
             .mount(&server)
             .await;
 
@@ -682,26 +820,19 @@ mod tests {
             .unwrap();
         let (_, pending) = flow.start().unwrap();
         let state = pending.state().to_string();
-        pending
-            .complete("c", &state, &reqwest::Client::new())
-            .await
-            .unwrap();
+        flow.complete(pending, "c", &state).await.unwrap();
     }
 
     #[tokio::test]
     async fn public_client_omits_client_secret() {
         let server = MockServer::start().await;
         let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let captured_clone = captured.clone();
 
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(BodyCapturingResponder {
-                captured: captured_clone,
-                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "tok",
-                    "instance_url": "https://my-org.my.salesforce.com"
-                })),
+                captured: captured.clone(),
+                response: ResponseTemplate::new(200).set_body_json(documented_token_response()),
             })
             .mount(&server)
             .await;
@@ -712,16 +843,48 @@ mod tests {
             .unwrap();
         let (_, pending) = flow.start().unwrap();
         let state = pending.state().to_string();
-        pending
-            .complete("c", &state, &reqwest::Client::new())
-            .await
-            .unwrap();
+        flow.complete(pending, "c", &state).await.unwrap();
 
         let body = captured.lock().await;
         assert!(
             !body.contains("client_secret"),
             "public client should not send client_secret, got: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn openid_scope_surfaces_the_id_token() {
+        // Salesforce returns a signed ID token when `openid` is among the
+        // requested scopes; the caller paid a consent prompt for it, so it
+        // must reach them rather than being dropped.
+        let server = MockServer::start().await;
+        let mut body = documented_token_response();
+        body["id_token"] = serde_json::Value::String("eyJhbGciOiJSUzI1NiJ9.payload.sig".into());
+        body["scope"] = serde_json::Value::String("api openid".into());
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .scope("api")
+            .scope("openid")
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let session = flow.complete(pending, "c", &state).await.unwrap();
+
+        assert_eq!(
+            session.id_token.as_deref(),
+            Some("eyJhbGciOiJSUzI1NiJ9.payload.sig")
+        );
+        assert_eq!(session.scope.as_deref(), Some("api openid"));
+        // The ID token is a credential — keep it out of debug output.
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("eyJhbGciOiJSUzI1NiJ9"), "leaked: {debug}");
     }
 
     #[tokio::test]
@@ -742,11 +905,18 @@ mod tests {
             .unwrap();
         let (_, pending) = flow.start().unwrap();
         let state = pending.state().to_string();
-        let err = pending
-            .complete("c", &state, &reqwest::Client::new())
-            .await
-            .unwrap_err();
+        let err = flow.complete(pending, "c", &state).await.unwrap_err();
         assert!(matches!(err, AuthError::OAuth { .. }));
+    }
+
+    /// Reads one field out of a captured `application/x-www-form-urlencoded`
+    /// request body.
+    fn form_value(body: &str, key: &str) -> Option<String> {
+        serde_urlencoded::from_str::<Vec<(String, String)>>(body)
+            .ok()?
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     struct BodyCapturingResponder {
