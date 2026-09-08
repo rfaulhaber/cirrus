@@ -346,10 +346,18 @@ pub struct DeployMessage {
     pub column_number: Option<i32>,
 }
 
+/// Whether a [`DeployMessage`] reports an error or a warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum DeployProblemType {
     Warning,
     Error,
+    /// A problem-type literal this SDK version doesn't know. This enum
+    /// rides inside every [`DeployMessage`], so without a fallback a
+    /// single new literal would fail deserialization of an entire
+    /// `check_deploy_status(id, true)` response — every component
+    /// success and failure with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Apex test results inside [`DeployDetails`].
@@ -933,6 +941,7 @@ mod tests {
             retrieve: RetrieveStatus,
             state: AsyncRequestState,
             manageable: ManageableState,
+            problem: DeployProblemType,
         }
         let parsed: Wire = quick_xml::de::from_str(
             "<Wire>\
@@ -940,6 +949,7 @@ mod tests {
                <retrieve>BrandNewPhase</retrieve>\
                <state>BrandNewPhase</state>\
                <manageable>brandNewState</manageable>\
+               <problem>Info</problem>\
              </Wire>",
         )
         .unwrap();
@@ -949,6 +959,7 @@ mod tests {
         assert!(!parsed.retrieve.is_terminal());
         assert_eq!(parsed.state, AsyncRequestState::Unknown);
         assert_eq!(parsed.manageable, ManageableState::Unknown);
+        assert_eq!(parsed.problem, DeployProblemType::Unknown);
     }
 
     #[test]
