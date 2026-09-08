@@ -156,7 +156,7 @@ workspace's `.env` and the same URL safety guard as `cirrus` and
 
 ```bash
 cargo nextest run -p cirrus-metadata --test integration \
-    --run-ignored only -- --test-threads=1
+    --run-ignored only -j 1
 ```
 
 ## License
