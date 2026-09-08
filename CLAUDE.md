@@ -35,7 +35,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - Typed `package.xml` via `PackageManifest` builder; `MetadataType` ships constants for the common types and `MetadataType::new` names anything else.
 - Open-ended escape hatch (`MetadataClient::request_builder()`), retry policy, and `INVALID_SESSION_ID` auto-refresh against the configured `AuthSession`.
 
-Tests: ~565 unit + ~33 doctest workspace-wide, all wiremock-backed, fast (<10s wall). Integration tests against real orgs are `#[ignore]`-gated and live under each crate's `tests/integration/`.
+Tests: ~585 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s wall). Integration tests against real orgs are `#[ignore]`-gated and live under each crate's `tests/integration/`.
 
 ### Project-wide rules
 
