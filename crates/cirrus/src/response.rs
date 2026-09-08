@@ -855,6 +855,17 @@ pub struct SObjectCollectionResult {
 /// `line` and `column` use `-1` as the "no error" sentinel. Callers
 /// should branch on [`success`](Self::success) rather than checking
 /// these for `>= 0`.
+//
+// Wire-shape provenance (api_tooling doc page IDs): `intro_rest_resources`
+// documents only the request for `/executeAnonymous` — no response body is
+// published for the REST resource. The field set below comes from
+// `tooling_api_objects_apexresult`, which enumerates the seven
+// `ExecuteAnonymousResult` fields (`column`, `compileProblem`, `compiled`,
+// `exceptionMessage`, `exceptionStackTrace`, `line`, `success`) for the
+// ApexExecutionOverlayResult surface. The JSON casing and the `-1` "no
+// error" sentinel on `line`/`column` are not published anywhere fetchable;
+// they come from live API observation, which is why those two fields are
+// non-`Option` `i32`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecuteAnonymousResult {
     /// `true` if the Apex source compiled. `false` indicates a syntax
