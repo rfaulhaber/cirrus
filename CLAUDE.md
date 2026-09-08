@@ -116,7 +116,7 @@ cargo nextest run -p cirrus-metadata  --test integration --run-ignored only -j 1
 
 The harness (`tests/integration/common.rs` in each crate) refuses to run unless `INSTANCE_URL` matches a known sandbox / Developer Edition / scratch My Domain pattern: `.sandbox.`, `.develop.`, `.scratch.`, or `.trailblaze.` infix before `.my.salesforce.com`. The `.trailblaze.` partition is used by free Developer Edition orgs from developer.salesforce.com signup (subdomain typically ends `-dev-ed`). Override with `CIRRUS_INTEGRATION_FORCE=1` only after verifying the target org is safe for destructive writes — the safe-list catches Enhanced Domains URLs but not legacy pre-Spring-'23 sandbox URLs, and Salesforce occasionally introduces new partition infixes (audit when adding orgs in unfamiliar shapes).
 
-Auth supports two paths: paste a static token from `sf org display`, or configure JWT bearer flow with a connected app + private key. Static-token mode is the easy bootstrap; JWT exercises the full auth flow.
+Auth supports two paths: paste a static token from `sf org display`, or configure JWT bearer flow with a connected app + private key. Static-token mode is the easy bootstrap; JWT exercises the full auth flow. Once `CIRRUS_INTEGRATION=1` is set, an incomplete auth configuration fails the run instead of skipping, so an opted-in run can't come back green having made no calls. `INSTANCE_URL` and `LOGIN_URL` must both be `https`; `CIRRUS_INTEGRATION_FORCE=1` waives the org classification, never that.
 
 Don't add network-touching tests to the default (`cargo test`) suite — those should always be wiremock-backed and offline.
 

@@ -23,6 +23,11 @@
 //!
 //! See `.env.example` at the repo root for the full template.
 //!
+//! With `CIRRUS_INTEGRATION=1` set, a missing or half-filled auth
+//! configuration fails the run instead of skipping — a blank `KEY=`
+//! counts as unset. Skipping there would report an all-green run that
+//! made no calls.
+//!
 //! `INSTANCE_URL` and `LOGIN_URL` must both be `https`, and
 //! `CIRRUS_INTEGRATION_FORCE=1` does not waive that — a bearer token or
 //! a signed JWT assertion on a plaintext request is disclosed to the
@@ -77,6 +82,78 @@ fn requires_https(env_key: &str, url: &str) {
     );
 }
 
+/// Reads an environment variable, treating a set-but-blank value as
+/// unset. `KEY=` is the natural way to clear a stale value in a `.env`,
+/// and it must not select the auth mode that variable belongs to.
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The four variables the JWT bearer flow needs.
+struct JwtConfig {
+    username: String,
+    consumer_key: String,
+    private_key_path: String,
+    login_url: String,
+}
+
+/// Reads the JWT block, or `None` when none of its variables is set.
+///
+/// A half-filled block fails the run instead of skipping: once
+/// `CIRRUS_INTEGRATION=1` is set the operator has opted in, and a silent
+/// skip reports an all-green run that exercised nothing.
+fn jwt_config() -> Option<JwtConfig> {
+    match (
+        env_var(ENV_USERNAME),
+        env_var(ENV_CONSUMER_KEY),
+        env_var(ENV_PRIVATE_KEY_PATH),
+        env_var(ENV_LOGIN_URL),
+    ) {
+        (Some(username), Some(consumer_key), Some(private_key_path), Some(login_url)) => {
+            Some(JwtConfig {
+                username,
+                consumer_key,
+                private_key_path,
+                login_url,
+            })
+        }
+        (None, None, None, None) => None,
+        (username, consumer_key, private_key_path, login_url) => panic!(
+            "JWT mode is only partially configured — missing or blank: {}. \
+             All four of {ENV_USERNAME}, {ENV_CONSUMER_KEY}, \
+             {ENV_PRIVATE_KEY_PATH} and {ENV_LOGIN_URL} are required. \
+             See .env.example.",
+            missing_names(&[
+                (ENV_USERNAME, username.is_none()),
+                (ENV_CONSUMER_KEY, consumer_key.is_none()),
+                (ENV_PRIVATE_KEY_PATH, private_key_path.is_none()),
+                (ENV_LOGIN_URL, login_url.is_none()),
+            ]),
+        ),
+    }
+}
+
+fn missing_names(vars: &[(&str, bool)]) -> String {
+    vars.iter()
+        .filter(|(_, missing)| *missing)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Message for an opted-in run that configured neither auth path.
+fn no_auth_configured() -> String {
+    format!(
+        "{ENV_ENABLED}=1 but no auth is configured. Set {ENV_ACCESS_TOKEN} \
+         for static-token mode, or all four of {ENV_USERNAME}, \
+         {ENV_CONSUMER_KEY}, {ENV_PRIVATE_KEY_PATH} and {ENV_LOGIN_URL} \
+         for JWT mode. See .env.example."
+    )
+}
+
 fn load_dotenv() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -86,7 +163,8 @@ fn load_dotenv() {
 
 /// Resolves the configured `instance_url` after applying the safety
 /// guard. Returns `None` (and prints a skip message) when integration
-/// tests aren't enabled or the URL fails the safe-list check.
+/// tests aren't enabled or the URL fails the safe-list check; panics
+/// when they are enabled but `INSTANCE_URL` is missing.
 pub fn try_instance_url() -> Option<String> {
     load_dotenv();
 
@@ -95,7 +173,9 @@ pub fn try_instance_url() -> Option<String> {
         return None;
     }
 
-    let instance_url = std::env::var(ENV_INSTANCE_URL).ok()?;
+    let Some(instance_url) = env_var(ENV_INSTANCE_URL) else {
+        panic!("{ENV_ENABLED}=1 but {ENV_INSTANCE_URL} is not set. See .env.example.");
+    };
 
     // `FORCE` waives the org classification below, never transport
     // security, so the scheme is checked separately from the safe-list.
@@ -114,14 +194,15 @@ pub fn try_instance_url() -> Option<String> {
 }
 
 /// Builds an [`AuthSession`] from environment, preferring static-token
-/// mode when both are available. Returns `None` when neither path is
-/// configured.
+/// mode when both are available. Returns `None` only when the harness
+/// itself is disabled or refuses the configured URL; an opted-in run
+/// with no usable auth configuration panics rather than skipping.
 ///
 /// [`AuthSession`]: cirrus_auth::AuthSession
 pub async fn try_init_auth() -> Option<SharedAuth> {
     let instance_url = try_instance_url()?;
 
-    if let Ok(token) = std::env::var(ENV_ACCESS_TOKEN) {
+    if let Some(token) = env_var(ENV_ACCESS_TOKEN) {
         let shared: SharedAuth = Arc::new(StaticTokenAuth::new(token, instance_url));
         return Some(shared);
     }
@@ -132,44 +213,48 @@ pub async fn try_init_auth() -> Option<SharedAuth> {
 }
 
 /// Builds a [`JwtAuth`] from environment, *ignoring* `ACCESS_TOKEN`.
-/// Returns `None` when any of the four JWT vars is missing.
+///
+/// Returns `None` when the JWT block is absent altogether and
+/// static-token mode is configured instead — that is a legitimate
+/// setup, and the JWT-specific tests skip. A half-filled JWT block, or
+/// no auth configuration at all, panics.
 ///
 /// Use this from JWT-specific tests that must exercise the full
 /// bearer flow rather than fall through to the static-token shortcut.
 pub async fn try_init_jwt_auth() -> Option<JwtAuth> {
     let instance_url = try_instance_url()?;
 
-    let username = std::env::var(ENV_USERNAME).ok()?;
-    let consumer_key = std::env::var(ENV_CONSUMER_KEY).ok()?;
-    let private_key_path = std::env::var(ENV_PRIVATE_KEY_PATH).ok()?;
-    let login_url = std::env::var(ENV_LOGIN_URL).ok()?;
-
-    requires_https(ENV_LOGIN_URL, &login_url);
-
-    let builder = match JwtAuth::builder()
-        .consumer_key(consumer_key)
-        .username(username)
-        .login_url(login_url)
-        .instance_url(instance_url)
-        .private_key_pem_file(private_key_path.clone())
-    {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "skipping: failed to load private key from \
-                 {ENV_PRIVATE_KEY_PATH} ({private_key_path}): {e}",
-            );
-            return None;
-        }
+    let Some(jwt) = jwt_config() else {
+        assert!(
+            env_var(ENV_ACCESS_TOKEN).is_some(),
+            "{}",
+            no_auth_configured()
+        );
+        eprintln!("skipping: JWT mode not configured ({ENV_ACCESS_TOKEN} only)");
+        return None;
     };
 
-    match builder.build() {
-        Ok(a) => Some(a),
-        Err(e) => {
-            eprintln!("skipping: JwtAuth construction failed: {e}");
-            None
-        }
-    }
+    requires_https(ENV_LOGIN_URL, &jwt.login_url);
+
+    let builder = JwtAuth::builder()
+        .consumer_key(jwt.consumer_key)
+        .username(jwt.username)
+        .login_url(jwt.login_url)
+        .instance_url(instance_url)
+        .private_key_pem_file(jwt.private_key_path.clone())
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to load the private key at {ENV_PRIVATE_KEY_PATH} \
+                 ({}): {e}. Note that `~` is not expanded — give an \
+                 absolute path.",
+                jwt.private_key_path,
+            )
+        });
+
+    let auth = builder
+        .build()
+        .unwrap_or_else(|e| panic!("JwtAuth construction failed: {e}"));
+    Some(auth)
 }
 
 /// Lightweight verifier: hits a trivial Salesforce REST endpoint

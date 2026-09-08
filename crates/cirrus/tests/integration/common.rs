@@ -30,6 +30,11 @@
 //! the shell. Shell takes precedence. `.env` should be gitignored —
 //! see `.env.example` in the repo root.
 //!
+//! With `CIRRUS_INTEGRATION=1` set, a missing or half-filled auth
+//! configuration fails the run instead of skipping — a blank `KEY=`
+//! counts as unset. Skipping there would report an all-green run that
+//! made no calls.
+//!
 //! # Safety: URL pattern guard
 //!
 //! Refuses to run unless the configured `INSTANCE_URL` matches a
@@ -114,6 +119,78 @@ fn requires_https(env_key: &str, url: &str) {
     );
 }
 
+/// Reads an environment variable, treating a set-but-blank value as
+/// unset. `KEY=` is the natural way to clear a stale value in a `.env`,
+/// and it must not select the auth mode that variable belongs to.
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The four variables the JWT bearer flow needs.
+struct JwtConfig {
+    username: String,
+    consumer_key: String,
+    private_key_path: String,
+    login_url: String,
+}
+
+/// Reads the JWT block, or `None` when none of its variables is set.
+///
+/// A half-filled block fails the run instead of skipping: once
+/// `CIRRUS_INTEGRATION=1` is set the operator has opted in, and a silent
+/// skip reports an all-green run that exercised nothing.
+fn jwt_config() -> Option<JwtConfig> {
+    match (
+        env_var(ENV_USERNAME),
+        env_var(ENV_CONSUMER_KEY),
+        env_var(ENV_PRIVATE_KEY_PATH),
+        env_var(ENV_LOGIN_URL),
+    ) {
+        (Some(username), Some(consumer_key), Some(private_key_path), Some(login_url)) => {
+            Some(JwtConfig {
+                username,
+                consumer_key,
+                private_key_path,
+                login_url,
+            })
+        }
+        (None, None, None, None) => None,
+        (username, consumer_key, private_key_path, login_url) => panic!(
+            "JWT mode is only partially configured — missing or blank: {}. \
+             All four of {ENV_USERNAME}, {ENV_CONSUMER_KEY}, \
+             {ENV_PRIVATE_KEY_PATH} and {ENV_LOGIN_URL} are required. \
+             See .env.example.",
+            missing_names(&[
+                (ENV_USERNAME, username.is_none()),
+                (ENV_CONSUMER_KEY, consumer_key.is_none()),
+                (ENV_PRIVATE_KEY_PATH, private_key_path.is_none()),
+                (ENV_LOGIN_URL, login_url.is_none()),
+            ]),
+        ),
+    }
+}
+
+fn missing_names(vars: &[(&str, bool)]) -> String {
+    vars.iter()
+        .filter(|(_, missing)| *missing)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Message for an opted-in run that configured neither auth path.
+fn no_auth_configured() -> String {
+    format!(
+        "{ENV_ENABLED}=1 but no auth is configured. Set {ENV_ACCESS_TOKEN} \
+         for static-token mode, or all four of {ENV_USERNAME}, \
+         {ENV_CONSUMER_KEY}, {ENV_PRIVATE_KEY_PATH} and {ENV_LOGIN_URL} \
+         for JWT mode. See .env.example."
+    )
+}
+
 /// Loads a `.env` from the project root once per test process. Idempotent.
 fn load_dotenv() {
     static ONCE: Once = Once::new();
@@ -126,9 +203,12 @@ fn load_dotenv() {
 /// Tries to construct a [`Cirrus`] from environment configuration.
 ///
 /// - Returns `Some(client)` if fully configured.
-/// - Returns `None` with a stderr skip message if env vars aren't set
-///   or if the URL fails the safety guard. Tests should `return` on
-///   `None`.
+/// - Returns `None` with a stderr skip message when `CIRRUS_INTEGRATION`
+///   isn't `1`, or when the URL fails the safety guard. Tests should
+///   `return` on `None`.
+/// - Panics when `CIRRUS_INTEGRATION=1` but the rest of the
+///   configuration is missing or half-filled. An opted-in run that
+///   exercises nothing must not report green.
 ///
 /// **Don't** unwrap or panic on `None` — that would defeat the
 /// "tests pass cleanly when unconfigured" property.
@@ -140,9 +220,8 @@ pub async fn try_init_client() -> Option<Cirrus> {
         return None;
     }
 
-    let Ok(instance_url) = std::env::var(ENV_INSTANCE_URL) else {
-        eprintln!("skipping: {ENV_INSTANCE_URL} not set");
-        return None;
+    let Some(instance_url) = env_var(ENV_INSTANCE_URL) else {
+        panic!("{ENV_ENABLED}=1 but {ENV_INSTANCE_URL} is not set. See .env.example.");
     };
 
     // `FORCE` waives the org classification below, never transport
@@ -162,7 +241,7 @@ pub async fn try_init_client() -> Option<Cirrus> {
         return None;
     }
 
-    let auth = build_auth(&instance_url).await?;
+    let auth = build_auth(&instance_url);
 
     let client = Cirrus::builder()
         .auth(auth)
@@ -171,48 +250,40 @@ pub async fn try_init_client() -> Option<Cirrus> {
     Some(client)
 }
 
-async fn build_auth(instance_url: &str) -> Option<SharedAuth> {
+fn build_auth(instance_url: &str) -> SharedAuth {
     // Prefer static token if set — fastest bootstrap, doesn't exercise
     // a flow but most contributors will have one handy via `sf org display`.
-    if let Ok(token) = std::env::var(ENV_ACCESS_TOKEN) {
-        let auth = StaticTokenAuth::new(token, instance_url);
-        return Some(Arc::new(auth));
+    if let Some(token) = env_var(ENV_ACCESS_TOKEN) {
+        return Arc::new(StaticTokenAuth::new(token, instance_url));
     }
 
-    // Otherwise try JWT bearer flow — exercises our full auth flow,
+    // Otherwise the JWT bearer flow — exercises our full auth flow,
     // requires more setup (connected app + cert).
-    let username = std::env::var(ENV_USERNAME).ok()?;
-    let consumer_key = std::env::var(ENV_CONSUMER_KEY).ok()?;
-    let private_key_path = std::env::var(ENV_PRIVATE_KEY_PATH).ok()?;
-    let login_url = std::env::var(ENV_LOGIN_URL).ok()?;
+    let Some(jwt) = jwt_config() else {
+        panic!("{}", no_auth_configured());
+    };
 
-    requires_https(ENV_LOGIN_URL, &login_url);
+    requires_https(ENV_LOGIN_URL, &jwt.login_url);
 
-    let builder = match JwtAuth::builder()
-        .consumer_key(consumer_key)
-        .username(username)
-        .login_url(login_url)
+    let builder = JwtAuth::builder()
+        .consumer_key(jwt.consumer_key)
+        .username(jwt.username)
+        .login_url(jwt.login_url)
         .instance_url(instance_url)
-        .private_key_pem_file(private_key_path.clone())
-    {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "skipping: failed to load private key from \
-                 {ENV_PRIVATE_KEY_PATH} ({private_key_path}): {e}",
-            );
-            return None;
-        }
-    };
+        .private_key_pem_file(jwt.private_key_path.clone())
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to load the private key at {ENV_PRIVATE_KEY_PATH} \
+                 ({}): {e}. Note that `~` is not expanded — give an \
+                 absolute path.",
+                jwt.private_key_path,
+            )
+        });
 
-    let auth = match builder.build() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("skipping: JwtAuth construction failed: {e}");
-            return None;
-        }
-    };
-    Some(Arc::new(auth))
+    let auth = builder
+        .build()
+        .unwrap_or_else(|e| panic!("JwtAuth construction failed: {e}"));
+    Arc::new(auth)
 }
 
 #[cfg(test)]
