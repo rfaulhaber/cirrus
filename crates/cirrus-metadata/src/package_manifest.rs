@@ -227,9 +227,19 @@ fn collapse_wildcard(members: &mut Vec<String>) {
 impl PackageManifest {
     /// Create a new empty manifest at the given API version.
     ///
-    /// `api_version` is the Salesforce version string (e.g. `"66.0"`)
-    /// — emitted into `<version>` in `package.xml` and into the
-    /// `<apiVersion>` field on SOAP retrieve.
+    /// `api_version` is the Salesforce version string (e.g. `"66.0"`).
+    /// It is emitted as the manifest's `<version>` element — in
+    /// `package.xml` and in the SOAP `unpackaged` parameter alike.
+    ///
+    /// This is a separate value from
+    /// [`RetrieveRequest::api_version`], which is emitted as the
+    /// retrieve request's own `<apiVersion>` element. In API version
+    /// 31.0 and later Salesforce uses the version specified in
+    /// `package.xml` for the retrieve, overriding `<apiVersion>` — so
+    /// keep the two in sync unless you specifically want the manifest
+    /// version to win.
+    ///
+    /// [`RetrieveRequest::api_version`]: crate::RetrieveRequest::api_version
     pub fn new(api_version: impl Into<String>) -> Self {
         Self {
             api_version: api_version.into(),
