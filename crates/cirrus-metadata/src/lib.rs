@@ -113,15 +113,22 @@ pub use transport::SoapOperation;
 pub const DEFAULT_API_VERSION: &str = "66.0";
 
 /// Deadline for establishing a connection to the SOAP endpoint.
-const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Deadline for each read from an open response body.
 ///
-/// A per-read deadline rather than a whole-request one: a retrieve can
-/// legitimately stream tens of megabytes of base64 zip, so the transfer
-/// gets as long as it needs while a peer that stops sending altogether
-/// still surfaces an error the retry policy can act on.
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Override with [`MetadataClientBuilder::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read timeout for the HTTP client the builder creates.
+///
+/// It runs from the moment the request is dispatched until the response
+/// head arrives — so it covers sending the envelope, which for a deploy
+/// carries the whole base64-encoded zip — and from then on bounds the
+/// gap between two chunks of the response body. Only that second phase
+/// resets.
+///
+/// Widen it with [`MetadataClientBuilder::read_timeout`] for a large
+/// deploy over a slow link: Salesforce caps the encoded zip at 50 MB,
+/// which no fixed default covers on an arbitrary connection.
+pub const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Default User-Agent header sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -256,6 +263,10 @@ pub struct MetadataClientBuilder {
     user_agent: Option<String>,
     http_client: Option<reqwest::Client>,
     retry_policy: Option<RetryPolicy>,
+    // Outer `Option` is "did the caller set this"; inner `None` is the
+    // caller asking for no deadline at all.
+    connect_timeout: Option<Option<std::time::Duration>>,
+    read_timeout: Option<Option<std::time::Duration>>,
 }
 
 impl MetadataClientBuilder {
@@ -287,13 +298,39 @@ impl MetadataClientBuilder {
     /// setting is ignored — configure that on the supplied client.
     ///
     /// The supplied client also brings its own timeouts and redirect
-    /// policy. The client this builder constructs otherwise sets a
-    /// 30 s connect timeout, a 60 s read timeout, and disables redirects
-    /// so the session token in the SOAP envelope is never re-POSTed to a
-    /// redirect target; a client configured here should do the same
-    /// unless you have a reason not to.
+    /// policy, so the builder's `connect_timeout` and `read_timeout`
+    /// are ignored. The client this builder constructs otherwise
+    /// applies [`DEFAULT_CONNECT_TIMEOUT`] and [`DEFAULT_READ_TIMEOUT`]
+    /// and disables redirects so the session token in the SOAP envelope
+    /// is never re-POSTed to a redirect target; a client configured here
+    /// should do the same unless you have a reason not to.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout for the HTTP client this builder
+    /// creates. Defaults to [`DEFAULT_CONNECT_TIMEOUT`]; pass `None` to
+    /// wait indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<std::time::Duration>>) -> Self {
+        self.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the read timeout for the HTTP client this builder creates.
+    /// Defaults to [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait
+    /// indefinitely.
+    ///
+    /// The deadline covers the whole in-flight request until the
+    /// response head arrives — a deploy's base64 zip goes up inside it —
+    /// and after that the gap between two response chunks. Widen it for
+    /// a large deploy or retrieve over a slow link.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn read_timeout(mut self, timeout: impl Into<Option<std::time::Duration>>) -> Self {
+        self.read_timeout = Some(timeout.into());
         self
     }
 
@@ -317,18 +354,24 @@ impl MetadataClientBuilder {
                 HeaderValue::from_str(ua)
                     .map_err(|e| MetadataError::InvalidHeader(e.to_string()))?,
             );
-            reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder()
                 .default_headers(headers)
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .read_timeout(DEFAULT_READ_TIMEOUT)
                 // The Metadata API carries the session token in the
                 // request body, where a redirect's cross-host header
                 // stripping can't reach it. Surfacing a 3xx as an error
                 // beats re-POSTing the envelope — token included — to
                 // whatever host the Location named.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(MetadataError::HttpClient)?
+                .redirect(reqwest::redirect::Policy::none());
+            if let Some(t) = self
+                .connect_timeout
+                .unwrap_or(Some(DEFAULT_CONNECT_TIMEOUT))
+            {
+                builder = builder.connect_timeout(t);
+            }
+            if let Some(t) = self.read_timeout.unwrap_or(Some(DEFAULT_READ_TIMEOUT)) {
+                builder = builder.read_timeout(t);
+            }
+            builder.build().map_err(MetadataError::HttpClient)?
         };
 
         Ok(MetadataClient {

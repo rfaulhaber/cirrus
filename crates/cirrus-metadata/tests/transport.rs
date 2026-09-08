@@ -9,7 +9,8 @@
 //! - same fault with non-refreshable auth → surfaced verbatim,
 //! - HTTP 503 → retry per `RetryPolicy`,
 //! - non-envelope body → `MetadataError::Http4xx5xx`,
-//! - 3xx redirect → surfaced as an error, never followed.
+//! - 3xx redirect → surfaced as an error, never followed,
+//! - builder read timeout → transport error once the deadline passes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -581,5 +582,31 @@ async fn redirects_are_not_followed() {
     match err {
         MetadataError::Http4xx5xx { status, .. } => assert_eq!(status, 307),
         other => panic!("expected Http4xx5xx with status 307, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_builder_read_timeout_bounds_a_call_the_org_never_answers() {
+    // The deadline is armed at dispatch, so it fires while the response
+    // head is still outstanding — the phase a deploy spends pushing its
+    // base64 zip — not only between two chunks of an arriving body.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .read_timeout(std::time::Duration::from_millis(50))
+        .retry_policy(RetryPolicy::none())
+        .build()
+        .unwrap();
+
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
+        other => panic!("expected a transport error, got {other:?}"),
     }
 }
