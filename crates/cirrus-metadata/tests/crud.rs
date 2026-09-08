@@ -172,6 +172,35 @@ async fn update_metadata_returns_save_results() {
 
 // -- upsert_metadata ---------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_upsertMetadata.htm
+/// The Arguments table reads "Limit: 10." for `metadata Metadata[]`,
+/// with none of the "(For CustomMetadata and CustomApplication only,
+/// the limit is 200.)" clause the other four component-array calls
+/// carry. The client-side guard has to hold upsert to 10 even for the
+/// two types those calls exempt, or an over-limit envelope reaches the
+/// wire.
+#[tokio::test]
+async fn upsert_metadata_caps_large_types_at_ten_like_every_other_type() {
+    let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.example.com"));
+    let md = MetadataClient::builder().auth(auth).build().unwrap();
+
+    let xml: Vec<String> = (0..11)
+        .map(|i| format!("<fullName>Rec.X{i}</fullName>"))
+        .collect();
+    let err = md
+        .upsert_metadata("CustomMetadata", &xml)
+        .await
+        .unwrap_err();
+    match err {
+        MetadataError::InvalidArgument(msg) => {
+            assert!(msg.contains("upsert_metadata"), "{msg}");
+            assert!(msg.contains("10"), "{msg}");
+            assert!(msg.contains("11"), "{msg}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn upsert_metadata_returns_created_flag_per_component() {
     let server = MockServer::start().await;

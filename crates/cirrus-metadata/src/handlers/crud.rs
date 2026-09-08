@@ -33,10 +33,12 @@
 //! ## Per-call component cap
 //!
 //! All five "multi" CRUD calls cap at 10 components per call (server
-//! limit), except `CustomMetadata` and `CustomApplication`, which
-//! Salesforce documents at 200. The SDK enforces this client-side via
-//! [`MAX_CRUD_COMPONENTS_PER_CALL`] /
-//! [`MAX_CRUD_COMPONENTS_PER_CALL_LARGE`] — passing more returns
+//! limit). Four of them — `createMetadata`, `updateMetadata`,
+//! `readMetadata` and `deleteMetadata` — raise that to 200 for
+//! `CustomMetadata` and `CustomApplication`. `upsertMetadata` is the
+//! exception: its documented limit is a flat 10 for every type. The
+//! SDK enforces this client-side via [`MAX_CRUD_COMPONENTS_PER_CALL`]
+//! / [`MAX_CRUD_COMPONENTS_PER_CALL_LARGE`] — passing more returns
 //! [`MetadataError::InvalidArgument`] before hitting the wire.
 //!
 //! [`deploy`]: crate::MetadataClient::deploy
@@ -54,21 +56,57 @@ use std::marker::PhantomData;
 
 /// Salesforce server limit on per-call component count for
 /// `createMetadata`, `updateMetadata`, `upsertMetadata`,
-/// `readMetadata`, and `deleteMetadata`. `CustomMetadata` and
-/// `CustomApplication` are the documented exceptions — see
+/// `readMetadata`, and `deleteMetadata`. All but `upsertMetadata`
+/// document a raised cap for two types — see
 /// [`MAX_CRUD_COMPONENTS_PER_CALL_LARGE`].
 pub const MAX_CRUD_COMPONENTS_PER_CALL: usize = 10;
 
 /// Raised per-call component limit for `CustomMetadata` and
 /// `CustomApplication`, the two types Salesforce documents at 200
-/// components per CRUD call.
+/// components per call.
+///
+/// Applies to `createMetadata`, `updateMetadata`, `readMetadata` and
+/// `deleteMetadata`. `upsertMetadata` doesn't carry the exception: its
+/// documented limit is [`MAX_CRUD_COMPONENTS_PER_CALL`] for every
+/// type.
 pub const MAX_CRUD_COMPONENTS_PER_CALL_LARGE: usize = 200;
 
-/// The documented per-call cap for a metadata type.
-fn per_call_cap(type_name: &str) -> usize {
-    match type_name {
-        "CustomMetadata" | "CustomApplication" => MAX_CRUD_COMPONENTS_PER_CALL_LARGE,
-        _ => MAX_CRUD_COMPONENTS_PER_CALL,
+/// One of the five component-array CRUD calls, for resolving the
+/// documented per-call cap and naming the call in errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrudCall {
+    Create,
+    Update,
+    Upsert,
+    Read,
+    Delete,
+}
+
+impl CrudCall {
+    /// The public method name, used in `InvalidArgument` messages.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Create => "create_metadata",
+            Self::Update => "update_metadata",
+            Self::Upsert => "upsert_metadata",
+            Self::Read => "read_metadata",
+            Self::Delete => "delete_metadata",
+        }
+    }
+
+    /// The documented per-call cap for this call and metadata type.
+    ///
+    /// `meta_upsertMetadata`'s argument table states "Limit: 10." with
+    /// no type carve-out, where the other four spell out "Limit: 10.
+    /// (For CustomMetadata and CustomApplication only, the limit is
+    /// 200.)". A cap the docs don't grant would defeat the guard: an
+    /// over-limit upsert would reach the wire unchecked.
+    fn per_call_cap(self, type_name: &str) -> usize {
+        match (self, type_name) {
+            (Self::Upsert, _) => MAX_CRUD_COMPONENTS_PER_CALL,
+            (_, "CustomMetadata" | "CustomApplication") => MAX_CRUD_COMPONENTS_PER_CALL_LARGE,
+            _ => MAX_CRUD_COMPONENTS_PER_CALL,
+        }
     }
 }
 
@@ -106,13 +144,14 @@ fn render_type_and_full_names<S: AsRef<str>>(type_name: &str, full_names: &[S], 
     }
 }
 
-fn check_component_cap(count: usize, type_name: &str, op_label: &str) -> MetadataResult<()> {
+fn check_component_cap(count: usize, type_name: &str, call: CrudCall) -> MetadataResult<()> {
+    let op_label = call.label();
     if count == 0 {
         return Err(MetadataError::InvalidArgument(format!(
             "{op_label} requires at least one component; got 0"
         )));
     }
-    let cap = per_call_cap(type_name);
+    let cap = call.per_call_cap(type_name);
     if count > cap {
         return Err(MetadataError::InvalidArgument(format!(
             "{op_label} accepts at most {cap} {type_name} components per call; got {count}"
@@ -326,7 +365,7 @@ impl MetadataClient {
         type_name: &str,
         components: &[S],
     ) -> MetadataResult<Vec<SaveResult>> {
-        check_component_cap(components.len(), type_name, "create_metadata")?;
+        check_component_cap(components.len(), type_name, CrudCall::Create)?;
         let op = CreateMetadataOp {
             type_name,
             components,
@@ -345,7 +384,7 @@ impl MetadataClient {
         type_name: &str,
         components: &[S],
     ) -> MetadataResult<Vec<SaveResult>> {
-        check_component_cap(components.len(), type_name, "update_metadata")?;
+        check_component_cap(components.len(), type_name, CrudCall::Update)?;
         let op = UpdateMetadataOp {
             type_name,
             components,
@@ -365,7 +404,7 @@ impl MetadataClient {
         type_name: &str,
         components: &[S],
     ) -> MetadataResult<Vec<UpsertResult>> {
-        check_component_cap(components.len(), type_name, "upsert_metadata")?;
+        check_component_cap(components.len(), type_name, CrudCall::Upsert)?;
         let op = UpsertMetadataOp {
             type_name,
             components,
@@ -383,7 +422,7 @@ impl MetadataClient {
         type_name: &str,
         full_names: &[S],
     ) -> MetadataResult<Vec<DeleteResult>> {
-        check_component_cap(full_names.len(), type_name, "delete_metadata")?;
+        check_component_cap(full_names.len(), type_name, CrudCall::Delete)?;
         let op = DeleteMetadataOp {
             type_name,
             full_names,
@@ -450,7 +489,7 @@ impl MetadataClient {
         T: DeserializeOwned,
         S: AsRef<str>,
     {
-        check_component_cap(full_names.len(), type_name, "read_metadata")?;
+        check_component_cap(full_names.len(), type_name, CrudCall::Read)?;
         let op = ReadMetadataOp::<T, S> {
             type_name,
             full_names,
@@ -576,13 +615,14 @@ mod tests {
 
     #[test]
     fn check_component_cap_rejects_empty_input() {
-        let err = check_component_cap(0, "ApexClass", "create_metadata").unwrap_err();
+        let err = check_component_cap(0, "ApexClass", CrudCall::Create).unwrap_err();
         assert!(err.to_string().contains("at least one"));
+        assert!(err.to_string().contains("create_metadata"));
     }
 
     #[test]
     fn check_component_cap_rejects_more_than_ten() {
-        let err = check_component_cap(11, "ApexClass", "delete_metadata").unwrap_err();
+        let err = check_component_cap(11, "ApexClass", CrudCall::Delete).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("10"));
         assert!(msg.contains("11"));
@@ -592,7 +632,7 @@ mod tests {
     fn check_component_cap_accepts_one_to_ten() {
         for n in 1..=10 {
             assert!(
-                check_component_cap(n, "ApexClass", "x").is_ok(),
+                check_component_cap(n, "ApexClass", CrudCall::Create).is_ok(),
                 "should accept {n}"
             );
         }
@@ -600,17 +640,43 @@ mod tests {
 
     /// CustomMetadata / CustomApplication carry a documented 200-component
     /// cap (meta_createMetadata: "Limit: 10. (For CustomMetadata and
-    /// CustomApplication only, the limit is 200.)").
+    /// CustomApplication only, the limit is 200.)"), repeated verbatim on
+    /// meta_updateMetadata, meta_readMetadata and meta_deleteMetadata.
     #[test]
     fn check_component_cap_allows_200_for_documented_large_types() {
+        let calls = [
+            CrudCall::Create,
+            CrudCall::Update,
+            CrudCall::Read,
+            CrudCall::Delete,
+        ];
         for ty in ["CustomMetadata", "CustomApplication"] {
-            assert!(check_component_cap(11, ty, "x").is_ok());
-            assert!(check_component_cap(200, ty, "x").is_ok());
-            let err = check_component_cap(201, ty, "x").unwrap_err();
+            for call in calls {
+                assert!(check_component_cap(11, ty, call).is_ok());
+                assert!(check_component_cap(200, ty, call).is_ok());
+                let err = check_component_cap(201, ty, call).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("200"),
+                    "message should cite the 200 cap: {msg}"
+                );
+            }
+        }
+    }
+
+    /// meta_upsertMetadata's Arguments table says "Limit: 10." with no
+    /// type carve-out, so the raised cap the other four calls document
+    /// must not leak into upsert.
+    #[test]
+    fn check_component_cap_holds_upsert_to_ten_for_every_type() {
+        for ty in ["CustomMetadata", "CustomApplication", "ApexClass"] {
+            assert!(check_component_cap(10, ty, CrudCall::Upsert).is_ok());
+            let err = check_component_cap(11, ty, CrudCall::Upsert).unwrap_err();
             let msg = err.to_string();
+            assert!(msg.contains("upsert_metadata"), "{msg}");
             assert!(
-                msg.contains("200"),
-                "message should cite the 200 cap: {msg}"
+                msg.contains("10"),
+                "message should cite the flat cap: {msg}"
             );
         }
     }
