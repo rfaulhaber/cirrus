@@ -329,6 +329,30 @@ impl Cirrus {
             .await
     }
 
+    /// GET with query parameters for a resource whose GET has side
+    /// effects, so a lost response must never be replayed. Same wire
+    /// behavior as [`Self::get_with_query`]; only the retry
+    /// classification differs.
+    pub(crate) async fn get_with_query_no_replay<R, Q>(
+        &self,
+        path: &str,
+        query: &Q,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        Q: Serialize + ?Sized,
+    {
+        let url = self.resolve_url(path);
+        self.send_with_replay::<R, Q, ()>(
+            reqwest::Method::GET,
+            &url,
+            Some(query),
+            None,
+            retry::Replay::Never,
+        )
+        .await
+    }
+
     /// POST a JSON body.
     pub async fn post<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
@@ -491,9 +515,14 @@ impl Cirrus {
     /// retrying. `parse` maps the terminal response into the caller's
     /// result shape. `Sforce-Limit-Info` capture happens here, on every
     /// response, so no send path can forget it.
+    ///
+    /// `replay` lets a call site whose HTTP method understates its
+    /// effect (anonymous Apex, Bulk job-data upload) opt out of the
+    /// method-derived idempotency assumption.
     async fn dispatch<T, MakeReq, Parse>(
         &self,
         method: &reqwest::Method,
+        replay: retry::Replay,
         make_request: MakeReq,
         parse: Parse,
     ) -> CirrusResult<T>
@@ -515,7 +544,13 @@ impl Cirrus {
                         let headers = response.headers().clone();
                         self.update_limit_info(&headers);
 
-                        if retry::should_retry_status(&self.retry_policy, method, status, attempt) {
+                        if retry::should_retry_status(
+                            &self.retry_policy,
+                            method,
+                            replay,
+                            status,
+                            attempt,
+                        ) {
                             // Drain the body so the connection returns
                             // to the pool clean.
                             let _ = response.bytes().await;
@@ -534,7 +569,13 @@ impl Cirrus {
                     }
                     Err(e) => {
                         let err: CirrusError = e.into();
-                        if retry::should_retry_network(&self.retry_policy, method, &err, attempt) {
+                        if retry::should_retry_network(
+                            &self.retry_policy,
+                            method,
+                            replay,
+                            &err,
+                            attempt,
+                        ) {
                             let delay = retry::compute_delay(&self.retry_policy, attempt, None);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -575,8 +616,26 @@ impl Cirrus {
         Q: Serialize + ?Sized,
         B: Serialize + ?Sized,
     {
+        self.send_with_replay(method, url, query, body, retry::Replay::ByMethod)
+            .await
+    }
+
+    async fn send_with_replay<R, Q, B>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        query: Option<&Q>,
+        body: Option<&B>,
+        replay: retry::Replay,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        Q: Serialize + ?Sized,
+        B: Serialize + ?Sized,
+    {
         self.dispatch(
             &method,
+            replay,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), url).bearer_auth(token);
                 if let Some(q) = query {
@@ -598,12 +657,17 @@ impl Cirrus {
     /// Used by Bulk 2.0 ingest uploads — the request body is `text/csv`, the
     /// response is the standard JSON job envelope. Path resolution still
     /// follows [`Cirrus`]'s three-mode semantics.
+    ///
+    /// `replay` says whether a lost response may be re-sent; a body
+    /// that submits data (rather than replacing a resource) passes
+    /// [`retry::Replay::Never`] even on an idempotent method.
     pub(crate) async fn send_with_body<R>(
         &self,
         method: reqwest::Method,
         path: &str,
         body: bytes::Bytes,
         content_type: &str,
+        replay: retry::Replay,
     ) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -611,6 +675,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            replay,
             |token: &str| {
                 // bytes::Bytes is Arc-backed — clone is cheap.
                 Ok(self
@@ -660,6 +725,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            retry::Replay::ByMethod,
             |token: &str| {
                 // Build a fresh Form per attempt — Form isn't Clone.
                 // The Vec<u8> JSON clone is one alloc (typically <1KB
@@ -711,6 +777,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            retry::Replay::ByMethod,
             |token: &str| {
                 let mut request = self
                     .client
@@ -753,6 +820,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            retry::Replay::ByMethod,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), &url).bearer_auth(token);
                 for (name, value) in extra_headers {

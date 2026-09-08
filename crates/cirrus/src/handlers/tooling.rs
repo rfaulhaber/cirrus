@@ -211,10 +211,16 @@ impl<'a> ToolingHandler<'a> {
     /// [`crate::CirrusError::Api`] — `ExecuteAnonymousResult` only
     /// describes outcomes for requests that Salesforce was *able* to
     /// dispatch to the Apex runtime.
+    ///
+    /// The resource is a GET, but it executes the script, so a lost
+    /// response is never replayed by the retry policy: the Apex may
+    /// already have committed its DML, fired callouts or sent email.
+    /// A transient failure surfaces to the caller, who is the only one
+    /// that can tell whether re-running the script is safe.
     pub async fn execute_anonymous(&self, apex: &str) -> CirrusResult<ExecuteAnonymousResult> {
         let query = [("anonymousBody", apex)];
         self.client
-            .get_with_query("tooling/executeAnonymous", &query)
+            .get_with_query_no_replay("tooling/executeAnonymous", &query)
             .await
     }
 }
@@ -720,6 +726,31 @@ mod tests {
         assert_eq!(res.column, -1);
         assert!(res.compile_problem.is_none());
         assert!(res.exception_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_anonymous_is_not_replayed_after_a_transient_5xx() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm
+        // "/executeAnonymous/?anonymousBody= <url encoded body> —
+        // Supported methods: GET — Executes Apex code anonymously."
+        // The script may already have committed its DML when the 503
+        // arrives, so the default policy's GET retry must not apply.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/tooling/executeAnonymous"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .tooling()
+            .execute_anonymous("insert new Account(Name='Acme');")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 503, .. }));
     }
 
     #[tokio::test]

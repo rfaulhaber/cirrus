@@ -135,6 +135,12 @@ impl BulkIngestHandler<'_> {
     /// Uploads CSV record data for a job. The job must be in `Open` state.
     /// Salesforce returns 201 with no body on success.
     ///
+    /// A lost response is never retried automatically: a repeated `PUT`
+    /// to `/batches` submits the job data again rather than replacing
+    /// it, so a replay would load every row twice. After a transient
+    /// failure, check the job with [`get`](Self::get) before deciding
+    /// whether to upload again.
+    ///
     /// Calls `PUT /services/data/{api_version}/jobs/ingest/{job_id}/batches`
     /// with `Content-Type: text/csv`.
     pub async fn upload(&self, job_id: &str, csv: bytes::Bytes) -> CirrusResult<()> {
@@ -142,7 +148,13 @@ impl BulkIngestHandler<'_> {
             .client
             .versioned_segments(&["jobs", "ingest", job_id, "batches"])?;
         self.client
-            .send_with_body(reqwest::Method::PUT, &path, csv, CSV_CONTENT_TYPE)
+            .send_with_body(
+                reqwest::Method::PUT,
+                &path,
+                csv,
+                CSV_CONTENT_TYPE,
+                crate::retry::Replay::Never,
+            )
             .await
     }
 
@@ -550,6 +562,28 @@ mod tests {
         let sf = fixture(server.uri());
         let csv = bytes::Bytes::from_static(b"Name\nAcme\nGlobex\n");
         sf.bulk().ingest().upload("750xx", csv).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingest_upload_is_not_replayed_after_a_transient_5xx() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/upload_job_data.htm
+        // "Uploads data for a job using CSV data you provide." Nothing
+        // documents a repeat PUT as replacing the data it already
+        // received, so a replay would load the rows a second time —
+        // even though PUT is otherwise a replay-safe method.
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/services/data/v66.0/jobs/ingest/750xx/batches"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let csv = bytes::Bytes::from_static(b"Name\nAcme\n");
+        let err = sf.bulk().ingest().upload("750xx", csv).await.unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 503, .. }));
     }
 
     #[tokio::test]

@@ -14,7 +14,10 @@
 //!    spec-idempotent (GET, HEAD, DELETE, PUT), because nothing
 //!    guarantees the request wasn't processed before an intermediary
 //!    emitted the error — and a duplicate `INSERT` is a worse failure
-//!    mode than a one-shot error surfaced to the caller.
+//!    mode than a one-shot error surfaced to the caller. A handler
+//!    whose HTTP method understates its effect (anonymous Apex over
+//!    GET, a Bulk 2.0 job-data upload over PUT) opts out of replay
+//!    entirely, so only 429 and connect-phase failures retry there.
 //!
 //!    Note on Salesforce specifics: the REST API's documented
 //!    rate-limit signal is **403 with `errorCode:
@@ -115,6 +118,33 @@ impl RetryPolicy {
     }
 }
 
+/// Whether a request may be re-sent when the outcome of an attempt is
+/// unknown — an ambiguous mid-request failure, or a 5xx that an
+/// intermediary may have emitted after the origin already processed the
+/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// Replay whenever the request method is spec-idempotent. The
+    /// default across the REST surface.
+    ByMethod,
+    /// Never replay once the request reached the server, whatever the
+    /// method says. Connect-phase failures still retry (the request
+    /// never arrived) and so does 429 (the request was refused rather
+    /// than processed).
+    ///
+    /// For the call sites whose HTTP method understates their effect:
+    /// `GET tooling/executeAnonymous` runs arbitrary Apex, and `PUT
+    /// jobs/ingest/{job}/batches` submits job data rather than
+    /// replacing a resource.
+    Never,
+}
+
+/// Whether an ambiguous outcome may be replayed: the method has to be
+/// spec-idempotent *and* the call site must not have opted out.
+fn is_replayable(method: &reqwest::Method, replay: Replay) -> bool {
+    matches!(replay, Replay::ByMethod) && is_idempotent(method)
+}
+
 /// Decision point: should we retry this HTTP response?
 ///
 /// `attempt` is the zero-indexed *previous* attempt count — i.e. on
@@ -124,6 +154,7 @@ impl RetryPolicy {
 pub(crate) fn should_retry_status(
     policy: &RetryPolicy,
     method: &reqwest::Method,
+    replay: Replay,
     status: u16,
     attempt: u32,
 ) -> bool {
@@ -139,10 +170,10 @@ pub(crate) fn should_retry_status(
         // 503 is the canonical "temporarily unavailable" status, but
         // an intermediary can emit it after the origin processed the
         // request — so like every other 5xx it only replays when the
-        // method is spec-idempotent. Unlike 500/502/504 it stays
+        // request is replay-safe. Unlike 500/502/504 it stays
         // retryable even when `retry_idempotent_5xx` is off.
-        503 => is_idempotent(method),
-        500 | 502 | 504 if policy.retry_idempotent_5xx => is_idempotent(method),
+        503 => is_replayable(method, replay),
+        500 | 502 | 504 if policy.retry_idempotent_5xx => is_replayable(method, replay),
         _ => false,
     }
 }
@@ -151,8 +182,8 @@ pub(crate) fn should_retry_status(
 ///
 /// Network errors that occur mid-request (connection reset, read
 /// timeout) are ambiguous — the server may or may not have processed
-/// the request before the connection dropped — so those retry only on
-/// idempotent methods, where a duplicated effect is harmless.
+/// the request before the connection dropped — so those retry only when
+/// the request is replay-safe, where a duplicated effect is harmless.
 /// Connect-phase errors (DNS failure, TCP RST, TLS handshake failure,
 /// connect timeout) mean the request never reached the server, so
 /// retrying is safe for any method. Same policy as the
@@ -160,6 +191,7 @@ pub(crate) fn should_retry_status(
 pub(crate) fn should_retry_network(
     policy: &RetryPolicy,
     method: &reqwest::Method,
+    replay: Replay,
     error: &CirrusError,
     attempt: u32,
 ) -> bool {
@@ -172,7 +204,7 @@ pub(crate) fn should_retry_network(
     if http.is_connect() {
         return true;
     }
-    is_idempotent(method)
+    is_replayable(method, replay)
 }
 
 fn is_idempotent(method: &reqwest::Method) -> bool {
@@ -276,8 +308,20 @@ mod tests {
     #[test]
     fn none_policy_disables_retry() {
         let p = RetryPolicy::none();
-        assert!(!should_retry_status(&p, &reqwest::Method::GET, 429, 0));
-        assert!(!should_retry_status(&p, &reqwest::Method::GET, 503, 0));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            429,
+            0
+        ));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            503,
+            0
+        ));
     }
 
     #[test]
@@ -289,7 +333,10 @@ mod tests {
             reqwest::Method::PATCH,
             reqwest::Method::DELETE,
         ] {
-            assert!(should_retry_status(&p, &m, 429, 0), "429 retry for {m}");
+            assert!(
+                should_retry_status(&p, &m, Replay::ByMethod, 429, 0),
+                "429 retry for {m}"
+            );
         }
     }
 
@@ -297,14 +344,44 @@ mod tests {
     fn retries_5xx_only_for_idempotent_methods() {
         let p = RetryPolicy::default();
         for status in [500, 502, 503, 504] {
-            assert!(should_retry_status(&p, &reqwest::Method::GET, status, 0));
-            assert!(should_retry_status(&p, &reqwest::Method::DELETE, status, 0));
-            assert!(should_retry_status(&p, &reqwest::Method::PUT, status, 0));
+            assert!(should_retry_status(
+                &p,
+                &reqwest::Method::GET,
+                Replay::ByMethod,
+                status,
+                0
+            ));
+            assert!(should_retry_status(
+                &p,
+                &reqwest::Method::DELETE,
+                Replay::ByMethod,
+                status,
+                0
+            ));
+            assert!(should_retry_status(
+                &p,
+                &reqwest::Method::PUT,
+                Replay::ByMethod,
+                status,
+                0
+            ));
             // Non-idempotent — never retry, 503 included: an
             // intermediary may emit it after the origin processed
             // the request.
-            assert!(!should_retry_status(&p, &reqwest::Method::POST, status, 0));
-            assert!(!should_retry_status(&p, &reqwest::Method::PATCH, status, 0));
+            assert!(!should_retry_status(
+                &p,
+                &reqwest::Method::POST,
+                Replay::ByMethod,
+                status,
+                0
+            ));
+            assert!(!should_retry_status(
+                &p,
+                &reqwest::Method::PATCH,
+                Replay::ByMethod,
+                status,
+                0
+            ));
         }
     }
 
@@ -320,11 +397,119 @@ mod tests {
             .await
             .unwrap_err()
             .into();
-        assert!(should_retry_network(&p, &reqwest::Method::POST, &err, 0));
-        assert!(should_retry_network(&p, &reqwest::Method::PATCH, &err, 0));
-        assert!(should_retry_network(&p, &reqwest::Method::GET, &err, 0));
+        assert!(should_retry_network(
+            &p,
+            &reqwest::Method::POST,
+            Replay::ByMethod,
+            &err,
+            0
+        ));
+        assert!(should_retry_network(
+            &p,
+            &reqwest::Method::PATCH,
+            Replay::ByMethod,
+            &err,
+            0
+        ));
+        assert!(should_retry_network(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            &err,
+            0
+        ));
         // The cap still applies.
-        assert!(!should_retry_network(&p, &reqwest::Method::POST, &err, 3));
+        assert!(!should_retry_network(
+            &p,
+            &reqwest::Method::POST,
+            Replay::ByMethod,
+            &err,
+            3
+        ));
+    }
+
+    #[test]
+    fn never_replay_blocks_5xx_retry_on_idempotent_methods() {
+        // GET tooling/executeAnonymous and PUT jobs/ingest/{id}/batches
+        // ride idempotent methods but must not be replayed once the
+        // request has reached the org.
+        let p = RetryPolicy::default();
+        for status in [500, 502, 503, 504] {
+            assert!(!should_retry_status(
+                &p,
+                &reqwest::Method::GET,
+                Replay::Never,
+                status,
+                0
+            ));
+            assert!(!should_retry_status(
+                &p,
+                &reqwest::Method::PUT,
+                Replay::Never,
+                status,
+                0
+            ));
+        }
+        // 429 means the request was refused before processing, so it
+        // stays retryable even for a non-replayable call.
+        assert!(should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::Never,
+            429,
+            0
+        ));
+    }
+
+    #[tokio::test]
+    async fn never_replay_keeps_connect_retries_but_drops_ambiguous_ones() {
+        let p = RetryPolicy::default();
+        let connect_err: CirrusError = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err()
+            .into();
+        // Nothing reached the server, so a replay can't duplicate an
+        // effect — this retries whatever the call site asked for.
+        assert!(should_retry_network(
+            &p,
+            &reqwest::Method::GET,
+            Replay::Never,
+            &connect_err,
+            0
+        ));
+
+        // A response that never arrives is ambiguous: the org may have
+        // processed the request already.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let stalled: CirrusError = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap_err()
+            .into();
+        assert!(should_retry_network(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            &stalled,
+            0
+        ));
+        assert!(!should_retry_network(
+            &p,
+            &reqwest::Method::GET,
+            Replay::Never,
+            &stalled,
+            0
+        ));
     }
 
     #[test]
@@ -332,7 +517,7 @@ mod tests {
         let p = RetryPolicy::default();
         for status in [400, 401, 403, 404, 405, 422] {
             assert!(
-                !should_retry_status(&p, &reqwest::Method::GET, status, 0),
+                !should_retry_status(&p, &reqwest::Method::GET, Replay::ByMethod, status, 0),
                 "should not retry {status}"
             );
         }
@@ -341,11 +526,35 @@ mod tests {
     #[test]
     fn stops_retrying_at_max_retries() {
         let p = RetryPolicy::default();
-        assert!(should_retry_status(&p, &reqwest::Method::GET, 429, 0));
-        assert!(should_retry_status(&p, &reqwest::Method::GET, 429, 2));
+        assert!(should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            429,
+            0
+        ));
+        assert!(should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            429,
+            2
+        ));
         // attempt == 3 means we've already retried 3 times — stop.
-        assert!(!should_retry_status(&p, &reqwest::Method::GET, 429, 3));
-        assert!(!should_retry_status(&p, &reqwest::Method::GET, 429, 99));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            429,
+            3
+        ));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            429,
+            99
+        ));
     }
 
     #[test]
@@ -354,12 +563,42 @@ mod tests {
             retry_idempotent_5xx: false,
             ..RetryPolicy::default()
         };
-        assert!(should_retry_status(&p, &reqwest::Method::GET, 429, 0));
-        assert!(should_retry_status(&p, &reqwest::Method::GET, 503, 0));
-        assert!(!should_retry_status(&p, &reqwest::Method::GET, 500, 0));
-        assert!(!should_retry_status(&p, &reqwest::Method::GET, 502, 0));
+        assert!(should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            429,
+            0
+        ));
+        assert!(should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            503,
+            0
+        ));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            500,
+            0
+        ));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            502,
+            0
+        ));
         // The 503 carve-out is idempotent-methods-only.
-        assert!(!should_retry_status(&p, &reqwest::Method::POST, 503, 0));
+        assert!(!should_retry_status(
+            &p,
+            &reqwest::Method::POST,
+            Replay::ByMethod,
+            503,
+            0
+        ));
     }
 
     #[test]
