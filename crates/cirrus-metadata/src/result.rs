@@ -104,7 +104,10 @@ pub struct DeployOptions {
     /// `package.xml` are missing from the zip. **Don't set on
     /// production deploys.**
     pub allow_missing_files: Option<bool>,
-    /// Reserved for future use.
+    /// Whether a file that's in the zip but not listed in
+    /// `package.xml` is automatically added to the package. A
+    /// `retrieve()` is issued with the updated `package.xml` that
+    /// includes the file. **Don't set on production deploys.**
     pub auto_update_package: Option<bool>,
     /// If `true`, performs a test deployment (validation) without
     /// actually committing the components. Pair with
@@ -113,7 +116,11 @@ pub struct DeployOptions {
     pub check_only: Option<bool>,
     /// Continue on warnings.
     pub ignore_warnings: Option<bool>,
-    /// Reserved for future use.
+    /// Whether a `retrieve()` runs immediately after the deployment.
+    /// Set `true` to retrieve whatever was deployed; its outcome
+    /// arrives in [`DeployDetails::retrieve_result`], which
+    /// `check_deploy_status` populates only when called with
+    /// `include_details: true`.
     pub perform_retrieve: Option<bool>,
     /// In dev/sandbox orgs only: skip the Recycle Bin when deleting
     /// components listed in `destructiveChanges.xml`.
@@ -282,6 +289,11 @@ pub struct DeployDetails {
     /// Apex test results.
     #[serde(default)]
     pub run_test_result: Option<RunTestsResult>,
+    /// Outcome of the `retrieve()` Salesforce runs after the deploy
+    /// when [`DeployOptions::perform_retrieve`] was set. `None`
+    /// otherwise.
+    #[serde(default)]
+    pub retrieve_result: Option<RetrieveResult>,
 }
 
 /// Per-component status entry inside [`DeployDetails`].

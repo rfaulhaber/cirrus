@@ -226,6 +226,116 @@ async fn check_deploy_status_parses_failure_details() {
     assert_eq!(first.column_number, Some(13));
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+/// DeployOptions: "performRetrieve | boolean | Indicates whether a
+/// retrieve() call is performed immediately after the deployment
+/// (true) or not (false)."
+///
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+/// DeployDetails: "retrieveResult | RetrieveResult | If the
+/// performRetrieve parameter was specified for the deploy() call, a
+/// retrieve() call is performed immediately after the deploy() process
+/// completes." The nested shape is the RetrieveResult table on
+/// meta_retrieveresult.htm.
+#[tokio::test]
+async fn check_deploy_status_surfaces_the_post_deploy_retrieve_result() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000retr</id>
+        <done>true</done>
+        <success>true</success>
+        <status>Succeeded</status>
+        <details>
+          <componentSuccesses>
+            <componentType>ApexClass</componentType>
+            <fullName>Foo</fullName>
+            <fileName>classes/Foo.cls</fileName>
+            <success>true</success>
+          </componentSuccesses>
+          <retrieveResult>
+            <done>true</done>
+            <id>09S00000postdep</id>
+            <status>Succeeded</status>
+            <success>true</success>
+            <fileProperties>
+              <createdById>005xx0000abc</createdById>
+              <createdByName>Stephanie</createdByName>
+              <createdDate>2026-05-28T10:00:00.000Z</createdDate>
+              <fileName>unpackaged/classes/Foo.cls</fileName>
+              <fullName>Foo</fullName>
+              <id>01p00000abc</id>
+              <lastModifiedById>005xx0000abc</lastModifiedById>
+              <lastModifiedByName>Stephanie</lastModifiedByName>
+              <lastModifiedDate>2026-05-28T10:00:00.000Z</lastModifiedDate>
+              <type>ApexClass</type>
+            </fileProperties>
+            <zipFile>UEt6aXA=</zipFile>
+          </retrieveResult>
+        </details>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md.check_deploy_status("0Af00000retr", true).await.unwrap();
+    let details = result.details.unwrap();
+    let retrieved = details.retrieve_result.unwrap();
+    assert_eq!(retrieved.id, "09S00000postdep");
+    assert_eq!(retrieved.status, Some(RetrieveStatus::Succeeded));
+    assert_eq!(retrieved.file_properties.len(), 1);
+    assert_eq!(&retrieved.zip_bytes().unwrap().unwrap()[..], b"PKzip");
+}
+
+#[tokio::test]
+async fn deploy_emits_the_retrieve_side_options() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:autoUpdatePackage>true</met:autoUpdatePackage>",
+        ))
+        .and(body_string_contains(
+            "<met:performRetrieve>true</met:performRetrieve>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <deployResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <done>false</done>
+        <id>0Af00000withretr</id>
+        <state>Queued</state>
+      </result>
+    </deployResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let opts = DeployOptions {
+        auto_update_package: Some(true),
+        perform_retrieve: Some(true),
+        ..Default::default()
+    };
+    let result = md.deploy(Bytes::from_static(b"PKzip"), opts).await.unwrap();
+    assert_eq!(result.id, "0Af00000withretr");
+}
+
 // -- cancel_deploy -----------------------------------------------------------
 
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
