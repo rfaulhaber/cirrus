@@ -309,10 +309,9 @@ impl<'a> SObjectHandler<'a> {
     ///
     /// Sends a `multipart/form-data` request with the metadata as one
     /// part and the binary as a second part. See [`BlobUploadSpec`] for
-    /// the per-object naming conventions Salesforce requires (the JSON
-    /// part name and the blob field name vary by sObject — and even by
-    /// operation; Document inserts use `entity_document` but updates
-    /// use `entity_content`).
+    /// how the two parts are named: the binary part must carry the
+    /// sObject's blob field API name, and the JSON part's name is
+    /// caller-chosen.
     ///
     /// Calls
     /// `POST /services/data/{api_version}/sobjects/{name}` with a
@@ -389,12 +388,10 @@ impl<'a> SObjectHandler<'a> {
     /// `PATCH /services/data/{api_version}/sobjects/{name}/{id}` with
     /// a multipart body. Salesforce returns 204 No Content on success.
     ///
-    /// # Wire-shape gotcha
-    ///
-    /// Per the docs, the `json_part_name` for *updates* is
-    /// `entity_content` even when the object is `Document` (which
-    /// uses `entity_document` on insert). Caller specifies which name
-    /// to use; we don't try to derive it.
+    /// The doc's update example names its JSON part `entity_content`
+    /// where the insert example uses `entity_document`; neither name is
+    /// required, so pass whichever you like — only
+    /// [`BlobUploadSpec::blob_field_name`] is constrained.
     ///
     /// [`create_with_blob`]: Self::create_with_blob
     pub async fn update_with_blob<B>(
@@ -458,39 +455,44 @@ fn http_date(since: SystemTime) -> CirrusResult<String> {
 /// [`SObjectHandler::create_with_blob`] or
 /// [`SObjectHandler::update_with_blob`].
 ///
-/// # Per-sObject naming conventions
+/// # Naming the two parts
 ///
-/// Salesforce's blob upload format requires two specific part names
-/// that vary by sObject and operation. The docs document a few
-/// well-known combinations:
+/// Only one of the two part names is constrained. Per the
+/// [Insert or Update Blob Data] doc: "In the non-binary part of the
+/// request body, use any value for the name attribute. For single
+/// documents, in the binary part of the request body, use the name
+/// attribute to specify the name of the blob data field for the
+/// object."
 ///
-/// | sObject          | Operation | `json_part_name`    | `blob_field_name` |
-/// |------------------|-----------|---------------------|-------------------|
-/// | `ContentVersion` | insert    | `entity_content`    | `VersionData`     |
-/// | `Document`       | insert    | `entity_document`   | `Body`            |
-/// | `Document`       | update    | `entity_content`    | `Body`            |
-/// | `Attachment`     | insert    | `entity_attachment` | `Body`            |
+/// So [`blob_field_name`](Self::blob_field_name) must be the sObject's
+/// blob field API name, while
+/// [`json_part_name`](Self::json_part_name) is yours to choose. The
+/// doc's examples happen to use these:
 ///
-/// Note that `Document` insert and update use different
-/// `json_part_name` values, per Salesforce's documentation.
+/// | sObject          | Operation | Example `json_part_name` | Required `blob_field_name` |
+/// |------------------|-----------|--------------------------|----------------------------|
+/// | `ContentVersion` | insert    | `entity_content`         | `VersionData`              |
+/// | `Document`       | insert    | `entity_document`        | `Body`                     |
+/// | `Document`       | update    | `entity_content`         | `Body`                     |
 ///
-/// For other blob-bearing objects, consult the
-/// [Insert or Update Blob Data] doc — the convention is generally
-/// `entity_<lowercased-object>` for the JSON part and the
-/// blob-field's API name for the binary part, but always verify.
+/// The two different names for `Document` are just what the two
+/// examples happen to show — either works for either operation.
+///
+/// For other blob-bearing objects, look up the blob field's API name on
+/// the object; the JSON part name needs no lookup.
 ///
 /// [Insert or Update Blob Data]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
 pub struct BlobUploadSpec<'a, B: ?Sized> {
-    /// Name of the JSON metadata part. See the table on
-    /// [`BlobUploadSpec`] for known per-object values.
+    /// Name of the JSON metadata part. Any value works — see the
+    /// [type-level docs](BlobUploadSpec#naming-the-two-parts).
     pub json_part_name: &'a str,
     /// Non-binary record fields, serialized as JSON. Any
     /// [`Serialize`] value works — typed structs,
     /// `serde_json::json!({...})`, `HashMap<String, Value>`.
     pub metadata: &'a B,
-    /// Name of the binary part — must match the sObject's blob field
-    /// API name. `Body` for Document/Attachment, `VersionData` for
-    /// ContentVersion.
+    /// Name of the binary part. This one Salesforce does validate: it
+    /// must be the sObject's blob field API name — `Body` for
+    /// `Document`, `VersionData` for `ContentVersion`.
     pub blob_field_name: &'a str,
     /// Filename to declare in the binary part's `Content-Disposition`.
     /// Salesforce surfaces this as the `PathOnClient` / `Name` /
@@ -1034,8 +1036,10 @@ mod tests {
 
         #[tokio::test]
         async fn create_with_blob_posts_multipart_to_sobjects_endpoint() {
-            // Mirrors the documented ContentVersion insert: JSON part
-            // named entity_content, binary part named VersionData.
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
+            // Mirrors the documented ContentVersion insert: the example's
+            // JSON part name `entity_content`, and the required binary
+            // part name `VersionData`.
             let server = MockServer::start().await;
 
             Mock::given(method("POST"))
@@ -1171,9 +1175,10 @@ mod tests {
         async fn update_with_blob_uses_patch_and_targets_record_id_path() {
             let server = MockServer::start().await;
 
-            // Document update example from the docs uses the
-            // `entity_content` JSON part name (not entity_document) on
-            // PATCH — verifying that quirk passes through.
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
+            // Mirrors the doc's "Updating a Document with Blob Data"
+            // example: an arbitrary JSON part name, and the binary part
+            // named for Document's blob field, `Body`.
             Mock::given(method("PATCH"))
                 .and(path("/services/data/v66.0/sobjects/Document/015D000000000"))
                 .and(header_regex(
@@ -1191,11 +1196,6 @@ mod tests {
                 .update_with_blob(
                     "015D000000000",
                     BlobUploadSpec {
-                        // Note: even though this is a Document update,
-                        // the doc shows the JSON part name as
-                        // `entity_content`, not `entity_document`.
-                        // That's a Salesforce wire-shape quirk — the
-                        // SDK doesn't try to derive it.
                         json_part_name: "entity_content",
                         metadata: &json!({"Name": "Updated"}),
                         blob_field_name: "Body",
