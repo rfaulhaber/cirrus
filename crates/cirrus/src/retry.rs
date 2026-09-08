@@ -135,8 +135,8 @@ pub(crate) enum Replay {
     ///
     /// For the call sites whose HTTP method understates their effect:
     /// `GET tooling/executeAnonymous` runs arbitrary Apex, and `PUT
-    /// jobs/ingest/{job}/batches` submits job data rather than
-    /// replacing a resource.
+    /// jobs/ingest/{job}/batches` uploads job data, which is documented
+    /// as a submission rather than a replacement.
     Never,
 }
 

@@ -107,8 +107,8 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-read timeout applied to the HTTP client the builder creates:
 /// the maximum time the client waits for the *next chunk* of a
 /// response, not for the whole response. Bulk 2.0 result pages and
-/// event log downloads can legitimately stream for minutes, so no
-/// overall request deadline is set. Override with
+/// event log files can be large enough that a whole-request deadline
+/// would cut a healthy transfer short, so none is set. Override with
 /// [`CirrusBuilder::read_timeout`].
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1095,11 +1095,10 @@ impl CirrusBuilder {
                 // Salesforce compresses a response only when the request
                 // carries Accept-Encoding, which this turns on.
                 .gzip(true)
-                // No Salesforce API resource answers with a redirect, so a
-                // 3xx means something in front of the org intercepted the
-                // call. Surface it as an error instead of replaying the
-                // request — bearer token included — against whatever host
-                // the Location header names.
+                // Following a 3xx would re-send the request — bearer
+                // token included — to whatever host the Location header
+                // names, so a redirect is surfaced as an error for the
+                // caller to inspect.
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(t) = self
                 .connect_timeout

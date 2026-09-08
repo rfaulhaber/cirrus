@@ -141,11 +141,11 @@ impl BulkIngestHandler<'_> {
     /// before applying its 150 MB ceiling, and that conversion inflates
     /// the data by roughly 50%. Split larger data across uploads.
     ///
-    /// A lost response is never retried automatically: a repeated `PUT`
-    /// to `/batches` submits the job data again rather than replacing
-    /// it, so a replay would load every row twice. After a transient
-    /// failure, check the job with [`get`](Self::get) before deciding
-    /// whether to upload again.
+    /// A lost response is never retried automatically. Salesforce
+    /// documents this `PUT` as uploading job data, not as replacing
+    /// data the job already holds, so a replay risks loading the same
+    /// rows twice. After a transient failure, check the job with
+    /// [`get`](Self::get) before deciding whether to upload again.
     ///
     /// Calls `PUT /services/data/{api_version}/jobs/ingest/{job_id}/batches`
     /// with `Content-Type: text/csv`.

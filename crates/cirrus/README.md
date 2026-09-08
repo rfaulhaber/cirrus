@@ -149,8 +149,8 @@ let created: Value = sf
 
 For the remaining unusual cases (binary download, SSE), `request_builder` and
 `execute` give you a pre-authenticated `reqwest::RequestBuilder` and a full
-bypass respectively — both step outside the request loop, so retry, the 401
-auto-refresh and the limit-info capture no longer apply.
+bypass respectively. Both step outside the request loop, so retry, the 401
+auto-refresh and the limit-info capture don't apply to them.
 
 ## Examples
 
