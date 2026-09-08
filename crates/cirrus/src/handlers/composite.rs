@@ -423,6 +423,12 @@ impl CompositeSObjectsHandler<'_> {
     /// Records that don't exist (or aren't visible to the caller) appear
     /// as `Value::Null` in the corresponding position of the returned
     /// slice — preserving 1:1 alignment with the input `ids`.
+    ///
+    /// Salesforce documents the ~800-ID ceiling as the point where the
+    /// URI passes its 16,384-byte limit and the request fails with HTTP
+    /// 414. Beyond that, switch to
+    /// [`retrieve_with_body`](Self::retrieve_with_body), which carries
+    /// the same arguments in a JSON body and allows 2000 records.
     pub async fn retrieve(
         &self,
         sobject: &str,
@@ -442,21 +448,24 @@ impl CompositeSObjectsHandler<'_> {
         ids: &[&str],
         fields: &[&str],
     ) -> CirrusResult<Vec<R>> {
-        let url = self
-            .client
-            .versioned_segments(&["composite", "sobjects", sobject])?;
-        let joined_ids = ids.join(",");
-        let joined_fields = fields.join(",");
+        let mut url = url::Url::parse(&self.client.versioned_segments(&[
+            "composite",
+            "sobjects",
+            sobject,
+        ])?)?;
+        // The query string is set wholesale rather than handed to
+        // reqwest's form encoder, which would emit each separator as
+        // `%2C`. A comma is a legal sub-delim in a query, and the
+        // three-byte expansion costs ~1.6 KB across the 799 separators
+        // of a full 800-ID batch — enough to push a request that
+        // Salesforce documents as legal past the 16,384-byte URI limit.
+        url.set_query(Some(&format!(
+            "ids={}&fields={}",
+            ids.join(","),
+            fields.join(",")
+        )));
         self.client
-            .send_at::<_, _, ()>(
-                reqwest::Method::GET,
-                &url,
-                Some(&[
-                    ("ids", joined_ids.as_str()),
-                    ("fields", joined_fields.as_str()),
-                ]),
-                None,
-            )
+            .send_at::<_, (), ()>(reqwest::Method::GET, url.as_str(), None, None)
             .await
     }
 
@@ -1325,6 +1334,58 @@ mod tests {
         assert_eq!(records[0]["Name"], "Acme");
         assert!(records[1].is_null());
         assert_eq!(records[2]["Name"], "Other");
+    }
+
+    #[tokio::test]
+    async fn sobjects_retrieve_sends_literal_comma_separators() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_retrieve.htm
+        // The documented request separates ids and fields with literal
+        // commas: `?ids=001xx000003DGb1AAG,...&fields=id,name`.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+        // "414  The length of the URI exceeds the 16,384-byte limit." —
+        // percent-encoding each separator as `%2C` triples its cost and
+        // pushes a documented-size batch over that limit.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .and(|request: &wiremock::Request| {
+                request.url.query()
+                    == Some("ids=001xx000003DGb1AAG,001xx000003DGb0AAG&fields=id,name")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"attributes": {"type": "Account"}, "Id": "001xx000003DGb1AAG", "Name": "Acme"},
+                {"attributes": {"type": "Account"}, "Id": "001xx000003DGb0AAG", "Name": "Global Media"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let records = sf
+            .composite()
+            .sobjects()
+            .retrieve(
+                "Account",
+                &["001xx000003DGb1AAG", "001xx000003DGb0AAG"],
+                &["id", "name"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["Name"], "Acme");
+    }
+
+    #[test]
+    fn sobjects_retrieve_uri_stays_under_the_documented_800_id_ceiling() {
+        // 800 18-character ids joined by literal commas is the batch size
+        // Salesforce calls out as roughly the maximum; the resulting URI
+        // has to fit the 16,384-byte limit that produces HTTP 414.
+        let ids: Vec<String> = (0..800).map(|i| format!("001xx{i:013}")).collect();
+        let query = format!("ids={}&fields=Id,Name", ids.join(","));
+        assert_eq!(query.len(), 15_218);
+
+        let percent_encoded_len = query.len() + ids.len().saturating_sub(1) * 2;
+        assert!(percent_encoded_len > 16_384);
     }
 
     #[tokio::test]
