@@ -239,8 +239,10 @@ impl std::fmt::Debug for OAuthErrorResponse {
 ///
 /// The caller assembles the form body with the flow-specific fields
 /// (`grant_type`, `assertion`, `refresh_token`, etc.). On non-2xx, the body
-/// is parsed as the OAuth error shape if possible; otherwise the raw body
-/// is folded into a generic [`AuthError::Other`] message.
+/// is parsed as the OAuth error shape if possible; otherwise only the
+/// status is surfaced as [`AuthError::UnexpectedResponse`] — the body is
+/// logged at TRACE rather than carried, since non-standard error pages can
+/// echo credentials.
 pub(super) async fn exchange<B>(
     http: &reqwest::Client,
     login_url: &str,

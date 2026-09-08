@@ -34,14 +34,12 @@
 //! Experience Cloud `MyDomainName.my.site.com`), and there is no sensible
 //! default for an org-scoped host.
 //!
-//! Wire-shape provenance: the reference Salesforce pages for this flow —
-//! including whether `https://login.salesforce.com` is rejected outright
-//! and whether `subject_token` has a documented length ceiling — live on
-//! help.salesforce.com and could not be fetched to confirm either claim,
-//! so neither is asserted or enforced here. The connected-app side of the
-//! flow (`isTokenExchangeEnabled`, `isSecretRequiredForTokenExchange`,
-//! and the `OauthTokenExchangeHandler` type) is documented in the
-//! Metadata API guide, and the request/response shape follows RFC 8693.
+//! No `subject_token` length limit and no restriction on the token
+//! endpoint host are enforced here: any `login_url` you configure is used
+//! as given. The request and response shapes follow RFC 8693, and the
+//! connected-app side of the flow (`isTokenExchangeEnabled`,
+//! `isSecretRequiredForTokenExchange`, and the `OauthTokenExchangeHandler`
+//! type) is documented in the Metadata API guide.
 //!
 //! ## What you get back
 //!
@@ -101,6 +99,15 @@ impl SubjectTokenType {
 /// One-shot RFC 8693 token-exchange request.
 ///
 /// Construct via [`TokenExchangeFlow::builder`].
+//
+// Wire-shape provenance: the reference Salesforce pages for this flow —
+// including whether `https://login.salesforce.com` is rejected outright
+// and whether `subject_token` has a documented length ceiling — live on
+// help.salesforce.com and were not reachable, so neither is asserted nor
+// enforced. The reachable pages that do govern the flow are the Apex
+// `token_exchange_handler` guide and the Metadata API's
+// `meta_oauthtokenexchangehandler`, neither of which states a length
+// limit or a permitted host.
 pub struct TokenExchangeFlow {
     consumer_key: String,
     consumer_secret: Option<String>,

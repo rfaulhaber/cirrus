@@ -313,8 +313,7 @@ impl JwtAuthBuilder {
     /// `https://MyDomainName.my.salesforce.com`, or
     /// `https://MyDomainName--SandboxName.sandbox.my.salesforce.com` for a
     /// sandbox. Salesforce recommends the My Domain form because it
-    /// survives org migrations that change the underlying instance. Orgs
-    /// that block logins at `login.salesforce.com` require it.
+    /// survives org migrations that change the underlying instance.
     ///
     /// This is the authorization server, not the org's REST host: keep
     /// [`instance_url`](Self::instance_url) pointing at the API endpoint
@@ -729,11 +728,11 @@ mod tests {
             exp > now,
             "assertion is already expired: exp={exp} now={now}"
         );
-        // Salesforce rejects an assertion whose exp is more than three
-        // minutes past its own clock.
+        // Pins this crate's own validity window; RFC 7523 sets no
+        // numeric bound and makes no claim about Salesforce's tolerance.
         assert!(
-            exp <= now + 180,
-            "exp is beyond Salesforce's 3-minute ceiling: exp={exp} now={now}"
+            exp <= now + JWT_VALIDITY_SECS,
+            "exp exceeds the SDK's validity window: exp={exp} now={now}"
         );
     }
 
