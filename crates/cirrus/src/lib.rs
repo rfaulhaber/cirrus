@@ -95,9 +95,22 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Default Salesforce REST API version when the caller doesn't override it.
 pub const DEFAULT_API_VERSION: &str = "v66.0";
+
+/// Connect-phase timeout applied to the HTTP client the builder
+/// creates. Override with [`CirrusBuilder::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read timeout applied to the HTTP client the builder creates:
+/// the maximum time the client waits for the *next chunk* of a
+/// response, not for the whole response. Bulk 2.0 result pages and
+/// event log downloads can legitimately stream for minutes, so no
+/// overall request deadline is set. Override with
+/// [`CirrusBuilder::read_timeout`].
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default User-Agent header value sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -776,6 +789,10 @@ pub struct CirrusBuilder {
     user_agent: Option<String>,
     http_client: Option<reqwest::Client>,
     retry_policy: Option<RetryPolicy>,
+    // Outer `Option` is "did the caller set this"; inner `None` is the
+    // caller asking for no deadline at all.
+    connect_timeout: Option<Option<Duration>>,
+    read_timeout: Option<Option<Duration>>,
 }
 
 impl CirrusBuilder {
@@ -801,10 +818,36 @@ impl CirrusBuilder {
 
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool across multiple SDK clients or for installing custom
-    /// middleware. When provided, the builder's `user_agent` setting is
-    /// ignored — configure that on the supplied client instead.
+    /// middleware. When provided, the builder's `user_agent`,
+    /// `connect_timeout` and `read_timeout` settings are ignored — the
+    /// supplied client owns its own headers, timeouts, redirect policy and
+    /// content-encoding support.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout for the HTTP client this builder
+    /// creates. Defaults to [`DEFAULT_CONNECT_TIMEOUT`]; pass `None` to
+    /// wait indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the per-read timeout for the HTTP client this builder
+    /// creates — the maximum wait between two chunks of a response
+    /// body, not a deadline for the whole request. Defaults to
+    /// [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait indefinitely.
+    ///
+    /// Widen this when draining very large Bulk 2.0 result pages or
+    /// event log files over a slow link.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.read_timeout = Some(timeout.into());
         self
     }
 
@@ -831,10 +874,27 @@ impl CirrusBuilder {
                 USER_AGENT,
                 HeaderValue::from_str(ua).map_err(|e| CirrusError::InvalidHeader(e.to_string()))?,
             );
-            reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder()
                 .default_headers(headers)
-                .build()
-                .map_err(CirrusError::HttpClient)?
+                // Salesforce compresses a response only when the request
+                // carries Accept-Encoding, which this turns on.
+                .gzip(true)
+                // No Salesforce API resource answers with a redirect, so a
+                // 3xx means something in front of the org intercepted the
+                // call. Surface it as an error instead of replaying the
+                // request — bearer token included — against whatever host
+                // the Location header names.
+                .redirect(reqwest::redirect::Policy::none());
+            if let Some(t) = self
+                .connect_timeout
+                .unwrap_or(Some(DEFAULT_CONNECT_TIMEOUT))
+            {
+                builder = builder.connect_timeout(t);
+            }
+            if let Some(t) = self.read_timeout.unwrap_or(Some(DEFAULT_READ_TIMEOUT)) {
+                builder = builder.read_timeout(t);
+            }
+            builder.build().map_err(CirrusError::HttpClient)?
         };
 
         Ok(Cirrus {
@@ -1119,6 +1179,87 @@ mod tests {
             assert_eq!(resp.status().as_u16(), 200);
             let body: Value = resp.json().await.unwrap();
             assert_eq!(body["raw"], true);
+        }
+    }
+
+    /// Transport defaults the builder installs on the HTTP client it
+    /// creates: response compression, redirect handling, timeouts.
+    mod client_defaults {
+        use super::*;
+        use serde_json::{Value, json};
+        use std::time::Duration;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn requests_advertise_gzip_encoding() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_rest_compression.htm
+            // "Salesforce compresses a response only if the request
+            // contains an Accept-Encoding: gzip, Accept-Encoding:
+            // deflate, Accept-Encoding: br, or Accept-Encoding: zstd
+            // header."
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .and(header("accept-encoding", "gzip"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+        }
+
+        #[tokio::test]
+        async fn redirects_surface_as_errors_instead_of_being_followed() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(302).insert_header("Location", "/elsewhere"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/elsewhere"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 302, .. }));
+        }
+
+        #[tokio::test]
+        async fn read_timeout_aborts_a_stalled_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"ok": true}))
+                        .set_delay(Duration::from_secs(30)),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .read_timeout(Duration::from_millis(50))
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            match err {
+                CirrusError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
+                other => panic!("expected a transport error, got {other:?}"),
+            }
         }
     }
 
