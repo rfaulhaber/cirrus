@@ -3,10 +3,12 @@
 //! Two flavors live under `/services/data/{version}/jobs/`:
 //!
 //! - **Ingest** (`/jobs/ingest`) — create / update / upsert / delete /
-//!   hardDelete records in batches of up to 150 MB / 10k+ records per
-//!   job. The caller drives the job through `Open` → `UploadComplete` →
-//!   `InProgress` → `JobComplete` / `Failed` / `Aborted`. Reach via
-//!   [`BulkHandler::ingest`].
+//!   hardDelete records from CSV uploads. Salesforce base64-encodes an
+//!   upload and caps the encoded form at 150 MB; because that
+//!   conversion adds roughly 50%, keep each upload's raw CSV under
+//!   100 MB. The caller drives the job through `Open` →
+//!   `UploadComplete` → `InProgress` → `JobComplete` / `Failed` /
+//!   `Aborted`. Reach via [`BulkHandler::ingest`].
 //! - **Query** (`/jobs/query`) — async SOQL execution that streams
 //!   results as CSV with cursor-based pagination. Reach via
 //!   [`BulkHandler::query`].
@@ -135,6 +137,10 @@ impl BulkIngestHandler<'_> {
     /// Uploads CSV record data for a job. The job must be in `Open` state.
     /// Salesforce returns 201 with no body on success.
     ///
+    /// Keep `csv` under 100 MB: Salesforce converts the body to base64
+    /// before applying its 150 MB ceiling, and that conversion inflates
+    /// the data by roughly 50%. Split larger data across uploads.
+    ///
     /// A lost response is never retried automatically: a repeated `PUT`
     /// to `/batches` submits the job data again rather than replacing
     /// it, so a replay would load every row twice. After a transient
@@ -190,8 +196,10 @@ impl BulkIngestHandler<'_> {
             .await
     }
 
-    /// Deletes a job. Only valid when the job is in `JobComplete`,
-    /// `Aborted`, or `Failed` state. Returns 204 on success.
+    /// Deletes a job. Only valid when the job is in `UploadComplete`,
+    /// `JobComplete`, `Aborted`, or `Failed` state — an ingest job that
+    /// has been closed can be discarded without aborting it first.
+    /// Returns 204 on success.
     ///
     /// Calls `DELETE /services/data/{api_version}/jobs/ingest/{job_id}`.
     pub async fn delete(&self, job_id: &str) -> CirrusResult<()> {
@@ -310,8 +318,13 @@ impl BulkQueryHandler<'_> {
     ///
     /// `locator` is the cursor returned by a previous
     /// [`BulkQueryResults::locator`]. Pass `None` for the first page.
-    /// `max_records` caps the number of rows in this page (Salesforce
-    /// caps the absolute maximum at 50,000 per request).
+    ///
+    /// `max_records` is an upper bound on the rows in this page, not a
+    /// guarantee: the response is still subject to Salesforce's size
+    /// limits, so a page can come back shorter than requested. Omit it
+    /// to let Salesforce pick. A short page therefore says nothing
+    /// about the end of the result set — keep draining until
+    /// [`BulkQueryResults::locator`] returns `None`.
     ///
     /// Calls
     /// `GET /services/data/{api_version}/jobs/query/{job_id}/results`
@@ -708,6 +721,40 @@ mod tests {
         let sf = fixture(server.uri());
         let bytes = sf.bulk().ingest().failed_results("750xx").await.unwrap();
         assert!(bytes.starts_with(b"sf__Id,sf__Error"));
+    }
+
+    #[tokio::test]
+    async fn ingest_unprocessed_records_uses_the_all_lowercase_path() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_unprocessed_results.htm
+        // "URI: /services/data/vXX.X/jobs/ingest/jobID/unprocessedrecords/"
+        // — all lowercase, unlike the successfulResults and
+        // failedResults siblings. This mock pins that spelling: a
+        // "consistency" edit to unprocessedRecords 404s against an org.
+        let server = MockServer::start().await;
+
+        let csv = "Name\nInitech\n";
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/jobs/ingest/750xx/unprocessedrecords",
+            ))
+            .and(header("accept", "text/csv"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(csv)
+                    .insert_header("content-type", "text/csv"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let bytes = sf
+            .bulk()
+            .ingest()
+            .unprocessed_records("750xx")
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], csv.as_bytes());
     }
 
     #[tokio::test]
