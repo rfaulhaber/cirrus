@@ -81,13 +81,14 @@ impl SObjectsHandler<'_> {
     /// response.
     ///
     /// `since` is formatted as RFC 7231 IMF-fixdate (e.g.
-    /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) via the `httpdate` crate
-    /// before being sent.
+    /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) before being sent. Times
+    /// outside the range that format can express return
+    /// [`CirrusError::InvalidHeader`] — see [`http_date`].
     pub async fn describe_global_if_modified_since(
         &self,
         since: SystemTime,
     ) -> CirrusResult<Option<DescribeGlobal>> {
-        let date = httpdate::fmt_http_date(since);
+        let date = http_date(since)?;
         let (status, bytes) = self
             .client
             .send_with_headers(
@@ -145,7 +146,8 @@ impl<'a> SObjectHandler<'a> {
     /// [`SObjectsHandler::describe_global_if_modified_since`]:
     /// pass the timestamp of your last fetch; Salesforce returns 304
     /// (and you can keep your cached metadata) when nothing has
-    /// changed.
+    /// changed. A `since` that RFC 7231's IMF-fixdate format can't
+    /// express returns [`CirrusError::InvalidHeader`].
     pub async fn describe_if_modified_since(
         &self,
         since: SystemTime,
@@ -165,7 +167,7 @@ impl<'a> SObjectHandler<'a> {
         let url = self
             .client
             .versioned_segments(&["sobjects", self.name, "describe"])?;
-        let date = httpdate::fmt_http_date(since);
+        let date = http_date(since)?;
         let (status, bytes) = self
             .client
             .send_with_headers(
@@ -422,6 +424,34 @@ impl<'a> SObjectHandler<'a> {
             )
             .await
     }
+}
+
+/// Formats a [`SystemTime`] as an RFC 7231 IMF-fixdate for
+/// `If-Modified-Since`.
+///
+/// `httpdate::fmt_http_date` is partial: it panics for times before the
+/// Unix epoch and for year 9999 onwards. Both bounds are checked here so
+/// a caller-supplied watermark — a stored sentinel, a clock skewed
+/// backwards — surfaces as an error instead of unwinding the calling
+/// task.
+fn http_date(since: SystemTime) -> CirrusResult<String> {
+    // httpdate's own ceiling, in seconds since the epoch: 9999-01-01.
+    const YEAR_9999: u64 = 253_402_300_800;
+
+    let secs = since
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| {
+            CirrusError::InvalidHeader(
+                "If-Modified-Since requires a time at or after the Unix epoch".into(),
+            )
+        })?
+        .as_secs();
+    if secs >= YEAR_9999 {
+        return Err(CirrusError::InvalidHeader(
+            "If-Modified-Since requires a time before year 9999".into(),
+        ));
+    }
+    Ok(httpdate::fmt_http_date(since))
 }
 
 /// Specification for a multipart blob upload via
@@ -782,6 +812,7 @@ mod tests {
     /// contains the part-name + filename + JSON-snippet markers we
     /// expect.
     mod conditional {
+        use super::super::http_date;
         use super::*;
         use std::time::{Duration, SystemTime};
         use wiremock::matchers::header_regex;
@@ -922,6 +953,63 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, crate::CirrusError::Api { status: 403, .. }));
+        }
+
+        #[test]
+        fn http_date_formats_a_representable_time() {
+            // RFC 7231 IMF-fixdate example: 1994-11-06T08:49:37Z.
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777);
+            assert_eq!(http_date(t).unwrap(), "Sun, 06 Nov 1994 08:49:37 GMT");
+        }
+
+        #[test]
+        fn http_date_rejects_times_before_the_epoch() {
+            let t = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+            assert!(matches!(
+                http_date(t),
+                Err(crate::CirrusError::InvalidHeader(_))
+            ));
+        }
+
+        #[test]
+        fn http_date_rejects_year_9999_and_later() {
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800);
+            assert!(matches!(
+                http_date(t),
+                Err(crate::CirrusError::InvalidHeader(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn conditional_describe_errors_on_unrepresentable_time() {
+            // A cache watermark computed defensively (a pre-epoch
+            // sentinel, a clock skewed backwards) must not unwind the
+            // caller's task.
+            let server = MockServer::start().await;
+            let sf = fixture(server.uri());
+            let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+
+            let err = sf
+                .sobjects()
+                .describe_global_if_modified_since(before_epoch)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::InvalidHeader(_)),
+                "{err:?}"
+            );
+
+            let err = sf
+                .sobject("Account")
+                .describe_if_modified_since(before_epoch)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::InvalidHeader(_)),
+                "{err:?}"
+            );
+
+            assert!(server.received_requests().await.unwrap().is_empty());
         }
     }
 
