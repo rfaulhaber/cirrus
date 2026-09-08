@@ -583,7 +583,9 @@ mod tests {
         // object type. Including object with consentImport returns an
         // error." Response body, `object`: "The object type for the
         // data being processed. Empty for jobs created with the
-        // consentImport operation."
+        // consentImport operation." Response body, `contentUrl`: "The
+        // URL to use for Upload Job Data requests for this job. Only
+        // valid if the job is in Open state."
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -600,9 +602,10 @@ mod tests {
                 "concurrencyMode": "Parallel",
                 "contentType": "CSV",
                 "apiVersion": 60.0,
+                "jobType": "V2Ingest",
+                "contentUrl": "services/data/v66.0/jobs/ingest/750xx/batches",
                 "lineEnding": "LF",
-                "columnDelimiter": "COMMA",
-                "jobType": "V2Ingest"
+                "columnDelimiter": "COMMA"
             })))
             .mount(&server)
             .await;
@@ -623,6 +626,10 @@ mod tests {
             .unwrap();
         assert_eq!(job.operation, BulkOperation::ConsentImport);
         assert_eq!(job.object, "");
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/v66.0/jobs/ingest/750xx/batches")
+        );
     }
 
     #[tokio::test]
