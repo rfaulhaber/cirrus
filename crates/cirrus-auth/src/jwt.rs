@@ -45,13 +45,20 @@ pub const SANDBOX_LOGIN_URL: &str = "https://test.salesforce.com";
 /// Default cache TTL for an access token after it's issued.
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// JWT validity window. Salesforce rejects assertions whose `exp` is
-/// more than 3 minutes ahead of *its* clock. Setting `exp = now + 180`
-/// leaves zero slack: any clock skew where the local host runs even
-/// slightly ahead of Salesforce will push `exp` over the ceiling and
-/// produce `invalid_grant`. The 10-second buffer below keeps the
-/// assertion short-lived while tolerating the kind of skew typical of
-/// NTP-synced machines.
+/// JWT validity window, in seconds.
+///
+/// The signed assertion is a bearer credential in flight, so the window
+/// is deliberately short: it only has to cover a single token request.
+/// RFC 7523 §3 requires the authorization server to reject an `exp`
+/// that has already passed and permits it to reject one that is
+/// "unreasonably far in the future", so the slack that remains is there
+/// for clock skew — it is the token endpoint's clock, not this host's,
+/// that decides whether `exp` is still ahead.
+// Salesforce is sometimes said to reject an assertion whose `exp` is
+// more than three minutes ahead of its own clock. No fetchable doc page
+// states such a ceiling and RFC 7523 sets no numeric bound, so this
+// window sits under the reputed limit rather than at it: correct
+// whether or not the ceiling is real.
 const JWT_VALIDITY_SECS: i64 = 170;
 
 #[derive(Serialize)]

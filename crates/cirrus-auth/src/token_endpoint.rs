@@ -347,9 +347,10 @@ mod tests {
 
     #[test]
     fn instance_url_check_ignores_ascii_case() {
-        // Salesforce's docs write My Domain hosts in mixed case
-        // (`MyDomainName.my.salesforce.com`) while the token response
-        // returns them lowercased.
+        // Salesforce's docs spell My Domain hosts in mixed case
+        // (`MyDomainName.my.salesforce.com`) and a configured value can
+        // be typed in any case, so the host compare is case-insensitive.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_auth_jwt_flow.htm
         let response = response("https://mydomainname.my.salesforce.com", None);
         check_instance_url("https://MyDomainName.my.salesforce.com", &response).unwrap();
     }
