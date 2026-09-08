@@ -82,7 +82,10 @@ pub enum CirrusError {
     #[error(transparent)]
     Auth(#[from] AuthError),
 
-    /// JSON serialization or deserialization failure.
+    /// Failed to serialize a request body to JSON — the `deployOptions`
+    /// or blob-field metadata part of a multipart upload. Response
+    /// bodies that don't match the shape the SDK asked for surface as
+    /// [`CirrusError::InvalidResponse`] instead.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
