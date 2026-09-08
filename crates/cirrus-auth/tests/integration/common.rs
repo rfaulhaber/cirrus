@@ -163,8 +163,9 @@ fn load_dotenv() {
 
 /// Resolves the configured `instance_url` after applying the safety
 /// guard. Returns `None` (and prints a skip message) when integration
-/// tests aren't enabled or the URL fails the safe-list check; panics
-/// when they are enabled but `INSTANCE_URL` is missing.
+/// tests aren't enabled or the URL's host isn't a known
+/// sandbox/dev/scratch partition; panics when they are enabled but
+/// `INSTANCE_URL` is missing or isn't `https`.
 pub fn try_instance_url() -> Option<String> {
     load_dotenv();
 
@@ -216,8 +217,9 @@ pub async fn try_init_auth() -> Option<SharedAuth> {
 ///
 /// Returns `None` when the JWT block is absent altogether and
 /// static-token mode is configured instead — that is a legitimate
-/// setup, and the JWT-specific tests skip. A half-filled JWT block, or
-/// no auth configuration at all, panics.
+/// setup, and the JWT-specific tests skip. A half-filled JWT block, no
+/// auth configuration at all, or a `LOGIN_URL` that isn't `https`
+/// panics.
 ///
 /// Use this from JWT-specific tests that must exercise the full
 /// bearer flow rather than fall through to the static-token shortcut.

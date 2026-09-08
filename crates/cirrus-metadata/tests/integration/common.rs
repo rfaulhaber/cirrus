@@ -165,11 +165,13 @@ fn load_dotenv() {
 /// Constructs a [`MetadataClient`] from environment configuration.
 ///
 /// Returns `None` (with a stderr skip message) when `CIRRUS_INTEGRATION`
-/// isn't `1` or the URL fails the safety guard, so tests `return` and
-/// pass cleanly without hitting the network. Panics when
-/// `CIRRUS_INTEGRATION=1` but the rest of the configuration is missing
-/// or half-filled — an opted-in run that exercises nothing must not
-/// report green.
+/// isn't `1` or the instance URL's host isn't a known sandbox/dev/scratch
+/// partition, so tests `return` and pass cleanly without hitting the
+/// network. Panics when `CIRRUS_INTEGRATION=1` but the rest of the
+/// configuration is missing or half-filled, and when a configured URL
+/// isn't `https` — an opted-in run that exercises nothing must not
+/// report green, and a credential must not cross the network in the
+/// clear.
 pub async fn try_init_client() -> Option<MetadataClient> {
     load_dotenv();
 

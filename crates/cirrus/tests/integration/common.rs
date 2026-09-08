@@ -204,11 +204,13 @@ fn load_dotenv() {
 ///
 /// - Returns `Some(client)` if fully configured.
 /// - Returns `None` with a stderr skip message when `CIRRUS_INTEGRATION`
-///   isn't `1`, or when the URL fails the safety guard. Tests should
-///   `return` on `None`.
+///   isn't `1`, or when the instance URL's host isn't a known
+///   sandbox/dev/scratch partition. Tests should `return` on `None`.
 /// - Panics when `CIRRUS_INTEGRATION=1` but the rest of the
-///   configuration is missing or half-filled. An opted-in run that
-///   exercises nothing must not report green.
+///   configuration is missing or half-filled, and when a configured URL
+///   isn't `https`. An opted-in run that exercises nothing must not
+///   report green, and a credential must not cross the network in the
+///   clear.
 ///
 /// **Don't** unwrap or panic on `None` — that would defeat the
 /// "tests pass cleanly when unconfigured" property.
