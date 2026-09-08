@@ -40,16 +40,18 @@ you need anything beyond `deployRequest`.
 - **CRUD-based calls** — `create_metadata`, `read_metadata`,
   `update_metadata`, `upsert_metadata`, `delete_metadata`,
   `rename_metadata`. Up to 10 components per call, per the Metadata API
-  contract.
+  contract — 200 for `CustomMetadata` and `CustomApplication`.
 - **Utility** — `list_metadata`, `describe_metadata`, `describe_value_type`.
-- **Typed `package.xml`** — [`PackageManifest`] builder with the full
-  `MetadataType` taxonomy and round-trippable XML serialization.
+- **Typed `package.xml`** — `PackageManifest` builder with round-trippable
+  XML serialization. `MetadataType` carries constants for the common
+  types and `MetadataType::new` accepts any other Salesforce-defined
+  type name.
 - **Open-ended escape hatch** — `MetadataClient::request_builder()` for
   hand-rolling envelopes against operations the typed surface hasn't
   modeled, with `SoapOperation` carrying the typed call path.
-- **Cross-cutting** — retry/backoff via [`RetryPolicy`], automatic
+- **Cross-cutting** — retry/backoff via `RetryPolicy`, automatic
   `INVALID_SESSION_ID` refresh against the configured `AuthSession`, SOAP
-  fault parsing into typed [`MetadataError::SoapFault`].
+  fault parsing into a typed `MetadataError::Soap`.
 
 ## Design principles
 
@@ -66,14 +68,14 @@ you need anything beyond `deployRequest`.
 
 ```toml
 [dependencies]
-cirrus-metadata = "0.1"
+cirrus-metadata = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust,ignore
 use cirrus_metadata::auth::StaticTokenAuth;
 use cirrus_metadata::{
-    ListMetadataQuery, MetadataClient, PackageManifest, RetrieveRequest,
+    ListMetadataQuery, MetadataClient, MetadataType, PackageManifest, RetrieveRequest,
 };
 use std::sync::Arc;
 
@@ -86,12 +88,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let md = MetadataClient::builder().auth(auth).build()?;
 
-    // List every Apex class in the org.
+    // List every Apex class in the org. `list_metadata` takes the
+    // queries plus the API version the listing is made against.
     let classes = md
-        .list_metadata(vec![ListMetadataQuery {
-            type_name: "ApexClass".into(),
-            folder: None,
-        }])
+        .list_metadata(
+            vec![ListMetadataQuery {
+                type_name: "ApexClass".into(),
+                folder: None,
+            }],
+            md.api_version(),
+        )
         .await?;
 
     for f in &classes {
@@ -100,23 +106,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build a retrieve manifest and pull the matching components.
     let manifest = PackageManifest::new(md.api_version())
-        .add("ApexClass", ["MyService"])
-        .add("CustomObject", ["Account"]);
+        .add(MetadataType::APEX_CLASS, ["MyService"])
+        .add(MetadataType::CUSTOM_OBJECT, ["Account"]);
 
     let async_result = md
         .retrieve(RetrieveRequest {
             api_version: md.api_version().to_string(),
-            package_names: vec![],
             single_package: true,
-            specific_files: vec![],
             unpackaged: Some(manifest),
+            ..Default::default()
         })
         .await?;
 
     let result = md.wait_for_retrieve(&async_result.id).await?;
 
-    if let Some(zip) = result.zip_file {
-        fs_err::write("retrieved.zip", zip)?;
+    // `zip_file` holds the base64 payload Salesforce returns;
+    // `zip_bytes()` decodes it into the actual archive.
+    if let Some(zip) = result.zip_bytes()? {
+        std::fs::write("retrieved.zip", zip)?;
     }
 
     Ok(())
@@ -125,11 +132,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Errors
 
-`MetadataError` covers transport failures, SOAP faults
-(`MetadataError::SoapFault { fault_code, fault_string, .. }`), per-component
-API errors (`MetadataError::Api`), envelope parsing failures, and auth
-errors (`#[from] AuthError`). Use `?` to propagate from any
-`AuthSession::access_token` call alongside SOAP traffic.
+`MetadataError` covers transport failures (`MetadataError::Http`), SOAP
+faults (`MetadataError::Soap { status, fault }`, where `fault.code()`
+returns the faultcode with its `sf:` prefix stripped), non-SOAP error
+bodies from proxies and gateways (`MetadataError::Http4xx5xx`),
+envelope and response-shape problems (`MetadataError::Xml`,
+`MetadataError::InvalidResponse`), client-side argument validation
+(`MetadataError::InvalidArgument`), exhausted polling budgets
+(`MetadataError::PollTimeout`), and auth errors
+(`MetadataError::Auth`, which is `#[from] AuthError`). Use `?` to
+propagate from any `AuthSession::access_token` call alongside SOAP
+traffic.
 
 `MetadataError` is `#[non_exhaustive]` so future variants don't break
 downstream `match` arms.
