@@ -54,8 +54,12 @@ fn client_against(server: &MockServer) -> MetadataClient {
 /// mixed result below.
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_saveResult.htm
 /// SaveResult: `fullName`, `success`, and `errors` ("An array of
-/// errors returned if the operation wasn't successful") whose entries
-/// carry `statusCode`, `message` and `fields`.
+/// errors returned if the operation wasn't successful").
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_error.htm
+/// Error, the element type of that array: `fields` ("An array
+/// containing names of fields that affected the error condition"),
+/// `message` ("The error message text") and `statusCode` ("A status
+/// code corresponding to the error").
 #[tokio::test]
 async fn create_metadata_returns_save_results_per_component() {
     let server = MockServer::start().await;
@@ -280,6 +284,10 @@ async fn upsert_metadata_returns_created_flag_per_component() {
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deleteResult.htm
 /// DeleteResult: `fullName` ("The full name of the deleted
 /// component"), `success`, and `errors`.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_error.htm
+/// Error, the element type of that array: `fields`, `message` ("The
+/// error message text") and `statusCode` ("A status code
+/// corresponding to the error").
 #[tokio::test]
 async fn delete_metadata_returns_one_result_per_full_name() {
     let server = MockServer::start().await;
@@ -514,6 +522,10 @@ async fn rename_metadata_returns_single_save_result() {
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_saveResult.htm
 /// A rename that fails reports it in the SaveResult's `errors` array,
 /// not as a SOAP fault.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_error.htm
+/// Error, the element type of that array: `fields`, `message` ("The
+/// error message text") and `statusCode` ("A status code
+/// corresponding to the error").
 #[tokio::test]
 async fn rename_metadata_propagates_error_in_save_result() {
     let server = MockServer::start().await;
