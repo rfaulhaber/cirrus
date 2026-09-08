@@ -371,3 +371,90 @@ async fn describe_value_type_parses_field_schema() {
     assert!(status.picklist_values[0].default_value);
     assert_eq!(status.picklist_values[1].value, Some("Deleted".into()));
 }
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describeValueType.htm
+/// The guide's own sample output for
+/// `{http://soap.sforce.com/2006/04/metadata}CustomObject` prints one
+/// field carrying two foreign key domains:
+///
+/// ```text
+/// Name: customHelp
+/// SoapType: string
+/// This field is a foreign key.
+/// Foreign key domain: ApexPage
+/// Foreign key domain: Scontrol
+/// ```
+///
+/// and its Java sample iterates `getForeignKeyDomain()` as a
+/// collection on both `parentField` and each entry of
+/// `valueTypeFields`.
+#[tokio::test]
+async fn describe_value_type_collects_every_foreign_key_domain() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:type>{http://soap.sforce.com/2006/04/metadata}CustomObject</met:type>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <describeValueTypeResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <apiCreatable>true</apiCreatable>
+        <apiDeletable>true</apiDeletable>
+        <apiReadable>true</apiReadable>
+        <apiUpdatable>true</apiUpdatable>
+        <parentField>
+          <foreignKeyDomain>CustomObject</foreignKeyDomain>
+          <isForeignKey>true</isForeignKey>
+          <isNameField>false</isNameField>
+          <minOccurs>0</minOccurs>
+          <soapType>string</soapType>
+          <valueRequired>false</valueRequired>
+        </parentField>
+        <valueTypeFields>
+          <isForeignKey>false</isForeignKey>
+          <isNameField>false</isNameField>
+          <minOccurs>0</minOccurs>
+          <name>compactLayoutAssignment</name>
+          <soapType>string</soapType>
+          <valueRequired>false</valueRequired>
+        </valueTypeFields>
+        <valueTypeFields>
+          <foreignKeyDomain>ApexPage</foreignKeyDomain>
+          <foreignKeyDomain>Scontrol</foreignKeyDomain>
+          <isForeignKey>true</isForeignKey>
+          <isNameField>false</isNameField>
+          <minOccurs>0</minOccurs>
+          <name>customHelp</name>
+          <soapType>string</soapType>
+          <valueRequired>false</valueRequired>
+        </valueTypeFields>
+      </result>
+    </describeValueTypeResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .describe_value_type("{http://soap.sforce.com/2006/04/metadata}CustomObject")
+        .await
+        .unwrap();
+
+    // A repeated element bound to a scalar field aborts the whole
+    // document, so the two-domain field is what proves the list shape.
+    let custom_help = &result.value_type_fields[1];
+    assert_eq!(custom_help.name, Some("customHelp".into()));
+    assert!(custom_help.is_foreign_key);
+    assert_eq!(custom_help.foreign_key_domain, ["ApexPage", "Scontrol"]);
+
+    // One domain still lands in the list, and a non-key field has none.
+    let parent = result.parent_field.as_ref().unwrap();
+    assert_eq!(parent.foreign_key_domain, ["CustomObject"]);
+    assert!(result.value_type_fields[0].foreign_key_domain.is_empty());
+}

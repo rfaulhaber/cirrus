@@ -711,6 +711,16 @@ pub struct DescribeValueTypeResult {
 /// [`fields`](Self::fields) describing their own structure (e.g. a
 /// `CustomField` value type field on `CustomObject` itself has a
 /// nested schema). Use [`Self::fields`] to walk the tree.
+//
+// Wire-shape provenance (api_meta doc page IDs):
+// - `meta_describeValueTypeResult` types `foreignKeyDomain` as a
+//   singular `string` in its property table, but
+//   `meta_describeValueType` contradicts it twice over: the Java
+//   sample iterates `field.getForeignKeyDomain()` as a collection, and
+//   its printed output for `CustomObject` prints two domains
+//   (`ApexPage`, `Scontrol`) for the one `customHelp` field. The
+//   repeating form is modelled here because binding a repeated
+//   element to a scalar fails the whole response, not just the field.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueTypeField {
@@ -734,10 +744,14 @@ pub struct ValueTypeField {
     /// Whether this field is a foreign key to another component.
     #[serde(default)]
     pub is_foreign_key: bool,
-    /// Target object type when [`is_foreign_key`](Self::is_foreign_key)
-    /// is true (e.g. `"Account"`, `"Opportunity"`).
-    #[serde(default, deserialize_with = "deserialize_nil_string")]
-    pub foreign_key_domain: Option<String>,
+    /// Target object types when [`is_foreign_key`](Self::is_foreign_key)
+    /// is true (e.g. `"Account"`, `"Opportunity"`). A single field can
+    /// point at more than one type — `CustomObject.customHelp` names
+    /// both `ApexPage` and `Scontrol` — so the wire emits one
+    /// `<foreignKeyDomain>` element per target. Empty for fields that
+    /// aren't foreign keys.
+    #[serde(default)]
+    pub foreign_key_domain: Vec<String>,
     /// Picklist options when this field is a picklist. Empty for
     /// non-picklist fields.
     #[serde(default)]
