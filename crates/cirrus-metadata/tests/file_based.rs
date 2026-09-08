@@ -123,6 +123,8 @@ async fn check_deploy_status_parses_full_deploy_result() {
         <numberTestsCompleted>5</numberTestsCompleted>
         <numberTestsTotal>5</numberTestsTotal>
         <numberTestErrors>0</numberTestErrors>
+        <numFiles>12</numFiles>
+        <zipSize>18342211</zipSize>
         <createdBy>005xx00000abcde</createdBy>
         <createdByName>Stephanie</createdByName>
         <createdDate>2026-05-28T10:00:00.000Z</createdDate>
@@ -161,6 +163,13 @@ async fn check_deploy_status_parses_full_deploy_result() {
     assert!(result.success);
     assert_eq!(result.status, Some(DeployStatus::Succeeded));
     assert_eq!(result.number_components_deployed, 10);
+    // meta_deployresult.htm: "numFiles | int | The total number of
+    // files included in this deployment." and "zipSize | long | The
+    // size of the unzipped deployment folder in bytes." Both are
+    // available in API version 64.0 and later, so both are live at the
+    // 66.0 default this client targets.
+    assert_eq!(result.num_files, 12);
+    assert_eq!(result.zip_size, 18_342_211);
     let details = result.details.unwrap();
     assert_eq!(details.component_successes.len(), 1);
     assert_eq!(details.component_successes[0].full_name, Some("Foo".into()));
@@ -446,6 +455,48 @@ async fn retrieve_sends_unpackaged_manifest_and_returns_async_result() {
     };
     let result = md.retrieve(req).await.unwrap();
     assert_eq!(result.id, "09S00000retrId");
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieve_request.htm
+/// rootTypesWithDependencies row: "A list of component types to
+/// retrieve dependencies for. Currently, the only allowed value for
+/// this parameter is Bot. … This field is available in API version
+/// 64.0 and later."
+#[tokio::test]
+async fn retrieve_sends_root_types_with_dependencies() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:rootTypesWithDependencies>Bot</met:rootTypesWithDependencies>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <retrieveResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <done>false</done>
+        <id>09S00000botdeps</id>
+        <state>Queued</state>
+      </result>
+    </retrieveResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let req = RetrieveRequest {
+        api_version: "66.0".into(),
+        single_package: true,
+        root_types_with_dependencies: vec!["Bot".into()],
+        unpackaged: Some(PackageManifest::new("66.0").add(MetadataType::new("Bot"), ["MyBot"])),
+        ..Default::default()
+    };
+    let result = md.retrieve(req).await.unwrap();
+    assert_eq!(result.id, "09S00000botdeps");
 }
 
 // -- check_retrieve_status ---------------------------------------------------

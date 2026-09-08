@@ -205,6 +205,11 @@ impl SoapOperation for RetrieveOp {
             out.push_str(&xml_escape(pkg));
             out.push_str("</met:packageNames>");
         }
+        for ty in &self.request.root_types_with_dependencies {
+            out.push_str("<met:rootTypesWithDependencies>");
+            out.push_str(&xml_escape(ty));
+            out.push_str("</met:rootTypesWithDependencies>");
+        }
         write_bool(&mut out, "singlePackage", self.request.single_package);
         for f in &self.request.specific_files {
             out.push_str("<met:specificFiles>");

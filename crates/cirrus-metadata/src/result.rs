@@ -203,6 +203,15 @@ pub struct DeployResult {
     #[serde(default)]
     pub number_test_errors: i32,
 
+    /// Total number of files included in this deployment. Available
+    /// in API version 64.0 and later; `0` on older versions.
+    #[serde(default)]
+    pub num_files: i32,
+    /// Size of the unzipped deployment folder, in bytes. Available in
+    /// API version 64.0 and later; `0` on older versions.
+    #[serde(default)]
+    pub zip_size: i64,
+
     /// Free-form description of the in-progress component or test
     /// class.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -459,6 +468,12 @@ pub struct RetrieveRequest {
     pub api_version: String,
     /// Packaged components to retrieve by managed-package name.
     pub package_names: Vec<String>,
+    /// Component types to pull dependencies for. `"Bot"` is the only
+    /// value Salesforce currently allows; set it when the request
+    /// includes Bot components. Available in API version 64.0 and
+    /// later, and metered separately — 25 retrieves per day using this
+    /// field, each covering up to 100 components.
+    pub root_types_with_dependencies: Vec<String>,
     /// `true` if the result is one package (vs. a set). Required
     /// `true` when `specific_files` is non-empty.
     pub single_package: bool,
