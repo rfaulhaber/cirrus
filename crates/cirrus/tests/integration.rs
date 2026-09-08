@@ -34,8 +34,16 @@
 //!   safety guards). Used by every test module.
 //! - `smoke` — read-only verifications: versions, limits,
 //!   version-negotiation, `Sforce-Limit-Info` capture.
-//! - (Future modules — sobjects CRUD, query pagination, Bulk 2.0,
-//!   composite, tooling — will land as their own files.)
+//! - `sobjects` — Account create → retrieve → update → delete, plus
+//!   global and per-object describe.
+//! - `query` — SOQL envelopes, typed deserialization, the pagination
+//!   stream, and `queryAll` over soft-deleted records.
+//! - `composite` — composite/sobjects, composite/batch, and typed
+//!   composite retrieve.
+//! - `tooling` — `executeAnonymous` result shapes, Tooling describe,
+//!   and Tooling query.
+//!
+//! Bulk 2.0 has no integration module yet.
 
 #[path = "integration/common.rs"]
 mod common;
