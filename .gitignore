@@ -3,8 +3,7 @@
 *.log
 tmp/
 
-.direnv
-.envrc
+.direnv/
 target/
 result
 rust_out
