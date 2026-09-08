@@ -510,7 +510,11 @@ pub struct BulkQueryJob {
 /// pagination. `locator` is `None` when the result set is fully drained;
 /// pass it back to [`crate::handlers::bulk::BulkQueryHandler::results`]
 /// in subsequent calls to fetch the next page.
-#[derive(Debug, Clone)]
+///
+/// The [`Debug`] rendering reports the CSV length in place of the body:
+/// one page holds up to tens of thousands of exported records, and the
+/// cursor fields are the reason to debug-format this type.
+#[derive(Clone)]
 pub struct BulkQueryResults {
     /// CSV body of this result page.
     pub csv: bytes::Bytes,
@@ -520,6 +524,16 @@ pub struct BulkQueryResults {
     /// Number of records included in this page (`Sforce-NumberOfRecords`
     /// response header).
     pub number_of_records: Option<i64>,
+}
+
+impl std::fmt::Debug for BulkQueryResults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkQueryResults")
+            .field("csv_len", &self.csv.len())
+            .field("locator", &self.locator)
+            .field("number_of_records", &self.number_of_records)
+            .finish()
+    }
 }
 
 /// One `EventLogFile` sObject record returned by querying
@@ -1837,6 +1851,19 @@ mod tests {
         assert!(parsed.success);
         assert!(parsed.errors.is_empty());
         assert!(parsed.created.is_none());
+    }
+
+    #[test]
+    fn bulk_query_results_debug_elides_the_csv_body() {
+        let results = BulkQueryResults {
+            csv: bytes::Bytes::from_static(b"Id,Name\n001xx,Acme Corp\n"),
+            locator: Some("MTAwMDA".into()),
+            number_of_records: Some(1),
+        };
+        let rendered = format!("{results:?}");
+        assert!(!rendered.contains("Acme Corp"), "leaked body: {rendered}");
+        assert!(rendered.contains("csv_len: 24"), "got {rendered}");
+        assert!(rendered.contains("MTAwMDA"), "got {rendered}");
     }
 
     #[test]
