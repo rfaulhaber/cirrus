@@ -513,8 +513,11 @@ async fn describe_value_type_parses_field_schema() {
 /// ```
 ///
 /// and its Java sample iterates `getForeignKeyDomain()` as a
-/// collection on both `parentField` and each entry of
-/// `valueTypeFields`.
+/// collection on each entry of `valueTypeFields`. That same output
+/// opens CustomObject with `** Value type fields **` and no
+/// `** Parent type fields **` section, so CustomObject has no parent.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describeValueTypeResult.htm
+/// parentField: "If the value type has no parent, this field is null."
 #[tokio::test]
 async fn describe_value_type_collects_every_foreign_key_domain() {
     let server = MockServer::start().await;
@@ -533,14 +536,6 @@ async fn describe_value_type_collects_every_foreign_key_domain() {
         <apiDeletable>true</apiDeletable>
         <apiReadable>true</apiReadable>
         <apiUpdatable>true</apiUpdatable>
-        <parentField>
-          <foreignKeyDomain>CustomObject</foreignKeyDomain>
-          <isForeignKey>true</isForeignKey>
-          <isNameField>false</isNameField>
-          <minOccurs>0</minOccurs>
-          <soapType>string</soapType>
-          <valueRequired>false</valueRequired>
-        </parentField>
         <valueTypeFields>
           <isForeignKey>false</isForeignKey>
           <isNameField>false</isNameField>
@@ -580,8 +575,85 @@ async fn describe_value_type_collects_every_foreign_key_domain() {
     assert!(custom_help.is_foreign_key);
     assert_eq!(custom_help.foreign_key_domain, ["ApexPage", "Scontrol"]);
 
-    // One domain still lands in the list, and a non-key field has none.
-    let parent = result.parent_field.as_ref().unwrap();
-    assert_eq!(parent.foreign_key_domain, ["CustomObject"]);
+    // A non-key field carries no domain, and CustomObject has no parent.
     assert!(result.value_type_fields[0].foreign_key_domain.is_empty());
+    assert!(result.parent_field.is_none());
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describeValueType.htm
+/// The sample output for
+/// `{http://soap.sforce.com/2006/04/metadata}CustomField` is the one
+/// that prints a parent:
+///
+/// ```text
+/// ** Parent type fields **
+/// This field is a foreign key.
+/// Foreign key domain: CustomObject
+/// ```
+///
+/// and the Java sample reads it through the same collection-valued
+/// `getForeignKeyDomain()` accessor it uses on `valueTypeFields`.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describeValueTypeResult.htm
+/// ValueTypeField.name: "The name is null for parent fields."
+#[tokio::test]
+async fn describe_value_type_reports_the_parent_field_domain() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:type>{http://soap.sforce.com/2006/04/metadata}CustomField</met:type>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <describeValueTypeResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <apiCreatable>true</apiCreatable>
+        <apiDeletable>true</apiDeletable>
+        <apiReadable>true</apiReadable>
+        <apiUpdatable>true</apiUpdatable>
+        <parentField>
+          <foreignKeyDomain>CustomObject</foreignKeyDomain>
+          <isForeignKey>true</isForeignKey>
+          <isNameField>false</isNameField>
+          <minOccurs>0</minOccurs>
+          <soapType>string</soapType>
+          <valueRequired>false</valueRequired>
+        </parentField>
+        <valueTypeFields>
+          <isForeignKey>false</isForeignKey>
+          <isNameField>false</isNameField>
+          <minOccurs>0</minOccurs>
+          <name>caseSensitive</name>
+          <soapType>boolean</soapType>
+          <valueRequired>false</valueRequired>
+        </valueTypeFields>
+        <valueTypeFields>
+          <isForeignKey>false</isForeignKey>
+          <isNameField>false</isNameField>
+          <minOccurs>0</minOccurs>
+          <name>defaultValue</name>
+          <soapType>string</soapType>
+          <valueRequired>false</valueRequired>
+        </valueTypeFields>
+      </result>
+    </describeValueTypeResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .describe_value_type("{http://soap.sforce.com/2006/04/metadata}CustomField")
+        .await
+        .unwrap();
+
+    let parent = result.parent_field.as_ref().unwrap();
+    assert!(parent.is_foreign_key);
+    assert_eq!(parent.foreign_key_domain, ["CustomObject"]);
+    assert_eq!(parent.name, None);
+    assert_eq!(result.value_type_fields.len(), 2);
 }
