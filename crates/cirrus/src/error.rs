@@ -101,7 +101,9 @@ pub enum CirrusError {
         message: String,
     },
 
-    /// Response could not be interpreted as the requested type or shape.
+    /// Response could not be interpreted as the requested type or
+    /// shape. When the message quotes an excerpt of what arrived,
+    /// bearer-token material in it is replaced with `[redacted]` first.
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 }
@@ -110,15 +112,19 @@ pub enum CirrusError {
 const REDACTED: &str = "[redacted]";
 
 impl CirrusError {
-    /// Removes bearer-token material from a stored raw error body.
+    /// Removes bearer-token material from every variant that carries
+    /// response-body text.
     ///
-    /// The `raw` body is only ever populated for responses that don't
-    /// match Salesforce's error array — i.e. pages written by proxies,
-    /// gateways and WAFs, which routinely echo the offending request
-    /// (headers included) back to the client. That body is interpolated
-    /// into the error's `Display`, so an ordinary
+    /// A body is only ever retained when it didn't match the shape the
+    /// SDK asked for — the error array on a 4xx/5xx, or the requested
+    /// type on a 2xx. Both cases are dominated by pages written by
+    /// proxies, gateways and WAFs, which routinely echo the offending
+    /// request (headers included) back to the client. That text is
+    /// interpolated into the error's `Display`, so an ordinary
     /// `tracing::error!("{e}")` would otherwise write a live org session
     /// id into the caller's log sink.
+    ///
+    /// Every new variant that stores body text has to be added here.
     pub(crate) fn redact_secrets(self, token: &str) -> Self {
         match self {
             Self::Api {
@@ -130,6 +136,7 @@ impl CirrusError {
                 errors,
                 raw: Some(redact_body(&raw, token)),
             },
+            Self::InvalidResponse(message) => Self::InvalidResponse(redact_body(&message, token)),
             other => other,
         }
     }
@@ -282,6 +289,31 @@ mod tests {
         assert!(!raw.contains("stale-one"), "{raw}");
         assert!(!raw.contains("stale-two"), "{raw}");
         assert_eq!(raw.matches("[redacted]").count(), 2, "{raw}");
+    }
+
+    #[test]
+    fn redact_secrets_strips_a_token_echoed_in_an_invalid_response() {
+        // A 2xx body that doesn't fit the requested type keeps an
+        // excerpt, and an interposed hop can answer 200 with the same
+        // echoed request a 502 page carries.
+        let token = "00D5f000000ABCD!AQcAQK_two_hundred";
+        let err = CirrusError::InvalidResponse(format!(
+            "endpoint returned 200 but the body did not deserialize into the requested type: \
+             expected value at line 1 column 1; body starts: \
+             <html>GET /services/data/v66.0/limits Authorization: Bearer {token}</html>"
+        ))
+        .redact_secrets(token);
+
+        let CirrusError::InvalidResponse(message) = &err else {
+            panic!("expected an InvalidResponse error");
+        };
+        assert!(
+            !message.contains(token),
+            "token survived redaction: {message}"
+        );
+        assert!(message.contains("[redacted]"));
+        assert!(message.contains("/services/data/v66.0/limits"));
+        assert!(!err.to_string().contains(token));
     }
 
     #[test]

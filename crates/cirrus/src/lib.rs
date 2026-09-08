@@ -1705,6 +1705,36 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn an_echoed_request_in_a_2xx_body_is_scrubbed() {
+            // A gateway can answer 200 with its own page. That body
+            // doesn't fit the requested type, so an excerpt lands in
+            // CirrusError::InvalidResponse and in the error's Display —
+            // the same exposure the error-array path has.
+            let token = "00D5f000000ABCD!AQcAQK_session_id";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "<html>GET /services/data/v66.0/limits\nAuthorization: Bearer {token}</html>"
+                )))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+
+            assert!(!err.to_string().contains(token), "{err}");
+            match err {
+                CirrusError::InvalidResponse(message) => {
+                    assert!(!message.contains(token), "{message}");
+                    assert!(message.contains("[redacted]"), "{message}");
+                }
+                other => panic!("expected an InvalidResponse error, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
         async fn an_echoed_request_in_an_error_body_is_scrubbed() {
             // A gateway that answers with its own page — not the
             // Salesforce error array — lands in CirrusError::Api::raw
