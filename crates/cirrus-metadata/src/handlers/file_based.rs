@@ -318,12 +318,18 @@ fn render_unpackaged(pkg: &PackageManifest, out: &mut String) {
 /// [`RetryPolicy`]: crate::RetryPolicy
 #[derive(Debug, Clone)]
 pub struct WaitConfig {
-    /// Delay before the first poll. Default 2 s.
+    /// Delay between the first and second poll; the first poll is
+    /// issued immediately. Doubles each round up to
+    /// [`max_delay`](Self::max_delay). Default 2 s.
     pub initial_delay: Duration,
     /// Cap on the backoff delay. Default 30 s.
     pub max_delay: Duration,
     /// Total wall-clock budget. `None` = wait indefinitely. Default
     /// `None` — deploys can legitimately run for hours.
+    ///
+    /// Backoff sleeps are clamped to what's left of the budget, so the
+    /// timeout fires within one in-flight status call of it rather
+    /// than a whole backoff round past it.
     pub total_timeout: Option<Duration>,
 }
 
@@ -513,14 +519,21 @@ impl MetadataClient {
                     }
                 };
             }
-            if let Some(timeout) = config.total_timeout
-                && start.elapsed() >= timeout
-            {
-                return Err(MetadataError::PollTimeout(format!(
-                    "wait_for_deploy timed out after {timeout:?} (deploy still in progress)"
-                )));
+            if let Some(timeout) = config.total_timeout {
+                // Clamping the sleep to what's left of the budget is
+                // what keeps the deadline honest: an unclamped sleep
+                // would carry the next check up to `max_delay` past
+                // the budget before it could fire.
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(MetadataError::PollTimeout(format!(
+                        "wait_for_deploy timed out after {timeout:?} (deploy still in progress)"
+                    )));
+                }
+                tokio::time::sleep(delay.min(remaining)).await;
+            } else {
+                tokio::time::sleep(delay).await;
             }
-            tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(config.max_delay);
         }
     }
@@ -559,14 +572,21 @@ impl MetadataClient {
                 }
                 return self.check_retrieve_status(retrieve_id, true).await;
             }
-            if let Some(timeout) = config.total_timeout
-                && start.elapsed() >= timeout
-            {
-                return Err(MetadataError::PollTimeout(format!(
-                    "wait_for_retrieve timed out after {timeout:?} (retrieve still in progress)"
-                )));
+            if let Some(timeout) = config.total_timeout {
+                // Clamping the sleep to what's left of the budget is
+                // what keeps the deadline honest: an unclamped sleep
+                // would carry the next check up to `max_delay` past
+                // the budget before it could fire.
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(MetadataError::PollTimeout(format!(
+                        "wait_for_retrieve timed out after {timeout:?} (retrieve still in progress)"
+                    )));
+                }
+                tokio::time::sleep(delay.min(remaining)).await;
+            } else {
+                tokio::time::sleep(delay).await;
             }
-            tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(config.max_delay);
         }
     }

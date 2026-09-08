@@ -571,6 +571,60 @@ async fn wait_for_deploy_times_out_when_never_done() {
     assert!(err.to_string().contains("timed out"));
 }
 
+/// The backoff schedule is deliberately built so an unclamped sleep
+/// would overshoot: with a 40 ms initial delay and a 2 s cap, the poll
+/// at t≈120 ms is followed by a 160 ms sleep, which would push the
+/// deadline check for a 140 ms budget out to t≈280 ms — twice the
+/// budget the caller asked for.
+#[tokio::test]
+async fn wait_for_deploy_timeout_fires_within_its_budget() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000slow</id>
+        <done>false</done>
+        <status>InProgress</status>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let budget = Duration::from_millis(140);
+    let started = std::time::Instant::now();
+    let err = md
+        .wait_for_deploy_with(
+            "0Af00000slow",
+            WaitConfig {
+                initial_delay: Duration::from_millis(40),
+                max_delay: Duration::from_secs(2),
+                total_timeout: Some(budget),
+            },
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(err, MetadataError::PollTimeout(_)));
+    assert!(elapsed >= budget, "returned early at {elapsed:?}");
+    // Generous headroom for the in-flight poll the budget can't
+    // interrupt; the unclamped schedule would land near 280 ms.
+    assert!(
+        elapsed < budget * 2,
+        "timeout overshot its budget: {elapsed:?}"
+    );
+}
+
 // -- wait_for_retrieve -------------------------------------------------------
 //
 // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_checkretrievestatus.htm
@@ -758,4 +812,42 @@ async fn check_retrieve_status_without_zip_is_retried() {
         .await
         .unwrap();
     assert!(!result.done);
+}
+
+/// Same schedule as the deploy case: an unclamped 160 ms sleep after
+/// the t≈120 ms poll would carry a 140 ms budget out to t≈280 ms.
+#[tokio::test]
+async fn wait_for_retrieve_timeout_fires_within_its_budget() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(xml_response(&retrieve_status_body(false, false, None)))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let budget = Duration::from_millis(140);
+    let started = std::time::Instant::now();
+    let err = md
+        .wait_for_retrieve_with(
+            "09S00000poll",
+            WaitConfig {
+                initial_delay: Duration::from_millis(40),
+                max_delay: Duration::from_secs(2),
+                total_timeout: Some(budget),
+            },
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(err, MetadataError::PollTimeout(_)));
+    assert!(elapsed >= budget, "returned early at {elapsed:?}");
+    assert!(
+        elapsed < budget * 2,
+        "timeout overshot its budget: {elapsed:?}"
+    );
 }
