@@ -939,16 +939,7 @@ const RAW_ERROR_BODY_CAP: usize = 2048;
 pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
     let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes).unwrap_or_default();
     let raw = if errors.is_empty() {
-        let mut body = String::from_utf8_lossy(bytes).into_owned();
-        if body.len() > RAW_ERROR_BODY_CAP {
-            let mut end = RAW_ERROR_BODY_CAP;
-            while !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.truncate(end);
-            body.push_str("… <truncated>");
-        }
-        Some(body)
+        Some(capped_body(bytes))
     } else {
         None
     };
@@ -959,12 +950,67 @@ pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
     }
 }
 
+/// Decodes a body for inclusion in an error, bounded by
+/// [`RAW_ERROR_BODY_CAP`] and marked when anything was dropped.
+///
+/// Only the capped byte prefix is decoded, so a multi-megabyte body never
+/// gets a full owned copy. Lossy decoding expands each invalid byte to a
+/// three-byte U+FFFD, which can push even that prefix past the cap, so the
+/// decoded string is trimmed again at a char boundary.
+fn capped_body(bytes: &[u8]) -> String {
+    let mut truncated = bytes.len() > RAW_ERROR_BODY_CAP;
+    let head = &bytes[..bytes.len().min(RAW_ERROR_BODY_CAP)];
+    let mut body = String::from_utf8_lossy(head).into_owned();
+    if body.len() > RAW_ERROR_BODY_CAP {
+        let mut end = RAW_ERROR_BODY_CAP;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        truncated = true;
+    }
+    if truncated {
+        body.push_str("… <truncated>");
+    }
+    body
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::Value;
     use serde_json::json;
+
+    #[test]
+    fn non_utf8_error_body_is_capped_after_lossy_decoding() {
+        // Each invalid byte becomes a three-byte U+FFFD, so a byte-prefix
+        // cap alone would still leave ~3x the cap in the error value.
+        let body = vec![0xffu8; RAW_ERROR_BODY_CAP * 4];
+        let err = parse_error_response(502, &body);
+        match err {
+            CirrusError::Api { raw: Some(raw), .. } => {
+                assert!(raw.ends_with("… <truncated>"), "missing marker");
+                assert!(
+                    raw.len() < RAW_ERROR_BODY_CAP + 32,
+                    "raw not capped: {} bytes",
+                    raw.len()
+                );
+            }
+            other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_error_body_is_preserved_verbatim() {
+        let err = parse_error_response(502, b"<html>bad gateway</html>");
+        match err {
+            CirrusError::Api { raw: Some(raw), .. } => {
+                assert_eq!(raw, "<html>bad gateway</html>");
+            }
+            other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
 
     #[test]
     fn unparseable_error_body_is_capped() {
