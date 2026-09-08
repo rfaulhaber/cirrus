@@ -617,6 +617,13 @@ impl Cirrus {
                 break Err(transport_error);
             };
 
+            // An unparsed error body is whatever an intermediary chose
+            // to return, and those pages echo the request that provoked
+            // them. Scrub the credential here, where the token for the
+            // attempt is still in hand, before the error can reach a
+            // log sink.
+            let result = result.map_err(|e| e.redact_secrets(&token));
+
             // 401 → invalidate the cached token and try once more with
             // a fresh one. If the auth session can't refresh (returns
             // the same token), surface the 401 verbatim.
@@ -1536,6 +1543,45 @@ mod tests {
             let sf = Cirrus::builder().auth(auth).build().unwrap();
             let err = sf.get::<Value>("limits").await.unwrap_err();
             assert!(matches!(err, CirrusError::Api { status: 302, .. }));
+        }
+
+        #[tokio::test]
+        async fn an_echoed_request_in_an_error_body_is_scrubbed() {
+            // A gateway that answers with its own page — not the
+            // Salesforce error array — lands in CirrusError::Api::raw
+            // and in the error's Display. If it echoed the request, the
+            // session token must not come with it.
+            let token = "00D5f000000ABCD!AQcAQK_session_id";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(502).set_body_string(format!(
+                    "Bad Gateway\nGET /services/data/v66.0/limits\nAuthorization: Bearer {token}\n"
+                )))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+
+            assert!(!err.to_string().contains(token), "{err}");
+            match err {
+                CirrusError::Api {
+                    status,
+                    raw: Some(raw),
+                    ..
+                } => {
+                    assert_eq!(status, 502);
+                    assert!(!raw.contains(token), "{raw}");
+                    assert!(raw.contains("Bad Gateway"));
+                }
+                other => panic!("expected an Api error with a raw body, got {other:?}"),
+            }
         }
 
         #[tokio::test]

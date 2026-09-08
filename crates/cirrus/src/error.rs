@@ -65,6 +65,11 @@ pub enum CirrusError {
         /// proxies/gateways, and retaining them unboundedly would let
         /// echoed request data flow into logs). Populated when `errors`
         /// is empty so callers can see what came back.
+        ///
+        /// Bearer-token material is replaced with `[redacted]` before
+        /// the body is stored, because those intermediary pages tend to
+        /// echo the request that provoked them and this value reaches
+        /// the error's `Display`.
         raw: Option<String>,
     },
 
@@ -99,6 +104,77 @@ pub enum CirrusError {
     /// Response could not be interpreted as the requested type or shape.
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+}
+
+/// Stand-in for credential material removed from a stored error body.
+const REDACTED: &str = "[redacted]";
+
+impl CirrusError {
+    /// Removes bearer-token material from a stored raw error body.
+    ///
+    /// The `raw` body is only ever populated for responses that don't
+    /// match Salesforce's error array — i.e. pages written by proxies,
+    /// gateways and WAFs, which routinely echo the offending request
+    /// (headers included) back to the client. That body is interpolated
+    /// into the error's `Display`, so an ordinary
+    /// `tracing::error!("{e}")` would otherwise write a live org session
+    /// id into the caller's log sink.
+    pub(crate) fn redact_secrets(self, token: &str) -> Self {
+        match self {
+            Self::Api {
+                status,
+                errors,
+                raw: Some(raw),
+            } => Self::Api {
+                status,
+                errors,
+                raw: Some(redact_body(&raw, token)),
+            },
+            other => other,
+        }
+    }
+}
+
+/// Replaces the live token, plus any `Bearer <credential>` run, with
+/// [`REDACTED`]. The second pass matters because an echoed request may
+/// carry a differently-encoded or already-rotated token that the exact
+/// match misses.
+fn redact_body(body: &str, token: &str) -> String {
+    let stripped = if token.is_empty() {
+        body.to_string()
+    } else {
+        body.replace(token, REDACTED)
+    };
+    redact_bearer_credentials(&stripped)
+}
+
+fn redact_bearer_credentials(body: &str) -> String {
+    const KEYWORD: &str = "bearer";
+    // ASCII-lowercasing preserves byte length, so offsets found here
+    // index `body` unchanged.
+    let haystack = body.to_ascii_lowercase();
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0;
+    while let Some(offset) = haystack[cursor..].find(KEYWORD) {
+        let keyword_end = cursor + offset + KEYWORD.len();
+        let after = &body[keyword_end..];
+        let spacing = after.len() - after.trim_start_matches([' ', '\t']).len();
+        let credential = &after[spacing..];
+        let credential_len = credential
+            .find(char::is_whitespace)
+            .unwrap_or(credential.len());
+        if spacing == 0 || credential_len == 0 {
+            // A bare "bearer" with nothing after it — leave it be.
+            out.push_str(&body[cursor..keyword_end]);
+            cursor = keyword_end;
+            continue;
+        }
+        out.push_str(&body[cursor..keyword_end + spacing]);
+        out.push_str(REDACTED);
+        cursor = keyword_end + spacing + credential_len;
+    }
+    out.push_str(&body[cursor..]);
+    out
 }
 
 fn display_errors(errors: &[SalesforceError], raw: &Option<String>) -> String {
@@ -158,6 +234,68 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("500"));
         assert!(msg.contains("Internal Server Error"));
+    }
+
+    #[test]
+    fn redact_secrets_strips_an_echoed_session_token() {
+        // The shape a gateway 502 page takes when it echoes the
+        // offending request line and headers.
+        let token = "00D5f000000ABCD!AQcAQK_echoed_session_id";
+        let err = CirrusError::Api {
+            status: 502,
+            errors: vec![],
+            raw: Some(format!(
+                "Bad Gateway — upstream rejected:\nGET /services/data/v66.0/query?q=SELECT+Id\nAuthorization: Bearer {token}\n"
+            )),
+        }
+        .redact_secrets(token);
+
+        let CirrusError::Api { raw: Some(raw), .. } = &err else {
+            panic!("expected an Api error with a raw body");
+        };
+        assert!(!raw.contains(token), "token survived redaction: {raw}");
+        assert!(raw.contains("[redacted]"));
+        // Everything else about the page is still there to debug with.
+        assert!(raw.contains("Bad Gateway"));
+        assert!(raw.contains("/services/data/v66.0/query"));
+        assert!(!err.to_string().contains(token));
+    }
+
+    #[test]
+    fn redact_secrets_strips_bearer_credentials_the_token_match_misses() {
+        // A stale or re-encoded credential in the echoed request is not
+        // the token this attempt used, so the keyword scan has to catch
+        // it. Case is irrelevant, and repeats are all replaced.
+        let err = CirrusError::Api {
+            status: 400,
+            errors: vec![],
+            raw: Some(
+                "authorization: bearer stale-one\nX-Forwarded-Authorization: BEARER stale-two\n"
+                    .to_string(),
+            ),
+        }
+        .redact_secrets("current-token");
+
+        let CirrusError::Api { raw: Some(raw), .. } = &err else {
+            panic!("expected an Api error with a raw body");
+        };
+        assert!(!raw.contains("stale-one"), "{raw}");
+        assert!(!raw.contains("stale-two"), "{raw}");
+        assert_eq!(raw.matches("[redacted]").count(), 2, "{raw}");
+    }
+
+    #[test]
+    fn redact_secrets_leaves_ordinary_bodies_alone() {
+        let err = CirrusError::Api {
+            status: 503,
+            errors: vec![],
+            raw: Some("Service Unavailable — bearer".to_string()),
+        }
+        .redact_secrets("tok");
+        let CirrusError::Api { raw: Some(raw), .. } = &err else {
+            panic!("expected an Api error with a raw body");
+        };
+        assert_eq!(raw, "Service Unavailable — bearer");
     }
 
     #[test]
