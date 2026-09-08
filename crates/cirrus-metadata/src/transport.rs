@@ -61,9 +61,12 @@ pub trait SoapOperation {
     /// Whether the operation is safe to replay when the outcome of a
     /// sent request is unknown (a 5xx from an intermediary, a
     /// mid-request network failure). Every SOAP call is an HTTP POST,
-    /// so this declaration is the only idempotency signal the retry
-    /// policy has. Defaults to `false` (never replay); read-only
-    /// operations (`checkDeployStatus`, `listMetadata`, …) opt in.
+    /// so the HTTP method carries no idempotency signal; the retry path
+    /// reads [`idempotent()`](Self::idempotent), which defaults to this
+    /// const. Defaults to `false` (never replay); read-only operations
+    /// (`checkDeployStatus`, `listMetadata`, …) opt in. An operation
+    /// whose replay safety depends on its arguments overrides
+    /// [`idempotent()`](Self::idempotent) instead of setting this.
     const IDEMPOTENT: bool = false;
 
     /// The typed response shape. Deserialized via `quick-xml`'s serde

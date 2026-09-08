@@ -9,10 +9,15 @@
 //! The Metadata API SOAP endpoint is always POST, so the HTTP method
 //! carries no idempotency signal; instead each [`SoapOperation`]
 //! declares whether it is safe to replay via
-//! [`SoapOperation::IDEMPOTENT`]. Read-only calls (`checkDeployStatus`,
-//! `listMetadata`, …) are; mutating calls (`deploy`, `createMetadata`,
-//! …) are not — a 503 emitted by an intermediary after the origin
-//! processed a `create` would otherwise be replayed into a duplicate.
+//! [`SoapOperation::idempotent()`], which defaults to the
+//! [`SoapOperation::IDEMPOTENT`] const. Read-only calls
+//! (`checkDeployStatus`, `listMetadata`, …) are; mutating calls
+//! (`deploy`, `createMetadata`, …) are not — a 503 emitted by an
+//! intermediary after the origin processed a `create` would otherwise be
+//! replayed into a duplicate. Not every status poll qualifies:
+//! `checkRetrieveStatus` is replayable only while `includeZip` is
+//! `false`, because the call that returns the zip also deletes it from
+//! the server, so it decides per request rather than per operation.
 //! Retries apply only to the SOAP dispatch path; the open-ended
 //! [`request_builder`] escape hatch is hands-off.
 //!
@@ -23,6 +28,7 @@
 //! is surfaced on the first attempt.
 //!
 //! [`SoapOperation`]: crate::transport::SoapOperation
+//! [`SoapOperation::idempotent()`]: crate::transport::SoapOperation::idempotent
 //! [`SoapOperation::IDEMPOTENT`]: crate::transport::SoapOperation::IDEMPOTENT
 //! [`request_builder`]: crate::MetadataClient::request_builder
 
