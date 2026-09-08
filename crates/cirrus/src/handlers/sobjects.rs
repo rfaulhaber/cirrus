@@ -90,21 +90,7 @@ impl SObjectsHandler<'_> {
         since: SystemTime,
     ) -> CirrusResult<Option<DescribeGlobal>> {
         let date = http_date(since)?;
-        let (status, bytes) = self
-            .client
-            .send_with_headers_raw(
-                reqwest::Method::GET,
-                "sobjects",
-                None,
-                &[("If-Modified-Since", &date)],
-            )
-            .await?;
-        if status == 304 {
-            return Ok(None);
-        }
-        Ok(Some(
-            serde_json::from_slice(&bytes).map_err(CirrusError::Serialization)?,
-        ))
+        self.client.get_if_modified_since("sobjects", &date).await
     }
 }
 
@@ -162,28 +148,13 @@ impl<'a> SObjectHandler<'a> {
         &self,
         since: SystemTime,
     ) -> CirrusResult<Option<R>> {
-        // versioned_segments produces an absolute URL, which
-        // send_with_headers_raw's three-mode path resolution passes
-        // through verbatim.
+        // versioned_segments produces an absolute URL, which the
+        // three-mode path resolution passes through verbatim.
         let url = self
             .client
             .versioned_segments(&["sobjects", self.name, "describe"])?;
         let date = http_date(since)?;
-        let (status, bytes) = self
-            .client
-            .send_with_headers_raw(
-                reqwest::Method::GET,
-                &url,
-                None,
-                &[("If-Modified-Since", &date)],
-            )
-            .await?;
-        if status == 304 {
-            return Ok(None);
-        }
-        Ok(Some(
-            serde_json::from_slice(&bytes).map_err(CirrusError::Serialization)?,
-        ))
+        self.client.get_if_modified_since(&url, &date).await
     }
 
     /// Retrieves a record by ID, returning every field. For a subset of
@@ -977,6 +948,68 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, crate::CirrusError::Api { status: 403, .. }));
+        }
+
+        #[tokio::test]
+        async fn conditional_describe_keeps_an_off_contract_2xx_body_excerpt() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+            // "420 Salesforce Edge doesn't have routing information
+            // available for this request host." An interposed hop can
+            // answer for the instance, and nothing stops it doing so
+            // with a 200 and its own page. That body is the only
+            // diagnostic there is, so the conditional path has to keep
+            // an excerpt of it — and scrub the credential the page
+            // echoed back — just like the unconditional one.
+            let token = "00D5f000000ABCD!AQcAQK_session_id";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/sobjects"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "<html>GET /services/data/v66.0/sobjects\nAuthorization: Bearer {token}</html>"
+                )))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let err = sf
+                .sobjects()
+                .describe_global_if_modified_since(SystemTime::now())
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::InvalidResponse(message) => {
+                    assert!(message.contains("200"), "{message}");
+                    assert!(message.contains("<html>"), "{message}");
+                    assert!(!message.contains(token), "{message}");
+                    assert!(message.contains("[redacted]"), "{message}");
+                }
+                other => panic!("expected InvalidResponse, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn conditional_per_object_describe_keeps_an_off_contract_2xx_body_excerpt() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/sobjects/Account/describe"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let err = sf
+                .sobject("Account")
+                .describe_if_modified_since(SystemTime::now())
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::InvalidResponse(message) => {
+                    assert!(message.contains("200"), "{message}");
+                    assert!(message.contains("not json at all"), "{message}");
+                }
+                other => panic!("expected InvalidResponse, got {other:?}"),
+            }
         }
 
         #[test]

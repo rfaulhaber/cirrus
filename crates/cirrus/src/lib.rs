@@ -928,47 +928,39 @@ impl Cirrus {
         .await
     }
 
-    /// Sends a GET with arbitrary extra headers, returning the
-    /// `(status, body_bytes)` tuple verbatim. Used for conditional
-    /// requests where the caller needs to dispatch on a specific
-    /// status (e.g., `304 Not Modified` for `If-Modified-Since`).
+    /// Sends a conditional GET carrying `If-Modified-Since`, returning
+    /// `None` when the org answers `304 Not Modified`.
     ///
-    /// Goes through the same retry policy, auth-refresh, and
-    /// `Sforce-Limit-Info` capture as the other send paths.
-    /// **Treats both 2xx and 304 as success** — they're returned as
-    /// `Ok((status, bytes))` for the caller to dispatch. Other non-2xx
-    /// statuses go through the normal error parsing.
-    pub(crate) async fn send_with_headers_raw(
+    /// `since` is an already-formatted IMF-fixdate. Goes through the
+    /// same retry policy, auth-refresh, `Sforce-Limit-Info` capture and
+    /// body handling as the other send paths — a 2xx that doesn't fit
+    /// `R` surfaces as [`CirrusError::InvalidResponse`] with a scrubbed
+    /// excerpt, exactly as it does on the unconditional path.
+    pub(crate) async fn get_if_modified_since<R: DeserializeOwned>(
         &self,
-        method: reqwest::Method,
         path: &str,
-        query: Option<&[(&str, &str)]>,
-        extra_headers: &[(&str, &str)],
-    ) -> CirrusResult<(u16, bytes::Bytes)> {
+        since: &str,
+    ) -> CirrusResult<Option<R>> {
+        let method = reqwest::Method::GET;
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
             &url,
             retry::Replay::ByMethod,
             |token: &str| {
-                let mut request = self.client.request(method.clone(), &url).bearer_auth(token);
-                for (name, value) in extra_headers {
-                    request = request.header(*name, *value);
-                }
-                if let Some(q) = query {
-                    request = request.query(q);
-                }
-                Ok(request)
+                Ok(self
+                    .client
+                    .request(method.clone(), &url)
+                    .bearer_auth(token)
+                    .header(reqwest::header::IF_MODIFIED_SINCE, since))
             },
             |status, _headers, bytes| {
-                // 304 is "use your cache" — not an error from
-                // the conditional-request perspective. 2xx is
-                // success. Other non-2xx → error.
-                if (200..300).contains(&status) || status == 304 {
-                    Ok((status, bytes))
-                } else {
-                    Err(response::parse_error_response(status, &bytes))
+                // 304 is "your cache is still good", not a failure —
+                // and it carries no body to deserialize.
+                if status == 304 {
+                    return Ok(None);
                 }
+                response::parse_response_bytes(status, &bytes).map(Some)
             },
         )
         .await
