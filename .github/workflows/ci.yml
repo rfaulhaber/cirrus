@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# Every job only builds and tests the checked-out tree. Releases are
+# published from a maintainer's machine via `cargo release`, so no job
+# here needs a write-scoped GITHUB_TOKEN — and `actions/checkout`
+# persists whatever token it gets into the workspace's git config,
+# where third-party build scripts and proc macros can reach it.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

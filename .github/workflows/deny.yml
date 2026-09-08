@@ -20,6 +20,10 @@ on:
     - cron: "0 12 * * 1"
   workflow_dispatch:
 
+# Auditing the lockfile needs nothing beyond reading the repository.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
