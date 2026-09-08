@@ -18,12 +18,12 @@
 //! segments yourself before calling.
 //!
 //! Relative segments (`.` and `..`, in either literal or percent-encoded
-//! spelling) are rejected with [`CirrusError`], because URL parsing
-//! resolves them away and a path assembled from untrusted input could
-//! otherwise reach an endpoint outside `/services/apexrest/` while still
-//! carrying the org's bearer token. Pre-encoding does not avoid this —
-//! `%2e%2e` normalizes to `..` — so such segments have to be refused
-//! rather than escaped.
+//! spelling) are rejected with [`CirrusError::InvalidInput`], because URL
+//! parsing resolves them away and a path assembled from untrusted input
+//! could otherwise reach an endpoint outside `/services/apexrest/` while
+//! still carrying the org's bearer token. Pre-encoding does not avoid
+//! this — `%2e%2e` normalizes to `..` — so such segments have to be
+//! refused rather than escaped.
 //!
 //! A backslash, or any character up to and including `U+0020` (every C0
 //! control plus the space), is refused for the same reason. URL parsing
@@ -31,6 +31,8 @@
 //! return wherever they appear, and trims C0 controls and spaces from both
 //! ends of the URL — each of which can reconstitute a dot segment that a
 //! check on the literal text has already accepted, as `".. "` does.
+//!
+//! [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
 
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
@@ -72,13 +74,13 @@ impl Cirrus {
 /// Body and response types are caller-defined since Apex REST endpoints
 /// have no platform-defined wire shape.
 ///
-/// Every method returns [`CirrusError::InvalidResponse`] without issuing
-/// a request when the supplied path contains an empty or relative
+/// Every method returns [`CirrusError::InvalidInput`] without issuing a
+/// request when the supplied path contains an empty or relative
 /// (`.` / `..`) segment, a backslash, or any character up to and
 /// including `U+0020` — the C0 controls and the space — see the
 /// [module docs](self#path-encoding).
 ///
-/// [`CirrusError::InvalidResponse`]: crate::CirrusError::InvalidResponse
+/// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
 #[derive(Debug)]
 pub struct ApexHandler<'a> {
     client: &'a Cirrus,
@@ -163,18 +165,22 @@ fn apex_path(path: &str) -> CirrusResult<String> {
         } else {
             "URL parsing removes or trims C0 controls and spaces before it resolves dot segments"
         };
-        return Err(CirrusError::InvalidResponse(format!(
-            "Apex REST path contains {c:?}: {reason}"
-        )));
+        return Err(CirrusError::InvalidInput {
+            field: "Apex REST path",
+            message: format!("{c:?} cannot appear in the path: {reason}"),
+        });
     }
     let trimmed = path.trim_start_matches('/');
     let body = trimmed.strip_suffix('/').unwrap_or(trimmed);
     for segment in body.split('/') {
         if segment.is_empty() || is_relative_segment(segment) {
-            return Err(CirrusError::InvalidResponse(format!(
-                "Apex REST path segment {segment:?} is not addressable under \
-                 /services/apexrest/ (empty and relative segments are rejected)"
-            )));
+            return Err(CirrusError::InvalidInput {
+                field: "Apex REST path",
+                message: format!(
+                    "segment {segment:?} is not addressable under /services/apexrest/ \
+                     (empty and relative segments are rejected)"
+                ),
+            });
         }
     }
     Ok(format!("/services/apexrest/{trimmed}"))
@@ -278,7 +284,7 @@ mod tests {
         ] {
             let err = apex_path(candidate).unwrap_err();
             assert!(
-                matches!(err, CirrusError::InvalidResponse(_)),
+                matches!(err, CirrusError::InvalidInput { .. }),
                 "{candidate:?} should be rejected, got {err:?}"
             );
         }
@@ -318,7 +324,7 @@ mod tests {
         ] {
             let err = sf.apex().delete::<()>(candidate).await.unwrap_err();
             assert!(
-                matches!(err, CirrusError::InvalidResponse(_)),
+                matches!(err, CirrusError::InvalidInput { .. }),
                 "{candidate:?}: {err:?}"
             );
         }
