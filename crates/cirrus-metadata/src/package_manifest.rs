@@ -199,8 +199,10 @@ impl MetadataType {
 ///
 /// Insertion order is preserved — entries appear in the emitted XML
 /// in the order they were added. Members within a type also preserve
-/// caller order, with no de-duplication. Adding the same metadata
-/// type more than once merges the member lists in order.
+/// caller order, with no de-duplication; the one exception is the `*`
+/// wildcard, which is kept once and hoisted to the front of the type's
+/// member list. Adding the same metadata type more than once merges
+/// the member lists in order.
 #[derive(Debug, Clone)]
 pub struct PackageManifest {
     api_version: String,
@@ -214,13 +216,45 @@ struct TypeEntry {
     members: Vec<String>,
 }
 
-/// Salesforce rejects a `<types>` block that mixes the `*` wildcard
-/// with explicit members, and the wildcard subsumes them anyway — so
-/// whenever a `*` is present, reduce the list to that single entry.
-fn collapse_wildcard(members: &mut Vec<String>) {
-    if members.iter().any(|m| m == "*") {
-        members.clear();
-        members.push("*".to_string());
+impl TypeEntry {
+    // The <types> blocks this entry renders as. A `*` wildcard never
+    // shares a block with explicit member names, so an entry carrying
+    // both emits two blocks under the same <name>: the wildcard first,
+    // then the named members.
+    //
+    // Salesforce documents that shape for standard objects, which a
+    // `*` on CustomObject does not match: "You can only overwrite
+    // these standard objects and fields by explicitly creating
+    // separate types elements for the objects or fields."
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_profile.htm
+    //
+    // Two <types> blocks sharing a <name> is itself a documented
+    // manifest shape — the "Custom and Standard Fields" sample emits
+    // two <name>CustomField</name> blocks.
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/manifest_samples.htm
+    fn blocks(&self) -> impl Iterator<Item = &[String]> {
+        let (wildcard, explicit) = match self.members.split_first() {
+            Some((first, rest)) if first == WILDCARD => (&self.members[..1], rest),
+            _ => (&self.members[..0], self.members.as_slice()),
+        };
+        // An empty member list renders nothing at all: <types> without
+        // <members> is invalid per Salesforce's schema.
+        [wildcard, explicit]
+            .into_iter()
+            .filter(|block| !block.is_empty())
+    }
+}
+
+/// The `members` value that stands for "every component of this type".
+const WILDCARD: &str = "*";
+
+/// Keeps a type's member list in the shape [`TypeEntry::blocks`]
+/// expects: at most one `*`, positioned first. Explicit names keep
+/// caller order and are not de-duplicated.
+fn hoist_wildcard(members: &mut Vec<String>) {
+    if members.iter().any(|m| m == WILDCARD) {
+        members.retain(|m| m != WILDCARD);
+        members.insert(0, WILDCARD.to_string());
     }
 }
 
@@ -258,12 +292,15 @@ impl PackageManifest {
     }
 
     /// Add components of one metadata type. If the type has already
-    /// been added, the new members are appended to its existing list —
-    /// unless the type carries the `*` wildcard (from a prior
-    /// [`Self::all`] or an explicit `"*"` member), in which case the
-    /// entry stays a lone wildcard: `*` already subsumes every member,
-    /// and Salesforce rejects a `<types>` block that mixes `*` with
-    /// explicit names.
+    /// been added, the new members are appended to its existing list.
+    ///
+    /// A type may carry the `*` wildcard (from [`Self::all`] or an
+    /// explicit `"*"` member) alongside named members. The two never
+    /// share a `<types>` block: such a type renders as a wildcard block
+    /// followed by a block of the named members, both under the same
+    /// `<name>`. That is how Salesforce documents pulling in standard
+    /// objects, which a `*` on `CustomObject` doesn't match. A repeated
+    /// `"*"` is kept once.
     ///
     /// Each member name is the metadata component's `fullName` —
     /// `"Foo"` for `MetadataType::APEX_CLASS`, `"Account__c"` for
@@ -283,10 +320,10 @@ impl PackageManifest {
             .find(|e| e.type_name == type_name.as_str())
         {
             entry.members.extend(new_members);
-            collapse_wildcard(&mut entry.members);
+            hoist_wildcard(&mut entry.members);
         } else {
             let mut members: Vec<String> = new_members.collect();
-            collapse_wildcard(&mut members);
+            hoist_wildcard(&mut members);
             self.entries.push(TypeEntry {
                 type_name: type_name.as_str().to_string(),
                 members,
@@ -298,12 +335,13 @@ impl PackageManifest {
     /// Add a metadata type with the `*` wildcard member, retrieving
     /// every component of that type.
     ///
-    /// If the type already has explicit members from a prior
-    /// [`Self::add`], they are dropped — Salesforce rejects a `<types>`
-    /// block that mixes `*` with explicit members, and the intent of
-    /// `all` ("everything of this type") subsumes any earlier list.
-    /// Repeated `all` calls for the same type collapse to a single
-    /// `"*"` entry.
+    /// Explicit members added for the same type are kept: the wildcard
+    /// renders as its own `<types>` block ahead of a second block
+    /// holding the named members, both under the same `<name>`. That
+    /// combination is how Salesforce documents including standard
+    /// objects in a wildcarded `CustomObject` manifest — `*` doesn't
+    /// match standard objects, so each one has to be named. Repeated
+    /// `all` calls for the same type stay a single `"*"`.
     ///
     /// Not all metadata types support the wildcard —
     /// `StandardValueSet`, `RecordType`, `Report`, `Dashboard`,
@@ -314,22 +352,8 @@ impl PackageManifest {
     /// column of the Metadata Types list. This builder doesn't
     /// validate, so a wildcard on a non-supporting type surfaces as a
     /// server-side error at deploy/retrieve time.
-    pub fn all<T: Into<MetadataType>>(mut self, type_name: T) -> Self {
-        let type_name: MetadataType = type_name.into();
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.type_name == type_name.as_str())
-        {
-            entry.members.clear();
-            entry.members.push("*".to_string());
-        } else {
-            self.entries.push(TypeEntry {
-                type_name: type_name.as_str().to_string(),
-                members: vec!["*".to_string()],
-            });
-        }
-        self
+    pub fn all<T: Into<MetadataType>>(self, type_name: T) -> Self {
+        self.add(type_name, [WILDCARD])
     }
 
     /// Returns the API version this manifest targets.
@@ -348,7 +372,10 @@ impl PackageManifest {
     }
 
     /// Iterate over the distinct `(type_name, members)` pairs in
-    /// insertion order.
+    /// insertion order. A type that carries both the `*` wildcard and
+    /// named members yields one pair holding all of them, with the
+    /// wildcard first; the split into two `<types>` blocks happens at
+    /// render time.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &[String])> {
         self.entries
             .iter()
@@ -361,7 +388,8 @@ impl PackageManifest {
     /// `<Package>` element with the metadata namespace as default,
     /// one `<types>` block per metadata type with `<members>` before
     /// `<name>`, and a final `<version>`. Suitable for inclusion in a
-    /// deploy zip.
+    /// deploy zip. A type carrying both the `*` wildcard and named
+    /// members emits two blocks under the same `<name>`.
     pub fn to_xml(&self) -> String {
         let mut out = String::with_capacity(128 + self.entries.len() * 64);
         out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -372,21 +400,18 @@ impl PackageManifest {
             out.push_str("</fullName>\n");
         }
         for entry in &self.entries {
-            // Empty member lists are dropped — emitting <types> with
-            // no <members> is invalid per Salesforce's schema.
-            if entry.members.is_empty() {
-                continue;
+            for block in entry.blocks() {
+                out.push_str("    <types>\n");
+                for member in block {
+                    out.push_str("        <members>");
+                    out.push_str(&xml_escape(member));
+                    out.push_str("</members>\n");
+                }
+                out.push_str("        <name>");
+                out.push_str(&xml_escape(&entry.type_name));
+                out.push_str("</name>\n");
+                out.push_str("    </types>\n");
             }
-            out.push_str("    <types>\n");
-            for member in &entry.members {
-                out.push_str("        <members>");
-                out.push_str(&xml_escape(member));
-                out.push_str("</members>\n");
-            }
-            out.push_str("        <name>");
-            out.push_str(&xml_escape(&entry.type_name));
-            out.push_str("</name>\n");
-            out.push_str("    </types>\n");
         }
         out.push_str("    <version>");
         out.push_str(&xml_escape(&self.api_version));
@@ -410,19 +435,18 @@ impl PackageManifest {
             out.push_str("</met:fullName>");
         }
         for entry in &self.entries {
-            if entry.members.is_empty() {
-                continue;
+            for block in entry.blocks() {
+                out.push_str("<met:types>");
+                for member in block {
+                    out.push_str("<met:members>");
+                    out.push_str(&xml_escape(member));
+                    out.push_str("</met:members>");
+                }
+                out.push_str("<met:name>");
+                out.push_str(&xml_escape(&entry.type_name));
+                out.push_str("</met:name>");
+                out.push_str("</met:types>");
             }
-            out.push_str("<met:types>");
-            for member in &entry.members {
-                out.push_str("<met:members>");
-                out.push_str(&xml_escape(member));
-                out.push_str("</met:members>");
-            }
-            out.push_str("<met:name>");
-            out.push_str(&xml_escape(&entry.type_name));
-            out.push_str("</met:name>");
-            out.push_str("</met:types>");
         }
         out.push_str("<met:version>");
         out.push_str(&xml_escape(&self.api_version));
@@ -518,16 +542,43 @@ mod tests {
     }
 
     #[test]
-    fn manifest_all_replaces_prior_explicit_members() {
-        // Mixing `*` with explicit names is rejected server-side; .all
-        // should subsume the prior list rather than produce ["Foo", "*"].
+    fn manifest_all_keeps_prior_explicit_members_in_a_second_block() {
         let pkg = PackageManifest::new("66.0")
             .add(MetadataType::APEX_CLASS, ["Foo", "Bar"])
             .all(MetadataType::APEX_CLASS);
         let xml = pkg.to_xml();
+        // Two <types> blocks under one <name>: the wildcard on its own,
+        // then the named members.
+        assert_eq!(xml.matches("<name>ApexClass</name>").count(), 2);
         assert_eq!(xml.matches("<members>*</members>").count(), 1);
-        assert!(!xml.contains("<members>Foo</members>"));
-        assert!(!xml.contains("<members>Bar</members>"));
+        assert!(xml.contains("<members>Foo</members>"));
+        assert!(xml.contains("<members>Bar</members>"));
+        let i_wildcard = xml.find("<members>*</members>").unwrap();
+        let i_foo = xml.find("<members>Foo</members>").unwrap();
+        assert!(i_wildcard < i_foo);
+    }
+
+    #[test]
+    fn manifest_wildcard_plus_standard_object_renders_separate_blocks() {
+        // `*` on CustomObject doesn't match standard objects; Salesforce
+        // documents naming them in a separate <types> element.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_profile.htm
+        let pkg = PackageManifest::new("66.0")
+            .all(MetadataType::CUSTOM_OBJECT)
+            .add(MetadataType::CUSTOM_OBJECT, ["Account"])
+            .all(MetadataType::PROFILE);
+        let xml = pkg.to_xml();
+        assert_eq!(xml.matches("<name>CustomObject</name>").count(), 2);
+        assert!(xml.contains("<members>Account</members>"));
+        assert_eq!(pkg.type_count(), 2);
+        assert!(
+            xml.contains(
+                "    <types>\n        <members>*</members>\n        \
+                 <name>CustomObject</name>\n    </types>\n    <types>\n        \
+                 <members>Account</members>\n        <name>CustomObject</name>\n    </types>\n"
+            ),
+            "unexpected block layout:\n{xml}"
+        );
     }
 
     #[test]
@@ -673,29 +724,31 @@ mod property_tests {
             prop_assert_eq!(actual, expected);
         }
 
-        /// The mirror order of `all_overrides_add_and_is_idempotent`:
-        /// once a type is wildcarded, later `add(t, _)` calls must not
-        /// splice explicit members next to the `"*"` — Salesforce
-        /// rejects the mixed form.
+        /// The mirror order of `all_after_add_hoists_wildcard`: once a
+        /// type is wildcarded, later `add(t, m)` calls append `m` after
+        /// the `"*"` in the same entry, so the wildcard-plus-named
+        /// manifest stays expressible.
         #[test]
-        fn add_after_all_keeps_lone_wildcard(
+        fn add_after_all_appends_after_wildcard(
             ty in name(),
             extra_members in proptest::collection::vec(name(), 0..4),
         ) {
             let pkg = PackageManifest::new("66.0")
                 .all(MetadataType::new(ty.clone()))
                 .add(MetadataType::new(ty.clone()), extra_members.clone());
+            let mut expected = vec!["*".to_string()];
+            expected.extend(extra_members);
             let entries: Vec<_> = pkg.entries().collect();
             prop_assert_eq!(entries.len(), 1, "expected exactly one entry");
             prop_assert_eq!(entries[0].0, ty.as_str());
-            prop_assert_eq!(entries[0].1, &["*".to_string()]);
+            prop_assert_eq!(entries[0].1, expected.as_slice());
         }
 
         /// An explicit `"*"` passed through `add` behaves like `all`:
-        /// the entry collapses to the lone wildcard instead of mixing
-        /// it with explicit members.
+        /// the wildcard is hoisted to the front of the member list and
+        /// the named members are kept behind it.
         #[test]
-        fn add_with_explicit_star_collapses(
+        fn add_with_explicit_star_hoists_wildcard(
             ty in name(),
             extra_members in proptest::collection::vec(name(), 0..4),
         ) {
@@ -703,16 +756,18 @@ mod property_tests {
             members.push("*".to_string());
             let pkg = PackageManifest::new("66.0")
                 .add(MetadataType::new(ty.clone()), members);
+            let mut expected = vec!["*".to_string()];
+            expected.extend(extra_members);
             let entries: Vec<_> = pkg.entries().collect();
             prop_assert_eq!(entries.len(), 1, "expected exactly one entry");
-            prop_assert_eq!(entries[0].1, &["*".to_string()]);
+            prop_assert_eq!(entries[0].1, expected.as_slice());
         }
 
-        /// `all(t)` collapses any prior `add(t, _)` entries to the
-        /// single `"*"` wildcard member. Repeated `all(t)` is also
-        /// idempotent.
+        /// `all(t)` after `add(t, m)` puts the `"*"` ahead of `m`
+        /// without dropping it, and repeated `all(t)` keeps exactly one
+        /// wildcard.
         #[test]
-        fn all_overrides_add_and_is_idempotent(
+        fn all_after_add_hoists_wildcard(
             ty in name(),
             extra_members in proptest::collection::vec(name(), 0..4),
         ) {
@@ -720,10 +775,42 @@ mod property_tests {
                 .add(MetadataType::new(ty.clone()), extra_members.clone())
                 .all(MetadataType::new(ty.clone()))
                 .all(MetadataType::new(ty.clone()));
+            let mut expected = vec!["*".to_string()];
+            expected.extend(extra_members);
             let entries: Vec<_> = pkg.entries().collect();
             prop_assert_eq!(entries.len(), 1, "expected exactly one entry after all()");
             prop_assert_eq!(entries[0].0, ty.as_str());
-            prop_assert_eq!(entries[0].1, &["*".to_string()]);
+            prop_assert_eq!(entries[0].1, expected.as_slice());
+        }
+
+        /// Every entry renders as one `<types>` block, or two when the
+        /// type carries the wildcard alongside named members.
+        #[test]
+        fn each_type_renders_one_block_per_member_kind(
+            ops in proptest::collection::vec(add_op(), 0..8),
+            wildcarded in proptest::collection::vec(name(), 0..3),
+        ) {
+            let mut pkg = PackageManifest::new("66.0");
+            for (ty, members) in &ops {
+                pkg = pkg.add(MetadataType::new(ty.clone()), members.clone());
+            }
+            for ty in &wildcarded {
+                pkg = pkg.all(MetadataType::new(ty.clone()));
+            }
+            let expected: usize = pkg
+                .entries()
+                .map(|(_, members)| match members {
+                    [] => 0,
+                    [first, rest @ ..] if first == "*" && !rest.is_empty() => 2,
+                    _ => 1,
+                })
+                .sum();
+            let xml = pkg.to_xml();
+            prop_assert_eq!(xml.matches("<types>").count(), expected);
+            prop_assert_eq!(
+                pkg.render_soap_inner().matches("<met:types>").count(),
+                expected
+            );
         }
 
         /// `to_xml()` always emits `<version>` regardless of the
