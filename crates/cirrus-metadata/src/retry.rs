@@ -16,11 +16,17 @@
 //! Retries apply only to the SOAP dispatch path; the open-ended
 //! [`request_builder`] escape hatch is hands-off.
 //!
+//! Status alone doesn't settle it. The Metadata API delivers SOAP faults
+//! with HTTP 500, so the dispatcher parses the response envelope before
+//! deciding: a parsed fault replays only when its code is one Salesforce
+//! documents as a temporarily unavailable server, and every other fault
+//! is surfaced on the first attempt.
+//!
 //! [`SoapOperation`]: crate::transport::SoapOperation
 //! [`SoapOperation::IDEMPOTENT`]: crate::transport::SoapOperation::IDEMPOTENT
 //! [`request_builder`]: crate::MetadataClient::request_builder
 
-use crate::error::MetadataError;
+use crate::error::{MetadataError, SoapFault};
 use std::time::Duration;
 
 /// Configuration for transient-failure retry behavior.
@@ -99,6 +105,32 @@ pub(crate) fn should_retry_status(
         500 | 502 | 504 if policy.retry_idempotent_5xx => idempotent,
         _ => false,
     }
+}
+
+/// Exception codes that describe a temporarily unavailable server
+/// rather than a problem with the request.
+///
+/// Salesforce answers a Metadata API SOAP fault with HTTP 500, so the
+/// status alone can't tell a deterministic application error from a
+/// transient one. Everything outside this list — `INVALID_TYPE`,
+/// `INVALID_CROSS_REFERENCE_KEY`, `INVALID_SESSION_ID`,
+/// `REQUEST_LIMIT_EXCEEDED` — returns the same fault on every attempt,
+/// so replaying it only spends API calls and delays the error.
+///
+/// Descriptions from the `ExceptionCode` reference:
+/// `SERVER_UNAVAILABLE` — "A server that's necessary for this call is
+/// unavailable. Other types of requests could still work.";
+/// `API_CURRENTLY_DISABLED` — "Because of a system problem, API
+/// functionality is temporarily unavailable."
+/// <https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_calls_concepts_core_data_objects.htm>
+const TRANSIENT_FAULT_CODES: [&str; 2] = ["SERVER_UNAVAILABLE", "API_CURRENTLY_DISABLED"];
+
+/// Decision point: is this SOAP fault worth replaying?
+///
+/// Applied on top of [`should_retry_status`] — a fault only replays when
+/// both the status and the fault code say the attempt can succeed.
+pub(crate) fn is_transient_fault(fault: &SoapFault) -> bool {
+    TRANSIENT_FAULT_CODES.contains(&fault.code())
 }
 
 /// Decision point: should we retry this network-level failure?
@@ -236,6 +268,36 @@ mod tests {
         let p = RetryPolicy::default();
         assert!(should_retry_status(&p, false, 429, 2));
         assert!(!should_retry_status(&p, false, 429, 3));
+    }
+
+    fn fault(code: &str) -> SoapFault {
+        SoapFault {
+            faultcode: format!("sf:{code}"),
+            faultstring: format!("{code}: message"),
+        }
+    }
+
+    #[test]
+    fn transient_faults_are_limited_to_unavailable_server_codes() {
+        assert!(is_transient_fault(&fault("SERVER_UNAVAILABLE")));
+        assert!(is_transient_fault(&fault("API_CURRENTLY_DISABLED")));
+    }
+
+    #[test]
+    fn deterministic_faults_are_not_transient() {
+        // Replaying any of these returns the identical fault, so the
+        // dispatcher must surface them on the first attempt.
+        for code in [
+            "INVALID_TYPE",
+            "INVALID_SESSION_ID",
+            "REQUEST_LIMIT_EXCEEDED",
+            "INVALID_CROSS_REFERENCE_KEY",
+        ] {
+            assert!(
+                !is_transient_fault(&fault(code)),
+                "{code} treated as transient"
+            );
+        }
     }
 
     #[test]
