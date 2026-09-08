@@ -231,8 +231,14 @@ pub struct SObjectMetadata {
     pub urls: HashMap<String, String>,
 }
 
-/// Bulk API 2.0 operation kind. Shared between ingest jobs (insert /
-/// update / upsert / delete / hardDelete) and query jobs (query / queryAll).
+/// Bulk API 2.0 operation kind, shared between ingest and query jobs.
+///
+/// Ingest jobs (`/jobs/ingest`) take `insert`, `delete`, `hardDelete`,
+/// `update`, `upsert`, `refresh` or `consentImport`; which of those a job
+/// may use depends on its target — standard objects support everything but
+/// `refresh` and `consentImport`, Marketing objects support `insert`,
+/// `upsert` and `refresh`, and consent ingest uses `consentImport`. Query
+/// jobs (`/jobs/query`) take `query` or `queryAll`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BulkOperation {
     #[serde(rename = "insert")]
@@ -247,10 +253,24 @@ pub enum BulkOperation {
     /// Delete" permission, which is disabled by default.
     #[serde(rename = "hardDelete")]
     HardDelete,
+    /// Marketing Object ingest only.
+    #[serde(rename = "refresh")]
+    Refresh,
+    /// Consent ingest. Consent ingest isn't backed by an object type, so
+    /// Salesforce rejects a create-job request that also sends `object`.
+    #[serde(rename = "consentImport")]
+    ConsentImport,
     #[serde(rename = "query")]
     Query,
     #[serde(rename = "queryAll")]
     QueryAll,
+    /// An operation Salesforce returned that this SDK doesn't name, so a
+    /// job created out-of-band still deserializes and its `state` and
+    /// record counts stay readable. Serializing it sends the literal
+    /// string `"Unknown"`, which no endpoint accepts — never use it in a
+    /// request.
+    #[serde(other)]
+    Unknown,
 }
 
 /// State of a Bulk API 2.0 job.
@@ -1286,6 +1306,96 @@ mod tests {
         assert_eq!(job.line_ending, BulkLineEnding::LF);
         assert_eq!(job.column_delimiter, BulkColumnDelimiter::Comma);
         assert!(job.number_records_processed.is_none());
+    }
+
+    #[test]
+    fn parses_bulk_ingest_job_with_consent_import_operation() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // operation/OperationEnum lists `consentImport` ("Consent ingest.
+        // Doesn't require the object property."), and the same page's
+        // `object` row says consent ingest isn't backed by an object type.
+        // Field set otherwise mirrors the Get Job Info example.
+        let body = json!({
+            "id": "7506g00000DhRA2AAN",
+            "operation": "consentImport",
+            "object": "",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA"
+        })
+        .to_string();
+        let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.operation, BulkOperation::ConsentImport);
+        assert_eq!(job.object, "");
+    }
+
+    #[test]
+    fn parses_bulk_job_state_change_with_refresh_operation() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // operation/OperationEnum lists `refresh` ("Marketing Object ingest
+        // only."). Envelope mirrors the documented state-change shape.
+        let body = json!({
+            "id": "750R0000000zxwzIAA",
+            "operation": "refresh",
+            "object": "MarketingObject__dlm",
+            "createdById": "005R0000000GiwjIAC",
+            "createdDate": "2018-12-10T17:50:19.000+0000",
+            "systemModstamp": "2018-12-10T17:51:27.000+0000",
+            "state": "UploadComplete",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 46.0
+        })
+        .to_string();
+        let job: BulkJobStateChange = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.operation, BulkOperation::Refresh);
+        assert_eq!(job.state, BulkJobState::UploadComplete);
+    }
+
+    #[test]
+    fn unnamed_bulk_operation_deserializes_without_sinking_the_envelope() {
+        // An operation Salesforce adds later must not cost the caller the
+        // rest of the job envelope.
+        let body = json!({
+            "id": "750R0000000zxwzIAA",
+            "operation": "someFutureOperation",
+            "object": "Account",
+            "createdById": "005R0000000GiwjIAC",
+            "createdDate": "2018-12-10T17:50:19.000+0000",
+            "systemModstamp": "2018-12-10T17:51:27.000+0000",
+            "state": "JobComplete",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 46.0
+        })
+        .to_string();
+        let job: BulkJobStateChange = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.operation, BulkOperation::Unknown);
+        assert_eq!(job.state, BulkJobState::JobComplete);
+    }
+
+    #[test]
+    fn bulk_operation_serializes_to_the_documented_wire_names() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        for (op, wire) in [
+            (BulkOperation::Insert, "insert"),
+            (BulkOperation::Delete, "delete"),
+            (BulkOperation::HardDelete, "hardDelete"),
+            (BulkOperation::Update, "update"),
+            (BulkOperation::Upsert, "upsert"),
+            (BulkOperation::Refresh, "refresh"),
+            (BulkOperation::ConsentImport, "consentImport"),
+        ] {
+            assert_eq!(serde_json::to_value(op).unwrap(), json!(wire));
+        }
     }
 
     #[test]
