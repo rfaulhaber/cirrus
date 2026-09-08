@@ -964,6 +964,72 @@ mod tests {
         assert_eq!(parsed.problem, DeployProblemType::Unknown);
     }
 
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    /// DeployResult.status is a "DeployStatus (enumeration of type
+    /// string)" whose valid values are Pending, InProgress,
+    /// FinalizingDeploy, FinalizingDeployFailed, Succeeded,
+    /// SucceededPartial, Failed, Canceling, and Canceled. With
+    /// `#[serde(other)]` in place a misspelled variant identifier
+    /// would deserialize to `Unknown` instead of failing, so every
+    /// documented literal is pinned here.
+    #[test]
+    fn deploy_status_literals_match_the_documented_set() {
+        #[derive(Deserialize)]
+        struct Wire {
+            status: DeployStatus,
+        }
+        fn parse(literal: &str) -> DeployStatus {
+            let wire: Wire =
+                quick_xml::de::from_str(&format!("<Wire><status>{literal}</status></Wire>"))
+                    .unwrap();
+            wire.status
+        }
+
+        for (literal, expected) in [
+            ("Pending", DeployStatus::Pending),
+            ("InProgress", DeployStatus::InProgress),
+            ("FinalizingDeploy", DeployStatus::FinalizingDeploy),
+            (
+                "FinalizingDeployFailed",
+                DeployStatus::FinalizingDeployFailed,
+            ),
+            ("Succeeded", DeployStatus::Succeeded),
+            ("SucceededPartial", DeployStatus::SucceededPartial),
+            ("Failed", DeployStatus::Failed),
+            ("Canceling", DeployStatus::Canceling),
+            ("Canceled", DeployStatus::Canceled),
+        ] {
+            assert_eq!(parse(literal), expected, "literal {literal}");
+        }
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+    /// RetrieveResult.status is a "RetrieveStatus (enumeration of type
+    /// string)" whose valid values are Pending, InProgress, Succeeded,
+    /// and Failed.
+    #[test]
+    fn retrieve_status_literals_match_the_documented_set() {
+        #[derive(Deserialize)]
+        struct Wire {
+            status: RetrieveStatus,
+        }
+        fn parse(literal: &str) -> RetrieveStatus {
+            let wire: Wire =
+                quick_xml::de::from_str(&format!("<Wire><status>{literal}</status></Wire>"))
+                    .unwrap();
+            wire.status
+        }
+
+        for (literal, expected) in [
+            ("Pending", RetrieveStatus::Pending),
+            ("InProgress", RetrieveStatus::InProgress),
+            ("Succeeded", RetrieveStatus::Succeeded),
+            ("Failed", RetrieveStatus::Failed),
+        ] {
+            assert_eq!(parse(literal), expected, "literal {literal}");
+        }
+    }
+
     #[test]
     fn test_level_as_wire_matches_doc_strings() {
         assert_eq!(TestLevel::NoTestRun.as_wire(), "NoTestRun");
