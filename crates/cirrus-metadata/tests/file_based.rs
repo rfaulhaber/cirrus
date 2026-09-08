@@ -555,8 +555,13 @@ async fn deploy_emits_the_retrieve_side_options() {
 // -- cancel_deploy -----------------------------------------------------------
 
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
-/// CancelDeployResult carries `id` and `done`; "If the done field
-/// value is true, the deployment has been canceled".
+/// "If the done field value is true, the deployment has been canceled".
+///
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeployresult.htm
+/// The property table naming both fields the fixture carries: `done`,
+/// "Indicates whether the deployment cancellation, which is started
+/// through cancelDeploy(), has completed (true) or not (false)", and
+/// `id`, "ID of the deployment being canceled".
 ///
 /// The request's element name is not documented — see the wire-shape
 /// provenance note on `CancelDeployOp`. The assertion below pins the
