@@ -296,7 +296,14 @@ pub(crate) fn compute_delay(
                 // Random source down — degrade gracefully to deterministic.
                 computed
             } else {
-                let r = u64::from_le_bytes(buf) % (max_ms + 1);
+                let sample = u64::from_le_bytes(buf);
+                // `[0, max_ms]` inclusive. When max_ms is u64::MAX the
+                // range is already the whole of u64, so the sample
+                // stands as is — computing the span would overflow.
+                let r = match max_ms.checked_add(1) {
+                    Some(span) => sample % span,
+                    None => sample,
+                };
                 Duration::from_millis(r)
             }
         }
@@ -745,6 +752,24 @@ mod tests {
         for _ in 0..50 {
             let d = compute_delay(&p, 2, None);
             assert!(d <= Duration::from_millis(400));
+        }
+    }
+
+    #[test]
+    fn compute_delay_survives_an_unbounded_max_delay() {
+        // "No ceiling" is expressible through the public policy, and at
+        // a high attempt count the capped delay saturates at u64::MAX
+        // milliseconds — the upper edge of the jitter sample.
+        let p = RetryPolicy {
+            max_retries: 60,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::MAX,
+            jitter: true,
+            ..RetryPolicy::default()
+        };
+        for attempt in [0, 57, 58, 63, 64, 100] {
+            let d = compute_delay(&p, attempt, None);
+            assert!(d <= Duration::from_millis(u64::MAX));
         }
     }
 
