@@ -15,8 +15,8 @@
 use bytes::Bytes;
 use cirrus_metadata::auth::StaticTokenAuth;
 use cirrus_metadata::{
-    DeployOptions, DeployStatus, MetadataClient, MetadataError, MetadataType, PackageManifest,
-    RetrieveRequest, RetrieveStatus, RetryPolicy, TestLevel, WaitConfig,
+    DeployOptions, DeployProblemType, DeployStatus, MetadataClient, MetadataError, MetadataType,
+    PackageManifest, RetrieveRequest, RetrieveStatus, RetryPolicy, TestLevel, WaitConfig,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -231,8 +231,141 @@ async fn check_deploy_status_parses_failure_details() {
     let first = &details.component_failures[0];
     assert_eq!(first.full_name, Some("BrokenClass".into()));
     assert_eq!(first.problem, Some("Unexpected token 'foo'".into()));
+    assert_eq!(first.problem_type, Some(DeployProblemType::Error));
     assert_eq!(first.line_number, Some(42));
     assert_eq!(first.column_number, Some(13));
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+/// DeployResult.status valid values include `SucceededPartial`;
+/// `errorStatusCode` carries "a status code … the message
+/// corresponding to the status code is returned in the errorMessage
+/// field", which meta_deploy.htm's sample reads as
+/// `getErrorStatusCode()` / `getErrorMessage()`. DeployMessage's
+/// `problemType` is one of Warning or Error.
+///
+/// `success` is deliberately absent: the guide doesn't say what value
+/// accompanies a partial deploy, so the fixture doesn't invent one.
+#[tokio::test]
+async fn check_deploy_status_parses_partial_success_and_error_fields() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000partial</id>
+        <done>true</done>
+        <status>SucceededPartial</status>
+        <numberComponentsDeployed>8</numberComponentsDeployed>
+        <numberComponentsTotal>10</numberComponentsTotal>
+        <numberComponentErrors>2</numberComponentErrors>
+        <errorStatusCode>INVALID_CROSS_REFERENCE_KEY</errorStatusCode>
+        <errorMessage>Some components were not deployed.</errorMessage>
+        <details>
+          <componentFailures>
+            <componentType>ApexClass</componentType>
+            <fullName>OldStyle</fullName>
+            <fileName>classes/OldStyle.cls</fileName>
+            <success>false</success>
+            <problem>Deprecated method used</problem>
+            <problemType>Warning</problemType>
+          </componentFailures>
+        </details>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .check_deploy_status("0Af00000partial", true)
+        .await
+        .unwrap();
+    assert_eq!(result.status, Some(DeployStatus::SucceededPartial));
+    assert!(result.status.unwrap().is_terminal());
+    assert_eq!(
+        result.error_status_code,
+        Some("INVALID_CROSS_REFERENCE_KEY".into())
+    );
+    assert_eq!(
+        result.error_message,
+        Some("Some components were not deployed.".into())
+    );
+    assert_eq!(result.number_component_errors, 2);
+    let failure = &result.details.unwrap().component_failures[0];
+    assert_eq!(failure.problem_type, Some(DeployProblemType::Warning));
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
+/// "In the returned DeployResult object, check the status field. If
+/// the status is Canceling, the cancellation is still in progress …
+/// Otherwise, if the status is Canceled, the deployment has been
+/// canceled and you're done."
+#[tokio::test]
+async fn check_deploy_status_parses_the_cancellation_states() {
+    let server = MockServer::start().await;
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with({
+            let counter = counter.clone();
+            move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let (done, status) = if n == 0 {
+                    ("false", "Canceling")
+                } else {
+                    ("true", "Canceled")
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml; charset=UTF-8")
+                    .set_body_string(format!(
+                        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000cancel</id>
+        <done>{done}</done>
+        <success>false</success>
+        <status>{status}</status>
+        <canceledBy>005xx00000abcde</canceledBy>
+        <canceledByName>Stephanie</canceledByName>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+                    ))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let in_progress = md
+        .check_deploy_status("0Af00000cancel", false)
+        .await
+        .unwrap();
+    assert_eq!(in_progress.status, Some(DeployStatus::Canceling));
+    assert!(
+        !in_progress.status.unwrap().is_terminal(),
+        "a cancellation in progress is not a finished deploy"
+    );
+    assert_eq!(in_progress.canceled_by_name, Some("Stephanie".into()));
+
+    let settled = md
+        .check_deploy_status("0Af00000cancel", false)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, Some(DeployStatus::Canceled));
+    assert!(settled.status.unwrap().is_terminal());
 }
 
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
@@ -560,6 +693,76 @@ async fn check_retrieve_status_decodes_zip_bytes() {
     );
     let zip = result.zip_bytes().unwrap().unwrap();
     assert_eq!(&zip[..], b"PKfakezipbytes");
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+/// RetrieveResult carries `errorStatusCode` ("If an error occurs
+/// during the retrieve() call, this field contains the status code for
+/// this error"), the matching `errorMessage`, and `messages`
+/// (RetrieveMessage[]) — "information about the success or failure of
+/// the retrieve() call". A RetrieveMessage is a `fileName` plus a
+/// required `problem`.
+#[tokio::test]
+async fn check_retrieve_status_parses_failure_messages() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkRetrieveStatus>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkRetrieveStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>09S00000failed</id>
+        <done>true</done>
+        <success>false</success>
+        <status>Failed</status>
+        <errorStatusCode>INVALID_CROSS_REFERENCE_KEY</errorStatusCode>
+        <errorMessage>An error occurred during the retrieve.</errorMessage>
+        <messages>
+          <fileName>unpackaged/classes/Missing.cls</fileName>
+          <problem>Entity of type 'ApexClass' named 'Missing' cannot be found</problem>
+        </messages>
+        <messages>
+          <fileName>unpackaged/package.xml</fileName>
+          <problem>No package.xml found</problem>
+        </messages>
+      </result>
+    </checkRetrieveStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .check_retrieve_status("09S00000failed", false)
+        .await
+        .unwrap();
+    assert!(result.done);
+    assert!(!result.success);
+    assert_eq!(result.status, Some(RetrieveStatus::Failed));
+    assert!(result.status.unwrap().is_terminal());
+    assert_eq!(
+        result.error_status_code,
+        Some("INVALID_CROSS_REFERENCE_KEY".into())
+    );
+    assert_eq!(
+        result.error_message,
+        Some("An error occurred during the retrieve.".into())
+    );
+    assert_eq!(result.messages.len(), 2);
+    assert_eq!(
+        result.messages[0].file_name,
+        Some("unpackaged/classes/Missing.cls".into())
+    );
+    assert_eq!(
+        result.messages[1].problem,
+        "No package.xml found".to_string()
+    );
+    assert!(result.zip_file.is_none());
 }
 
 // -- wait_for_deploy ---------------------------------------------------------
