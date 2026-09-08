@@ -27,8 +27,9 @@
 //!    burns more of it. 429 is retried anyway because proxies and API
 //!    gateways in front of an org do emit it.
 //! 2. **Honor server hints.** When the server provides a
-//!    [`Retry-After`] header (RFC 7231 §7.1.3 delta-seconds form), use
-//!    that delay instead of our backoff schedule.
+//!    [`Retry-After`] header — either RFC 7231 §7.1.3 form,
+//!    delta-seconds or an HTTP-date — use that delay instead of our
+//!    backoff schedule.
 //! 3. **Jitter to avoid thundering herd.** Default policy applies
 //!    *full jitter* — random uniform `[0, computed_delay]` — per
 //!    AWS's recommendations for distributed clients hitting a shared
@@ -227,16 +228,26 @@ fn is_idempotent(method: &reqwest::Method) -> bool {
     )
 }
 
-/// Parse a `Retry-After` header value as RFC 7231 §7.1.3 delta-seconds.
+/// Parse a `Retry-After` header value in either RFC 7231 §7.1.3 form:
+/// delta-seconds, or an HTTP-date converted to the delay remaining
+/// until then. A date already in the past yields
+/// [`Duration::ZERO`] — the server is saying "now".
 ///
-/// The HTTP-date variant of `Retry-After` is also valid per spec but
-/// we don't accept it — Salesforce documentation only shows the
-/// integer form, and the date-parsing surface isn't worth pulling in
-/// `httpdate` for this niche.
+/// Both forms matter here because the 429/503 responses this reads come
+/// from proxies and API gateways in front of the org rather than from
+/// Salesforce itself, and those emit either shape.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?;
-    let s = raw.to_str().ok()?;
-    s.trim().parse::<u64>().ok().map(Duration::from_secs)
+    let s = raw.to_str().ok()?.trim();
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let deadline = httpdate::parse_http_date(s).ok()?;
+    Some(
+        deadline
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 /// Compute the next backoff delay.
@@ -644,13 +655,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_returns_none_for_http_date_form() {
-        // We don't support the HTTP-date variant — returning None
-        // makes the caller fall back to the backoff schedule.
+    fn parse_retry_after_handles_http_date_in_the_future() {
+        let deadline = std::time::SystemTime::now() + Duration::from_secs(120);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(&httpdate::fmt_http_date(deadline)).unwrap(),
+        );
+        let d = parse_retry_after(&h).expect("HTTP-date form should parse");
+        // The header has one-second resolution, so allow a little slack.
+        assert!(
+            d >= Duration::from_secs(118) && d <= Duration::from_secs(121),
+            "expected roughly 120s, got {d:?}",
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_a_past_http_date_to_zero() {
         let mut h = reqwest::header::HeaderMap::new();
         h.insert(
             reqwest::header::RETRY_AFTER,
             reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_retry_after_returns_none_for_unparseable_values() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("soonish"),
         );
         assert_eq!(parse_retry_after(&h), None);
     }
