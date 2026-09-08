@@ -1,11 +1,12 @@
 //! Tooling API integration tests.
 //!
-//! The most valuable test here is
-//! [`execute_anonymous_*`] — those verify the
-//! [`ExecuteAnonymousResult`] wire shape that's marked
-//! "unverified against public REST docs" in `response.rs`. If any of
-//! these fail, fix the deserialization in `response.rs` first, then
-//! re-run.
+//! The most valuable test here is [`execute_anonymous_*`]. The
+//! [`ExecuteAnonymousResult`] field set is doc-published, but its JSON
+//! casing and the `-1` "no error" sentinel on `line`/`column` are not
+//! — the wire-shape provenance note in `response.rs` records that both
+//! come from live API observation, and these tests are what keeps that
+//! observation honest. If any of them fail, fix the deserialization in
+//! `response.rs` first, then re-run.
 //!
 //! Also covers Tooling `describe_global`, a Tooling query (against
 //! `ApexClass` — every org has Tooling sObjects even if no Apex is
