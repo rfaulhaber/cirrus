@@ -24,6 +24,11 @@
 //! carrying the org's bearer token. Pre-encoding does not avoid this —
 //! `%2e%2e` normalizes to `..` — so such segments have to be refused
 //! rather than escaped.
+//!
+//! Backslashes, tabs, line feeds and carriage returns are refused for the
+//! same reason: URL parsing treats `\` as a path separator and strips the
+//! other three before it resolves dot segments, so either spelling can
+//! smuggle a `..` past a segment-by-segment check.
 
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
@@ -67,7 +72,8 @@ impl Cirrus {
 ///
 /// Every method returns [`CirrusError::InvalidResponse`] without issuing
 /// a request when the supplied path contains an empty or relative
-/// (`.` / `..`) segment — see the [module docs](self#path-encoding).
+/// (`.` / `..`) segment, a backslash, or a tab, line feed or carriage
+/// return — see the [module docs](self#path-encoding).
 ///
 /// [`CirrusError::InvalidResponse`]: crate::CirrusError::InvalidResponse
 #[derive(Debug)]
@@ -134,11 +140,27 @@ impl ApexHandler<'_> {
 /// The leading `/` triggers [`crate::Cirrus`]'s instance-rooted branch,
 /// bypassing the versioned `/services/data/{version}/` prefix.
 ///
-/// Errors when any content-bearing segment is empty or relative, so that
-/// a path built from untrusted input cannot resolve outside the Apex REST
-/// root. A single trailing slash is kept: Apex `urlMapping` values are
-/// documented with one.
+/// Errors when any content-bearing segment is empty or relative, or when
+/// the path contains a backslash, tab, line feed or carriage return, so
+/// that a path built from untrusted input cannot resolve outside the Apex
+/// REST root. A single trailing slash is kept: Apex `urlMapping` values
+/// are documented with one.
 fn apex_path(path: &str) -> CirrusResult<String> {
+    // For a special scheme, WHATWG URL parsing treats `\` as a path
+    // separator and strips tab, LF and CR from the input before it looks
+    // for dot segments. Either one hides a `..` from the split below —
+    // `Cases\..\..\..\services/data/...` and `Cases/.<TAB>./` alike
+    // resolve out of the Apex REST root — so both are rejected outright
+    // instead of normalized.
+    if let Some(c) = path
+        .chars()
+        .find(|c| matches!(c, '\\' | '\t' | '\n' | '\r'))
+    {
+        return Err(CirrusError::InvalidResponse(format!(
+            "Apex REST path contains {c:?}, which URL parsing treats as a path \
+             separator or strips before resolving dot segments"
+        )));
+    }
     let trimmed = path.trim_start_matches('/');
     let body = trimmed.strip_suffix('/').unwrap_or(trimmed);
     for segment in body.split('/') {
@@ -233,6 +255,14 @@ mod tests {
             "Cases/%2E%2E/comments",
             "Cases/.%2e/comments",
             "Cases/%2e/comments",
+            // A backslash is a path separator for special schemes, so the
+            // whole thing would otherwise pass as one segment.
+            "Cases\\..\\..\\..\\services/data/v66.0/sobjects/Account/001xx",
+            // Tab, LF and CR are stripped before dot segments are
+            // resolved, so they can split a `..` in half.
+            "Cases/.\t./.\t./.\t./services/data/v66.0/limits",
+            "Cases/.\n./.\n./.\n./services/data/v66.0/limits",
+            "Cases/.\r./.\r./.\r./services/data/v66.0/limits",
         ] {
             let err = apex_path(candidate).unwrap_err();
             assert!(
@@ -268,12 +298,17 @@ mod tests {
         // No mock is mounted: any outgoing request fails the test by
         // returning a 404 that would surface as CirrusError::Api.
         let sf = fixture(server.uri());
-        let err = sf
-            .apex()
-            .delete::<()>("Cases/../../services/data/v66.0/sobjects/Account/001xx")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, CirrusError::InvalidResponse(_)), "{err:?}");
+        for candidate in [
+            "Cases/../../services/data/v66.0/sobjects/Account/001xx",
+            "Cases\\..\\..\\..\\services/data/v66.0/sobjects/Account/001xx",
+            "Cases/.\t./.\t./.\t./services/data/v66.0/limits",
+        ] {
+            let err = sf.apex().delete::<()>(candidate).await.unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidResponse(_)),
+                "{candidate:?}: {err:?}"
+            );
+        }
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
