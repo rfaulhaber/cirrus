@@ -170,7 +170,7 @@ Shared dependency versions are declared in `[workspace.dependencies]` (including
 
 The project uses a Nix flake with `direnv` (`.envrc` is `use flake`). The dev shell provides `rustc`/`cargo` (stable), `clippy`, `rust-analyzer`, `cargo-nextest`, and `cargo-release`. Outside Nix, the `rust-toolchain.toml` pins channel `stable` with `clippy` and `rustfmt`.
 
-Edition is **2024** — code may use features unavailable in older editions. The workspace resolver is `"3"` (requires Cargo ≥ 1.85).
+Edition is **2024** — code may use features unavailable in older editions. The workspace resolver is `"3"` (requires Cargo ≥ 1.85). The published MSRV is `rust-version = "1.88"` in `[workspace.package]`, inherited by every member; it is set by the dependency graph (`jsonwebtoken` 11 and `time`), and a dedicated CI job pins that exact toolchain so the declared floor stays honest.
 
 ## Common Commands
 
