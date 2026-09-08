@@ -909,6 +909,51 @@ mod tests {
         assert!(matches!(err, AuthError::OAuth { .. }));
     }
 
+    #[tokio::test]
+    async fn token_request_is_not_followed_across_a_redirect() {
+        // The token request carries the connected app secret and the PKCE
+        // verifier. A 3xx from the configured login host must surface as an
+        // error rather than replaying those credentials at whatever host the
+        // `Location` header names.
+        let login = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "Location",
+                format!("{}/services/oauth2/token", elsewhere.uri()).as_str(),
+            ))
+            .mount(&login)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&elsewhere)
+            .await;
+
+        let flow = flow_with_required_fields()
+            .login_url(login.uri())
+            .consumer_secret("connected-app-secret")
+            .build()
+            .unwrap();
+        let (_url, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+
+        let err = flow.complete(pending, "c", &state).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnexpectedResponse { status: 307 }),
+            "expected the redirect to surface as an error, got: {err:?}"
+        );
+        assert!(
+            elsewhere
+                .received_requests()
+                .await
+                .is_some_and(|r| r.is_empty()),
+            "credentials were replayed at the redirect target"
+        );
+    }
+
     /// Reads one field out of a captured `application/x-www-form-urlencoded`
     /// request body.
     fn form_value(body: &str, key: &str) -> Option<String> {
