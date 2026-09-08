@@ -741,8 +741,12 @@ async fn check_retrieve_status_decodes_zip_bytes() {
 /// during the retrieve() call, this field contains the status code for
 /// this error"), the matching `errorMessage`, and `messages`
 /// (RetrieveMessage[]) — "information about the success or failure of
-/// the retrieve() call". A RetrieveMessage is a `fileName` plus a
-/// required `problem`.
+/// the retrieve() call", "one object per problem", each a `fileName`
+/// ("The name of the file in the retrieved .zip file where a problem
+/// occurred") and a `problem` ("A description of the problem that
+/// occurred"). The page marks neither field required; modelling
+/// `problem` as a plain `String` is this crate's own choice, since a
+/// message with no problem text carries nothing.
 #[tokio::test]
 async fn check_retrieve_status_parses_failure_messages() {
     let server = MockServer::start().await;
