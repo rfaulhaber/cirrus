@@ -939,8 +939,10 @@ pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
     Err(parse_error_response(status, bytes))
 }
 
-/// Ceiling on how much of an unparseable error body is preserved in
-/// [`CirrusError::Api::raw`]. Bodies that don't match the Salesforce
+/// Ceiling on how much of an off-contract body is retained in an error —
+/// the unparseable error body in [`CirrusError::Api::raw`], and the body
+/// excerpt in the [`CirrusError::InvalidResponse`] raised for a 2xx that
+/// doesn't fit `R`. Bodies that don't match the Salesforce
 /// error shape come from proxies and gateways, which can echo request
 /// data — capping what we retain bounds what can end up in the
 /// caller's logs via `Display`/`Debug`, and keeps a pathological body
