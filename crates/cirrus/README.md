@@ -105,8 +105,10 @@ boundary between auth and REST without extra plumbing.
 
 - **Retry + backoff** — `RetryPolicy` covers 429, 503, and transient 5xx with
   full jitter; honors `Retry-After`. Configurable; off by default for non-idempotent 5xx.
-- **Sforce-Limit-Info capture** — every response's API quota header is parsed
-  and surfaced via `sf.last_limit_info()`.
+- **Sforce-Limit-Info capture** — every response sent through the typed verb
+  methods and handlers has its API quota header parsed and surfaced via
+  `sf.last_limit_info()`. `request_builder` and `execute` step outside the
+  request loop, so they don't advance it.
 - **Pagination as `futures::Stream`** — composes with `StreamExt` from any
   async ecosystem, so the consumer API surface isn't tied to a specific
   combinator crate. Drop the stream → no further fetches. (Execution still

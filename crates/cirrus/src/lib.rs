@@ -538,6 +538,13 @@ impl Cirrus {
     /// constructed the entire request themselves and just wants to share
     /// the SDK's connection pool.
     ///
+    /// The request never enters the SDK's request loop, so — as with
+    /// [`Self::request_builder`] — the [`RetryPolicy`], the 401
+    /// auto-refresh and `Sforce-Limit-Info` capture do not apply:
+    /// a transient 5xx or a 429 comes back as-is, an expired token
+    /// surfaces as a 401 the caller must handle, and
+    /// [`Self::last_limit_info`] stops advancing.
+    ///
     /// To get an auth token for a custom request, use
     /// `client.auth().access_token().await?`.
     pub async fn execute(&self, request: reqwest::Request) -> CirrusResult<reqwest::Response> {
