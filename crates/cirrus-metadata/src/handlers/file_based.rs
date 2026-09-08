@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_op_body_fits_its_initial_allocation() {
+    fn deploy_op_body_fits_the_capacity_it_reserves() {
         // A populated option set renders far longer than the tags that
         // surround the encoded zip, so the buffer is sized from the
         // rendered options rather than a fixed headroom. Growing it
@@ -680,15 +680,25 @@ mod tests {
 
         let zip = vec![0x5a_u8; 4096];
         let encoded_len = zip.len().div_ceil(3) * 4;
+        let reserved = encoded_len + rendered_opts.len() + 128;
         let op = DeployOp {
             zip: Bytes::from(zip),
             options: opts,
         };
         let body = op.render_body().unwrap();
 
-        // An untouched `String::with_capacity` reservation proves the
-        // buffer was never grown while it held the encoded zip.
-        assert_eq!(body.capacity(), encoded_len + rendered_opts.len() + 128);
+        // Everything appended after the encoded zip has to fit in what
+        // `render_body` reserved up front; the moment it doesn't, the
+        // push that overflows copies the whole base64 payload. Asserting
+        // the fit rather than the final capacity keeps the test about
+        // that, since `String::with_capacity` and base64's own sink are
+        // both free to reserve more than they were asked for.
+        assert!(
+            body.len() <= reserved,
+            "body outgrew its reservation: {} > {reserved}",
+            body.len()
+        );
+        assert!(body.capacity() >= reserved);
         assert!(body.contains(&rendered_opts));
     }
 
