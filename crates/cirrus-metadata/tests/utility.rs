@@ -321,12 +321,13 @@ async fn describe_metadata_parses_object_catalog() {
 /// FileProperties: "namespacePrefix | string | The namespace prefix of
 /// the component" — present only for components that have one.
 ///
-/// The two blank forms Salesforce sends for an absent string both have
-/// to normalize to `None`: a self-closing `xsi:nil` element and an
-/// empty one. The `xsi` prefix is declared on the SOAP envelope, which
-/// is outside the response element the transport hands the
-/// deserializer, so neither form carries nil semantics by the time it
-/// is parsed.
+/// The blank forms an absent string arrives in all have to normalize to
+/// `None`: a self-closing `xsi:nil` element, an empty one, and — since
+/// the envelope reader leaves character data untrimmed — one an
+/// intermediary has pretty-printed into whitespace. The `xsi` prefix is
+/// declared on the SOAP envelope, which is outside the response element
+/// the transport hands the deserializer, so none of them carries nil
+/// semantics by the time it is parsed.
 #[tokio::test]
 async fn blank_string_elements_normalize_to_none() {
     let server = MockServer::start().await;
@@ -378,6 +379,20 @@ async fn blank_string_elements_normalize_to_none() {
         <namespacePrefix>acme</namespacePrefix>
         <type>ApexClass</type>
       </result>
+      <result>
+        <createdById>005xx0000abc</createdById>
+        <createdByName>Stephanie</createdByName>
+        <createdDate>2026-01-15T08:00:00.000Z</createdDate>
+        <fileName>classes/Qux.cls</fileName>
+        <fullName>Qux</fullName>
+        <id>01p00000pqrSTU</id>
+        <lastModifiedById>005xx0000abc</lastModifiedById>
+        <lastModifiedByName>Stephanie</lastModifiedByName>
+        <lastModifiedDate>2026-05-20T12:00:00.000Z</lastModifiedDate>
+        <namespacePrefix>
+        </namespacePrefix>
+        <type>ApexClass</type>
+      </result>
     </listMetadataResponse>
   </soapenv:Body>
 </soapenv:Envelope>"#,
@@ -402,6 +417,7 @@ async fn blank_string_elements_normalize_to_none() {
     // A real namespace still comes through, so the adapter isn't just
     // discarding the field.
     assert_eq!(results[2].namespace_prefix, Some("acme".into()));
+    assert_eq!(results[3].namespace_prefix, None, "whitespace-only form");
 }
 
 // -- describe_value_type -----------------------------------------------------

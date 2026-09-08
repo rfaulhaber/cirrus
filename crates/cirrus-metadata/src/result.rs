@@ -24,7 +24,7 @@
 
 use serde::Deserialize;
 
-/// Adapter that maps empty strings to `None`.
+/// Adapter that maps blank strings to `None`.
 ///
 /// Salesforce encodes a null `Option<String>` as either an empty
 /// `<field></field>` element or a self-closing `<field xsi:nil="true"/>`,
@@ -36,6 +36,12 @@ use serde::Deserialize;
 /// for unnamespaced components, types with no file suffix, and the
 /// other common absent-value cases.
 ///
+/// Whitespace counts as blank. Character data reaches the deserializer
+/// verbatim — the envelope reader deliberately leaves it untrimmed, so
+/// that entity references and stored leading whitespace survive — which
+/// means a pretty-printed `<field>\n  </field>` from an intermediary
+/// arrives as whitespace rather than as the empty string.
+///
 /// Apply via `#[serde(default, deserialize_with = "deserialize_nil_string")]`
 /// on every `Option<String>` field Salesforce can render blank.
 fn deserialize_nil_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
@@ -43,7 +49,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(d)?;
-    Ok(opt.filter(|s| !s.is_empty()))
+    Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
 // -- Async kickoff envelopes -------------------------------------------------
