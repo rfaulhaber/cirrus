@@ -566,7 +566,7 @@ mod tests {
     use crate::auth::StaticTokenAuth;
     use serde_json::json;
     use std::sync::Arc;
-    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::matchers::{body_json, header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fixture(uri: String) -> Cirrus {
@@ -819,11 +819,23 @@ mod tests {
         assert!(resp.results.iter().all(|r| r.is_success()));
     }
 
+    /// Wire shape per the `responses_composite_sobject_tree` "JSON
+    /// example upon failure" body.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/responses_composite_sobject_tree.htm
+    ///
+    /// Wire-shape provenance: that page prints the rollback response
+    /// body but no HTTP status line, and
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+    /// assigns 201 to "POST requests and some PATCH requests" without
+    /// singling out sObject Tree. The 201 below is therefore assumed,
+    /// not doc-verified — it has not been pinned against a live org.
+    /// What the test does prove is the handler contract that matters:
+    /// a 2xx rollback response is surfaced as
+    /// [`CompositeTreeResponse`] rather than an error, so callers reach
+    /// the per-record `referenceId`/`errors` payload.
     #[tokio::test]
     async fn tree_surfaces_per_record_failure() {
-        // All-or-nothing — has_errors=true, only the failing referenceId
-        // appears in results. The transport call returns 201 (yes, even
-        // for a rolled-back request — the docs document this).
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -859,13 +871,14 @@ mod tests {
 
     #[tokio::test]
     async fn tree_percent_encodes_sobject_name() {
-        // Custom-object names are alphanumeric + underscores in practice,
-        // but versioned_segments encodes any reserved character we hand it
-        // — covers the unlikely case of a dev sandbox name with a space.
+        // An sObject name carrying characters reserved in a URL path
+        // segment ('/', space) must stay inside one segment, so it can't
+        // inject extra segments into the composite tree URL.
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/services/data/v66.0/composite/tree/My_Custom__c"))
+            .and(path("/services/data/v66.0/composite/tree/a%2Fb=c%20d"))
+            .and(path_regex(r"^/services/data/v66\.0/composite/tree/[^/]+$"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "hasErrors": false,
                 "results": []
@@ -876,7 +889,7 @@ mod tests {
         let sf = fixture(server.uri());
         let resp = sf
             .composite()
-            .tree("My_Custom__c", &json!({"records": []}))
+            .tree("a/b=c d", &json!({"records": []}))
             .await
             .unwrap();
         assert!(!resp.has_errors);
