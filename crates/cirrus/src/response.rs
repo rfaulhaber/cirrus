@@ -894,9 +894,10 @@ pub struct ExecuteAnonymousResult {
 /// Parses a Salesforce response body, branching on the HTTP status.
 ///
 /// On 2xx, the body is deserialized into `R` (use `serde_json::Value` for an
-/// untyped response). On 4xx/5xx, the body is parsed as a Salesforce error
-/// array; if that fails the raw body is preserved in
-/// [`CirrusError::Api::raw`] for debugging.
+/// untyped response); a body that doesn't fit `R` becomes a
+/// [`CirrusError::InvalidResponse`] carrying an excerpt of what arrived. On
+/// 4xx/5xx, the body is parsed as a Salesforce error array; if that fails
+/// the raw body is preserved in [`CirrusError::Api::raw`] for debugging.
 pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
     status: u16,
     bytes: &[u8],
@@ -914,7 +915,16 @@ pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
                 ))
             });
         }
-        return serde_json::from_slice(bytes).map_err(CirrusError::Serialization);
+        // A 2xx that doesn't fit `R` is usually an off-contract body from an
+        // interposed hop, or a truncated one — serde's message alone names
+        // neither, so keep an excerpt under the same cap the error path uses.
+        return serde_json::from_slice(bytes).map_err(|err| {
+            CirrusError::InvalidResponse(format!(
+                "endpoint returned {status} but the body did not deserialize into the requested \
+                 type: {err}; body: {}",
+                capped_body(bytes)
+            ))
+        });
     }
     Err(parse_error_response(status, bytes))
 }
@@ -998,6 +1008,39 @@ mod tests {
                 );
             }
             other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undeserializable_2xx_body_keeps_an_excerpt() {
+        let err = parse_response_bytes::<QueryResult<Value>>(
+            200,
+            b"<html><body>Gateway timeout</body></html>",
+        )
+        .unwrap_err();
+        match err {
+            CirrusError::InvalidResponse(msg) => {
+                assert!(msg.contains("200"), "status missing: {msg}");
+                assert!(msg.contains("Gateway timeout"), "body missing: {msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undeserializable_2xx_body_excerpt_is_capped() {
+        let body = format!("{{\"junk\": \"{}\"}}", "x".repeat(RAW_ERROR_BODY_CAP * 3));
+        let err = parse_response_bytes::<QueryResult<Value>>(200, body.as_bytes()).unwrap_err();
+        match err {
+            CirrusError::InvalidResponse(msg) => {
+                assert!(msg.contains("… <truncated>"), "missing marker");
+                assert!(
+                    msg.len() < RAW_ERROR_BODY_CAP + 256,
+                    "excerpt not capped: {} bytes",
+                    msg.len()
+                );
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
         }
     }
 
