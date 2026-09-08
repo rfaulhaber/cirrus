@@ -335,6 +335,13 @@ pub enum BulkColumnDelimiter {
 pub struct BulkIngestJob {
     pub id: String,
     pub operation: BulkOperation,
+    /// Object type the job's data belongs to. Absent for jobs created
+    /// with the `consentImport` operation — consent ingest isn't
+    /// backed by an object type — and deserializes as an empty string
+    /// there rather than failing the envelope. See [Create a Job].
+    ///
+    /// [Create a Job]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+    #[serde(default)]
     pub object: String,
     pub state: BulkJobState,
     #[serde(rename = "externalIdFieldName", default)]
@@ -1492,6 +1499,32 @@ mod tests {
         .to_string();
         let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(job.operation, BulkOperation::ConsentImport);
+        assert_eq!(job.object, "");
+    }
+
+    #[test]
+    fn parses_bulk_ingest_job_with_object_absent() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // The response table treats `object` as conditional on the
+        // operation rather than always present; `#[serde(default)]`
+        // keeps a body that omits it from failing the whole envelope.
+        let body = json!({
+            "id": "7506g00000DhRA2AAN",
+            "operation": "consentImport",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA"
+        })
+        .to_string();
+        let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(job.object, "");
     }
 
