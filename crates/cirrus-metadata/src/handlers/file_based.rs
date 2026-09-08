@@ -51,17 +51,24 @@ impl SoapOperation for DeployOp {
     type Response = DeployResponseWire;
 
     fn render_body(&self) -> MetadataResult<String> {
+        // The options are rendered first so their exact length is known
+        // before the buffer is sized. Everything after the encoded zip
+        // has to fit in the initial allocation: a reallocation here
+        // would copy a buffer already holding the base64 form of a
+        // documented-maximum 39 MB zip.
+        let mut opts = String::new();
+        render_deploy_options(&self.options, &mut opts);
+
         // Base64 expands to four characters per three input bytes,
         // rounded up to a whole quantum. Sizing the buffer for that up
-        // front and encoding straight into it keeps a
-        // documented-maximum 39 MB zip from being materialized a second
-        // time as a standalone encoded string.
+        // front and encoding straight into it keeps the zip from being
+        // materialized a second time as a standalone encoded string.
         let encoded_len = self.zip.len().div_ceil(3) * 4;
-        let mut out = String::with_capacity(encoded_len + 256);
+        let mut out = String::with_capacity(encoded_len + opts.len() + 128);
         out.push_str("<met:ZipFile>");
         base64::engine::general_purpose::STANDARD.encode_string(&self.zip, &mut out);
         out.push_str("</met:ZipFile><met:DeployOptions>");
-        render_deploy_options(&self.options, &mut out);
+        out.push_str(&opts);
         out.push_str("</met:DeployOptions>");
         Ok(out)
     }
@@ -585,6 +592,51 @@ mod tests {
         assert!(i_runtests < i_testlevel);
         assert!(body.contains("<met:runTests>MyTest</met:runTests>"));
         assert!(body.contains("<met:testLevel>RunLocalTests</met:testLevel>"));
+    }
+
+    #[test]
+    fn deploy_op_body_fits_its_initial_allocation() {
+        // A populated option set renders far longer than the tags that
+        // surround the encoded zip, so the buffer is sized from the
+        // rendered options rather than a fixed headroom. Growing it
+        // after the zip has been encoded into it would copy the whole
+        // base64 payload.
+        let opts = DeployOptions {
+            allow_missing_files: Some(true),
+            auto_update_package: Some(true),
+            check_only: Some(true),
+            ignore_warnings: Some(false),
+            perform_retrieve: Some(false),
+            purge_on_delete: Some(false),
+            rollback_on_error: Some(true),
+            run_tests: vec![
+                "AccountTriggerTest".into(),
+                "ContactTriggerTest".into(),
+                "OpportunityServiceTest".into(),
+            ],
+            single_package: Some(true),
+            test_level: Some(TestLevel::RunSpecifiedTests),
+        };
+
+        let mut rendered_opts = String::new();
+        render_deploy_options(&opts, &mut rendered_opts);
+        assert!(
+            rendered_opts.len() > 256,
+            "option set should be large enough to exercise the sizing"
+        );
+
+        let zip = vec![0x5a_u8; 4096];
+        let encoded_len = zip.len().div_ceil(3) * 4;
+        let op = DeployOp {
+            zip: Bytes::from(zip),
+            options: opts,
+        };
+        let body = op.render_body().unwrap();
+
+        // An untouched `String::with_capacity` reservation proves the
+        // buffer was never grown while it held the encoded zip.
+        assert_eq!(body.capacity(), encoded_len + rendered_opts.len() + 128);
+        assert!(body.contains(&rendered_opts));
     }
 
     #[test]
