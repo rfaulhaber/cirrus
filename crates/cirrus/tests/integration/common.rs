@@ -22,9 +22,9 @@
 //!   - `CIRRUS_INTEGRATION_USERNAME=...`
 //!   - `CIRRUS_INTEGRATION_CONSUMER_KEY=...`
 //!   - `CIRRUS_INTEGRATION_PRIVATE_KEY_PATH=...`
-//!   - `CIRRUS_INTEGRATION_LOGIN_URL=...` (typically
-//!     `https://login.salesforce.com` for production-tier login or
-//!     `https://test.salesforce.com` for sandboxes)
+//!   - `CIRRUS_INTEGRATION_LOGIN_URL=...` — `https://login.salesforce.com`
+//!     for Developer Edition and production-tier login; for a sandbox or
+//!     scratch org, that org's own My Domain login URL
 //!
 //! Variables can come from a `.env` file at the project root or from
 //! the shell. Shell takes precedence. `.env` should be gitignored —
