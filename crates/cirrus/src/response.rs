@@ -102,39 +102,73 @@ pub type OrgLimits = HashMap<String, Limit>;
 
 /// Snapshot of the `Sforce-Limit-Info` response header, parsed.
 ///
-/// Salesforce includes this header on most REST API responses to
-/// surface the org's near-real-time API call usage:
+/// Salesforce returns this header on every REST API request except calls
+/// to the Versions URI, to surface the org's near-real-time API usage. The
+/// value is a list of `key=used/allowed` directives:
 ///
 /// ```text
-/// Sforce-Limit-Info: api-usage=10/15000
+/// Sforce-Limit-Info: api-usage=10018/100000; api-bursts=1/750
+/// Sforce-Limit-Info: api-usage=10018/100000
 /// ```
 ///
 /// Populated automatically on every successful round-trip; the most
 /// recent value is reachable via [`crate::Cirrus::last_limit_info`].
 ///
-/// Only the `api-usage` key is modelled here. See [REST API Headers —
-/// Sforce-Limit-Info] for the upstream documentation.
+/// See [REST API Headers — Limit Info Header] for the upstream
+/// documentation.
 ///
-/// [REST API Headers — Sforce-Limit-Info]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_limit_info.htm
+/// [REST API Headers — Limit Info Header]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_api_usage.htm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitInfo {
     /// API calls used by this org in the current 24-hour rolling
-    /// window.
+    /// window (the first number of the `api-usage` directive).
     pub used: u32,
-    /// Daily API call allocation for this org.
+    /// Daily API call allocation for this org (the second number of
+    /// the `api-usage` directive).
     pub allowed: u32,
+    /// `(used, allowed)` from the `api-bursts` directive, which the
+    /// header reference shows in its example but does not describe.
+    /// `None` when the header carried no such directive.
+    pub bursts: Option<(u32, u32)>,
 }
 
 impl LimitInfo {
     /// Parses a raw `Sforce-Limit-Info` header value, e.g.
-    /// `"api-usage=10/15000"`. Returns `None` for any malformed shape
-    /// — typoed key, non-numeric counts, missing slash, etc.
+    /// `"api-usage=10018/100000; api-bursts=1/750"`.
+    ///
+    /// Directives are separated by `;` (or `,`, when an intermediary
+    /// folds repeated headers into one value) and unrecognized keys are
+    /// ignored, so a value carrying directives this SDK doesn't model
+    /// still yields the `api-usage` counts. Returns `None` when no
+    /// well-formed `api-usage` directive is present.
     pub fn parse(header_value: &str) -> Option<Self> {
-        let rest = header_value.trim().strip_prefix("api-usage=")?;
-        let (used, allowed) = rest.split_once('/')?;
-        let used = used.trim().parse::<u32>().ok()?;
-        let allowed = allowed.trim().parse::<u32>().ok()?;
-        Some(Self { used, allowed })
+        let mut usage = None;
+        let mut bursts = None;
+        for directive in header_value.split([';', ',']) {
+            let Some((key, value)) = directive.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "api-usage" => usage = Self::parse_pair(value),
+                "api-bursts" => bursts = Self::parse_pair(value),
+                _ => {}
+            }
+        }
+        let (used, allowed) = usage?;
+        Some(Self {
+            used,
+            allowed,
+            bursts,
+        })
+    }
+
+    /// Parses the `used/allowed` half of a single directive.
+    fn parse_pair(value: &str) -> Option<(u32, u32)> {
+        let (used, allowed) = value.split_once('/')?;
+        Some((
+            used.trim().parse::<u32>().ok()?,
+            allowed.trim().parse::<u32>().ok()?,
+        ))
     }
 
     /// Convenience: API calls remaining (`allowed - used`, saturating).
@@ -1656,6 +1690,45 @@ mod tests {
         assert_eq!(info.used, 42);
         assert_eq!(info.allowed, 15000);
         assert_eq!(info.remaining(), 14958);
+        assert_eq!(info.bursts, None);
+    }
+
+    #[test]
+    fn limit_info_parses_documented_multi_directive_header() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_api_usage.htm
+        // Example: Sforce-Limit-Info: api-usage=10018/100000; api-bursts=1/750
+        let info = LimitInfo::parse("api-usage=10018/100000; api-bursts=1/750").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.allowed, 100000);
+        assert_eq!(info.bursts, Some((1, 750)));
+
+        // The same page's second example carries only the api-usage
+        // directive.
+        let info = LimitInfo::parse("api-usage=10018/100000").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.allowed, 100000);
+        assert_eq!(info.bursts, None);
+    }
+
+    #[test]
+    fn limit_info_ignores_unknown_directives_and_directive_order() {
+        let info = LimitInfo::parse("api-bursts=1/750; api-usage=10018/100000").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.bursts, Some((1, 750)));
+
+        // A directive this SDK doesn't model must not sink the parse.
+        let info = LimitInfo::parse("some-future-key=1/2; api-usage=7/100").unwrap();
+        assert_eq!(info.used, 7);
+        assert_eq!(info.allowed, 100);
+        assert_eq!(info.bursts, None);
+    }
+
+    #[test]
+    fn limit_info_parses_comma_folded_directives() {
+        // Repeated headers folded into one value by an intermediary.
+        let info = LimitInfo::parse("api-usage=10018/100000, api-bursts=1/750").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.bursts, Some((1, 750)));
     }
 
     #[test]
@@ -1677,6 +1750,8 @@ mod tests {
         assert_eq!(LimitInfo::parse(""), None);
         // Negative — not parseable as u32.
         assert_eq!(LimitInfo::parse("api-usage=-5/100"), None);
+        // A well-formed burst directive alone carries no usage counts.
+        assert_eq!(LimitInfo::parse("api-bursts=1/750"), None);
     }
 
     #[test]
@@ -1686,6 +1761,7 @@ mod tests {
         let info = LimitInfo {
             used: 100,
             allowed: 50,
+            bursts: None,
         };
         assert_eq!(info.remaining(), 0);
     }
