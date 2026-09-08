@@ -92,7 +92,7 @@ impl SObjectsHandler<'_> {
         let date = http_date(since)?;
         let (status, bytes) = self
             .client
-            .send_with_headers(
+            .send_with_headers_raw(
                 reqwest::Method::GET,
                 "sobjects",
                 None,
@@ -163,7 +163,7 @@ impl<'a> SObjectHandler<'a> {
         since: SystemTime,
     ) -> CirrusResult<Option<R>> {
         // versioned_segments produces an absolute URL, which
-        // send_with_headers' three-mode path resolution passes
+        // send_with_headers_raw's three-mode path resolution passes
         // through verbatim.
         let url = self
             .client
@@ -171,7 +171,7 @@ impl<'a> SObjectHandler<'a> {
         let date = http_date(since)?;
         let (status, bytes) = self
             .client
-            .send_with_headers(
+            .send_with_headers_raw(
                 reqwest::Method::GET,
                 &url,
                 None,

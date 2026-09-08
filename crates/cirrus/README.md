@@ -150,12 +150,12 @@ and `Cirrus::builder().build()` fails outright on an `http://` instance URL.
 deliberate plaintext hop, such as a recording proxy on a trusted network.
 
 Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
-`Sforce-Query-Options`, …) go through `send_with_headers_as`, which keeps retry,
+`Sforce-Query-Options`, …) go through `send_with_headers`, which keeps retry,
 the 401 auto-refresh and the `Sforce-Limit-Info` capture:
 
 ```rust,ignore
 let created: Value = sf
-    .send_with_headers_as(
+    .send_with_headers(
         Method::POST,
         "sobjects/Lead",
         None,

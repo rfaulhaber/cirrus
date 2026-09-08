@@ -386,7 +386,7 @@ impl Cirrus {
     /// # let sf = Cirrus::builder().auth(auth).build()?;
     /// // Create a Lead without running the org's assignment rules.
     /// let created: Value = sf
-    ///     .send_with_headers_as(
+    ///     .send_with_headers(
     ///         cirrus::reqwest::Method::POST,
     ///         "sobjects/Lead",
     ///         None,
@@ -398,7 +398,7 @@ impl Cirrus {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_with_headers_as<R, B>(
+    pub async fn send_with_headers<R, B>(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -524,7 +524,7 @@ impl Cirrus {
     ///   stops advancing.
     ///
     /// To add Salesforce request headers and keep all of that, use
-    /// [`Self::send_with_headers_as`]; for a plain typed call, one of
+    /// [`Self::send_with_headers`]; for a plain typed call, one of
     /// the verb methods ([`Self::get`], [`Self::post`], …).
     pub async fn request_builder(
         &self,
@@ -938,7 +938,7 @@ impl Cirrus {
     /// **Treats both 2xx and 304 as success** — they're returned as
     /// `Ok((status, bytes))` for the caller to dispatch. Other non-2xx
     /// statuses go through the normal error parsing.
-    pub(crate) async fn send_with_headers(
+    pub(crate) async fn send_with_headers_raw(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -1533,7 +1533,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn send_with_headers_as_attaches_salesforce_request_headers() {
+        async fn send_with_headers_attaches_salesforce_request_headers() {
             // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_autoassign.htm
             // "Field name: Sforce-Auto-Assign ... If the header is not
             // provided in the request, the default value is TRUE."
@@ -1553,7 +1553,7 @@ mod tests {
 
             let sf = server_fixture(server.uri());
             let created: Value = sf
-                .send_with_headers_as(
+                .send_with_headers(
                     reqwest::Method::POST,
                     "sobjects/Lead",
                     None,
@@ -1566,7 +1566,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn send_with_headers_as_keeps_the_retry_policy() {
+        async fn send_with_headers_keeps_the_retry_policy() {
             // The point of the method over request_builder: a
             // header-carrying call still gets retry, 401 refresh and
             // Sforce-Limit-Info capture.
@@ -1600,7 +1600,7 @@ mod tests {
                 .build()
                 .unwrap();
             let result: Value = sf
-                .send_with_headers_as::<_, ()>(
+                .send_with_headers::<_, ()>(
                     reqwest::Method::GET,
                     "query",
                     Some(&[("q", "SELECT Id FROM Account")]),
