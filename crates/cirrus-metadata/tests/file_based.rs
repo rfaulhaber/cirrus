@@ -463,6 +463,54 @@ async fn check_deploy_status_surfaces_the_post_deploy_retrieve_result() {
     assert_eq!(&retrieved.zip_bytes().unwrap().unwrap()[..], b"PKzip");
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+/// The RetrieveResult table marks only `done` as "Required"; `id`
+/// ("ID of the component being retrieved") carries no such marker, so
+/// a nested post-deploy retrieveResult without it still has to parse
+/// instead of failing the whole checkDeployStatus response.
+#[tokio::test]
+async fn check_deploy_status_accepts_a_post_deploy_retrieve_result_without_an_id() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000noretrid</id>
+        <done>true</done>
+        <success>true</success>
+        <status>Succeeded</status>
+        <details>
+          <retrieveResult>
+            <done>true</done>
+            <status>Succeeded</status>
+            <success>true</success>
+          </retrieveResult>
+        </details>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .check_deploy_status("0Af00000noretrid", true)
+        .await
+        .unwrap();
+    assert_eq!(result.id, "0Af00000noretrid");
+    let retrieved = result.details.unwrap().retrieve_result.unwrap();
+    assert!(retrieved.id.is_empty());
+    assert!(retrieved.done);
+    assert_eq!(retrieved.status, Some(RetrieveStatus::Succeeded));
+}
+
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
 /// DeployOptions defines both `performRetrieve` and
 /// `autoUpdatePackage`; neither is reserved on the SOAP endpoint.

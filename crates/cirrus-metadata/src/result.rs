@@ -509,6 +509,12 @@ pub struct RetrieveRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveResult {
+    /// ID of the retrieve request. `done` is the only field Salesforce
+    /// documents as required on this object, so an omitted `id` reads
+    /// back as an empty string rather than failing the call —
+    /// including when this result arrives nested in
+    /// [`DeployDetails::retrieve_result`].
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub done: bool,
