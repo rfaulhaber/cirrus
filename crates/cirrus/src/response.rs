@@ -603,12 +603,17 @@ impl ApiVersion {
     }
 
     /// Returns the highest-numbered [`ApiVersion`] in `versions`,
-    /// comparing by `(major, minor)` rather than lexically. Versions
-    /// that fail to parse compare as the smallest.
+    /// comparing by `(major, minor)` rather than lexically.
     ///
-    /// Returns `None` if the slice is empty.
+    /// Entries whose [`version`](Self::version) isn't a `major.minor`
+    /// pair are ignored, so the returned entry always carries a version
+    /// string usable as a `vXX.X` path segment. Returns `None` when the
+    /// slice is empty or holds nothing parseable.
     pub fn latest(versions: &[Self]) -> Option<&Self> {
-        versions.iter().max_by_key(|v| v.version_number())
+        versions
+            .iter()
+            .filter(|v| v.version_number().is_some())
+            .max_by_key(|v| v.version_number())
     }
 }
 

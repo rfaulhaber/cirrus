@@ -2,8 +2,14 @@
 //!
 //! This is the simplest endpoint Salesforce exposes: it returns a JSON array
 //! of [`ApiVersion`] entries describing every API version available on the
-//! org. It does require auth (a bearer token), but lives outside the
-//! versioned `/services/data/{version}` tree.
+//! org. It lives outside the versioned `/services/data/{version}` tree and,
+//! per the [Versions] resource reference, needs no authentication —
+//! [`Cirrus::versions`] still sends the configured bearer token because it
+//! shares the standard send path, so it needs a working credential like any
+//! other call. To reach the endpoint before credentials are available, use
+//! [`Cirrus::execute`], which sends a caller-built request untouched.
+//!
+//! [Versions]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_versions.htm
 
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
@@ -26,8 +32,10 @@ impl Cirrus {
     /// the rest of the SDK expects).
     ///
     /// Comparison is numeric — sorted by `(major, minor)`, not
-    /// lexically. Errors if the org returns no parseable versions
-    /// (shouldn't happen for a real Salesforce org).
+    /// lexically. Entries whose `version` isn't a `major.minor` pair are
+    /// skipped; if that leaves nothing, this errors with
+    /// [`CirrusError::InvalidResponse`] rather than handing back a
+    /// version segment the org can't resolve.
     ///
     /// For one-shot bootstrapping at client-construction time, prefer
     /// [`CirrusBuilder::build_with_latest_version`] which combines
@@ -156,6 +164,95 @@ mod tests {
     #[test]
     fn latest_returns_none_for_empty_slice() {
         assert!(crate::ApiVersion::latest(&[]).is_none());
+    }
+
+    #[test]
+    fn latest_skips_unparseable_entries() {
+        let versions = vec![
+            crate::ApiVersion {
+                label: "x".into(),
+                url: "/x".into(),
+                version: "not-a-version".into(),
+            },
+            crate::ApiVersion {
+                label: "Spring '26".into(),
+                url: "/services/data/v66.0".into(),
+                version: "66.0".into(),
+            },
+            crate::ApiVersion {
+                label: "y".into(),
+                url: "/y".into(),
+                version: "latest".into(),
+            },
+        ];
+        let latest = crate::ApiVersion::latest(&versions).unwrap();
+        assert_eq!(latest.version, "66.0");
+    }
+
+    #[test]
+    fn latest_returns_none_when_nothing_parses() {
+        let versions = vec![
+            crate::ApiVersion {
+                label: "x".into(),
+                url: "/x".into(),
+                version: "not-a-version".into(),
+            },
+            crate::ApiVersion {
+                label: "y".into(),
+                url: "/y".into(),
+                version: "latest".into(),
+            },
+        ];
+        assert!(crate::ApiVersion::latest(&versions).is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_api_version_errors_when_no_entry_parses() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "x", "url": "/services/data/latest", "version": "latest"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder().auth(auth).build().unwrap();
+
+        match sf.latest_api_version().await.unwrap_err() {
+            crate::CirrusError::InvalidResponse(msg) => {
+                assert!(msg.contains("no parseable API versions"), "got {msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_with_latest_version_rejects_an_unparseable_version_list() {
+        // A garbage version must fail at construction rather than being
+        // installed as the client's `vXX.X` path segment.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "x", "url": "/services/data/latest", "version": "latest"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let err = Cirrus::builder()
+            .auth(auth)
+            .build_with_latest_version()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::CirrusError::InvalidResponse(_)),
+            "expected InvalidResponse, got {err:?}"
+        );
     }
 
     #[tokio::test]
