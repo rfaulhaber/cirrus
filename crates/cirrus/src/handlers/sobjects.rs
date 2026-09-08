@@ -81,9 +81,10 @@ impl SObjectsHandler<'_> {
     /// response.
     ///
     /// `since` is formatted as RFC 7231 IMF-fixdate (e.g.
-    /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) before being sent. Times
-    /// outside the range that format can express return
-    /// [`CirrusError::InvalidHeader`] — see [`http_date`].
+    /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) before being sent. A `since`
+    /// before the Unix epoch, or in year 9999 or later, can't be
+    /// expressed in that format and returns
+    /// [`CirrusError::InvalidHeader`].
     pub async fn describe_global_if_modified_since(
         &self,
         since: SystemTime,
