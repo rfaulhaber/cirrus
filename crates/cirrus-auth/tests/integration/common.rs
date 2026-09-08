@@ -22,6 +22,11 @@
 //!   - `CIRRUS_INTEGRATION_LOGIN_URL=...`
 //!
 //! See `.env.example` at the repo root for the full template.
+//!
+//! `INSTANCE_URL` and `LOGIN_URL` must both be `https`, and
+//! `CIRRUS_INTEGRATION_FORCE=1` does not waive that — a bearer token or
+//! a signed JWT assertion on a plaintext request is disclosed to the
+//! network.
 
 #![allow(dead_code)] // helper functions used by sibling test modules
 
@@ -44,17 +49,32 @@ const SAFE_PARTITIONS: &[&str] = &[
     ".trailblaze.my.salesforce.com",
 ];
 
-/// Anchored to the parsed host — substring matching over the whole URL
-/// would let a production instance through if a safe-partition string
-/// appeared in the path or query.
+/// Requires `https` and anchors the host check to the parsed host —
+/// substring matching over the whole URL would let a production instance
+/// through if a safe-partition string appeared in the path or query.
 pub fn is_safe_test_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    if parsed.scheme() != "https" {
+        return false;
+    }
     let Some(host) = parsed.host_str() else {
         return false;
     };
     SAFE_PARTITIONS.iter().any(|p| host.ends_with(p))
+}
+
+/// Every credential this harness handles — org session ids, signed JWT
+/// assertions, the connected app's consumer key — is a bearer secret,
+/// and RFC 6750 §5.3 requires TLS for any request that carries one.
+fn requires_https(env_key: &str, url: &str) {
+    let is_https = url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "https");
+    assert!(
+        is_https,
+        "{env_key} ({url}) must be an https URL — the credentials this \
+         harness sends must not cross the network in the clear.",
+    );
 }
 
 fn load_dotenv() {
@@ -77,11 +97,16 @@ pub fn try_instance_url() -> Option<String> {
 
     let instance_url = std::env::var(ENV_INSTANCE_URL).ok()?;
 
+    // `FORCE` waives the org classification below, never transport
+    // security, so the scheme is checked separately from the safe-list.
+    requires_https(ENV_INSTANCE_URL, &instance_url);
+
     let force = std::env::var(ENV_FORCE).ok().as_deref() == Some("1");
     if !is_safe_test_url(&instance_url) && !force {
         eprintln!(
             "REFUSING TO RUN: {ENV_INSTANCE_URL} ({instance_url}) doesn't match a known \
-             sandbox/dev/scratch pattern. Set {ENV_FORCE}=1 to override.",
+             https sandbox/dev/scratch pattern. Set {ENV_FORCE}=1 to override the \
+             host check.",
         );
         return None;
     }
@@ -118,6 +143,8 @@ pub async fn try_init_jwt_auth() -> Option<JwtAuth> {
     let consumer_key = std::env::var(ENV_CONSUMER_KEY).ok()?;
     let private_key_path = std::env::var(ENV_PRIVATE_KEY_PATH).ok()?;
     let login_url = std::env::var(ENV_LOGIN_URL).ok()?;
+
+    requires_https(ENV_LOGIN_URL, &login_url);
 
     let builder = match JwtAuth::builder()
         .consumer_key(consumer_key)
@@ -161,4 +188,55 @@ pub async fn ping_with_token(instance_url: &str, token: &str) -> reqwest::Result
         .send()
         .await?;
     Ok(resp.status().as_u16())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_test_url;
+
+    #[test]
+    fn url_classifier_accepts_known_safe_partitions() {
+        assert!(is_safe_test_url(
+            "https://acme--sandbox1.sandbox.my.salesforce.com"
+        ));
+        assert!(is_safe_test_url(
+            "https://my-trailhead-playground.develop.my.salesforce.com"
+        ));
+        assert!(is_safe_test_url(
+            "https://test-7emx29.scratch.my.salesforce.com"
+        ));
+        assert!(is_safe_test_url(
+            "https://cunning-bear-jezk1j-dev-ed.trailblaze.my.salesforce.com"
+        ));
+    }
+
+    #[test]
+    fn url_classifier_refuses_plaintext_http() {
+        assert!(!is_safe_test_url("http://acme.develop.my.salesforce.com"));
+        assert!(!is_safe_test_url(
+            "http://acme--sandbox1.sandbox.my.salesforce.com"
+        ));
+    }
+
+    #[test]
+    fn url_classifier_refuses_production_my_domain() {
+        assert!(!is_safe_test_url("https://acme.my.salesforce.com"));
+        // Pre-Enhanced-Domains sandbox URLs lack the .sandbox. infix.
+        assert!(!is_safe_test_url(
+            "https://acme--sandbox1.my.salesforce.com"
+        ));
+    }
+
+    #[test]
+    fn url_classifier_refuses_safe_partition_outside_host() {
+        // The safe-partition string appearing in the path, query, or a
+        // deceptive subdomain prefix must not satisfy the guard — only
+        // the actual host counts.
+        assert!(!is_safe_test_url(
+            "https://acme.my.salesforce.com/?x=.sandbox.my.salesforce.com"
+        ));
+        assert!(!is_safe_test_url(
+            "https://acme.my.salesforce.com.sandbox.my.salesforce.evil.example"
+        ));
+    }
 }

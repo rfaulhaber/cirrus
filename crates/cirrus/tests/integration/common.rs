@@ -47,6 +47,11 @@
 //! to override. Set this only when you've verified the target org is
 //! safe for destructive write operations.
 //!
+//! `INSTANCE_URL` and `LOGIN_URL` must both be `https`, and
+//! `CIRRUS_INTEGRATION_FORCE=1` does not waive that — a bearer token or
+//! a signed JWT assertion on a plaintext request is disclosed to the
+//! network.
+//!
 //! [enh]: https://help.salesforce.com/s/articleView?id=000393816
 
 #![allow(dead_code)] // helper functions used by sibling test modules
@@ -77,21 +82,36 @@ const SAFE_PARTITIONS: &[&str] = &[
     ".trailblaze.my.salesforce.com",
 ];
 
-/// Returns true if the URL matches a known-safe sandbox/dev/scratch
-/// pattern. Used to gate write-capable integration tests away from
-/// production My Domains.
+/// Returns true if the URL is `https` and its host matches a known-safe
+/// sandbox/dev/scratch pattern. Used to gate write-capable integration
+/// tests away from production My Domains.
 ///
-/// The check is anchored to the parsed URL's host — a plain substring
-/// match over the whole URL would let a production instance through if
-/// a safe-partition string appeared in the path or query.
+/// The host check is anchored to the parsed URL's host — a plain
+/// substring match over the whole URL would let a production instance
+/// through if a safe-partition string appeared in the path or query.
 pub fn is_safe_test_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    if parsed.scheme() != "https" {
+        return false;
+    }
     let Some(host) = parsed.host_str() else {
         return false;
     };
     SAFE_PARTITIONS.iter().any(|p| host.ends_with(p))
+}
+
+/// Every credential this harness handles — org session ids, signed JWT
+/// assertions, the connected app's consumer key — is a bearer secret,
+/// and RFC 6750 §5.3 requires TLS for any request that carries one.
+fn requires_https(env_key: &str, url: &str) {
+    let is_https = url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "https");
+    assert!(
+        is_https,
+        "{env_key} ({url}) must be an https URL — the credentials this \
+         harness sends must not cross the network in the clear.",
+    );
 }
 
 /// Loads a `.env` from the project root once per test process. Idempotent.
@@ -125,15 +145,19 @@ pub async fn try_init_client() -> Option<Cirrus> {
         return None;
     };
 
+    // `FORCE` waives the org classification below, never transport
+    // security, so the scheme is checked separately from the safe-list.
+    requires_https(ENV_INSTANCE_URL, &instance_url);
+
     let force = std::env::var(ENV_FORCE).ok().as_deref() == Some("1");
     if !is_safe_test_url(&instance_url) && !force {
         eprintln!(
             "REFUSING TO RUN: {ENV_INSTANCE_URL} ({instance_url}) doesn't match a known \
              sandbox/dev/scratch pattern. Expected one of: \
              *.sandbox.my.salesforce.com, *.develop.my.salesforce.com, \
-             *.scratch.my.salesforce.com, *.trailblaze.my.salesforce.com. \
-             Set {ENV_FORCE}=1 to override — but verify the org is safe \
-             for destructive writes first.",
+             *.scratch.my.salesforce.com, *.trailblaze.my.salesforce.com, \
+             all over https. Set {ENV_FORCE}=1 to override the host check \
+             — but verify the org is safe for destructive writes first.",
         );
         return None;
     }
@@ -161,6 +185,8 @@ async fn build_auth(instance_url: &str) -> Option<SharedAuth> {
     let consumer_key = std::env::var(ENV_CONSUMER_KEY).ok()?;
     let private_key_path = std::env::var(ENV_PRIVATE_KEY_PATH).ok()?;
     let login_url = std::env::var(ENV_LOGIN_URL).ok()?;
+
+    requires_https(ENV_LOGIN_URL, &login_url);
 
     let builder = match JwtAuth::builder()
         .consumer_key(consumer_key)
@@ -208,6 +234,14 @@ mod tests {
         // signup use the .trailblaze. partition with a -dev-ed subdomain.
         assert!(is_safe_test_url(
             "https://cunning-bear-jezk1j-dev-ed.trailblaze.my.salesforce.com"
+        ));
+    }
+
+    #[test]
+    fn url_classifier_refuses_plaintext_http() {
+        assert!(!is_safe_test_url("http://acme.develop.my.salesforce.com"));
+        assert!(!is_safe_test_url(
+            "http://acme--sandbox1.sandbox.my.salesforce.com"
         ));
     }
 
