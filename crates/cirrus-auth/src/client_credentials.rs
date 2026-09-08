@@ -33,7 +33,10 @@
 
 use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
-use crate::token_endpoint::{check_instance_url, exchange, token_is_fresh};
+use crate::token_endpoint::{
+    check_instance_url, default_http_client, exchange, normalize_url, require_secure_login_url,
+    token_is_fresh,
+};
 use async_trait::async_trait;
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
@@ -230,21 +233,25 @@ impl ClientCredentialsAuthBuilder {
     /// must be the org's My Domain URL (e.g.
     /// `https://my-org.my.salesforce.com`). Salesforce explicitly rejects
     /// this flow at `https://login.salesforce.com` and
-    /// `https://test.salesforce.com`.
+    /// `https://test.salesforce.com`. Must be `https` (loopback hosts
+    /// excepted, for local test servers).
     pub fn login_url(mut self, url: impl Into<String>) -> Self {
         self.login_url = Some(url.into());
         self
     }
 
     /// REST instance URL — the org's My Domain. Required. Must match the
-    /// `instance_url` returned by the token-exchange response.
+    /// `instance_url` returned by the token-exchange response (compared
+    /// after trailing slashes are trimmed, ignoring ASCII case).
     pub fn instance_url(mut self, url: impl Into<String>) -> Self {
         self.instance_url = Some(url.into());
         self
     }
 
-    /// How long to cache an access token before re-minting. Defaults to 30
-    /// minutes.
+    /// Upper bound on how long an access token is cached before
+    /// re-minting. Defaults to 30 minutes. Raising it does not extend a
+    /// token past a shorter `expires_in` advertised by the token
+    /// endpoint, which always wins.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.token_ttl = Some(ttl);
         self
@@ -252,6 +259,11 @@ impl ClientCredentialsAuthBuilder {
 
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool.
+    ///
+    /// The client built by default applies connect and request timeouts
+    /// and refuses to follow redirects, so a redirect cannot replay the
+    /// consumer secret to another host. A client supplied here replaces
+    /// those defaults wholesale — configure both on it.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -265,18 +277,18 @@ impl ClientCredentialsAuthBuilder {
         let consumer_secret = self
             .consumer_secret
             .ok_or(AuthError::MissingField("consumer_secret"))?;
-        let mut instance_url = self
-            .instance_url
-            .ok_or(AuthError::MissingField("instance_url"))?;
-        if instance_url.ends_with('/') {
-            instance_url.pop();
-        }
-        let mut login_url = self.login_url.ok_or(AuthError::MissingField("login_url"))?;
-        if login_url.ends_with('/') {
-            login_url.pop();
-        }
+        let instance_url = normalize_url(
+            &self
+                .instance_url
+                .ok_or(AuthError::MissingField("instance_url"))?,
+        );
+        let login_url = normalize_url(&self.login_url.ok_or(AuthError::MissingField("login_url"))?);
+        require_secure_login_url(&login_url)?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
-        let http = self.http_client.unwrap_or_default();
+        let http = match self.http_client {
+            Some(client) => client,
+            None => default_http_client()?,
+        };
 
         Ok(ClientCredentialsAuth {
             consumer_key,
@@ -355,7 +367,7 @@ mod tests {
     #[test]
     fn builder_strips_trailing_slashes_on_login_and_instance_url() {
         let auth = builder_with_required_fields()
-            .instance_url("https://my-org.my.salesforce.com/")
+            .instance_url("https://my-org.my.salesforce.com//")
             .login_url("https://my-org.my.salesforce.com/")
             .build()
             .unwrap();
@@ -458,7 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_expires_in_overrides_configured_ttl() {
+    async fn shorter_server_expires_in_wins_over_configured_ttl() {
         // The response advertises a 1-second lifetime while the configured
         // TTL is the 30-minute default. The short server-advertised lifetime
         // must win, putting the token immediately inside the refresh margin
@@ -488,6 +500,51 @@ mod tests {
         let _ = auth.access_token().await.unwrap();
         let _ = auth.access_token().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn longer_server_expires_in_does_not_extend_configured_ttl() {
+        // The mirror case: the endpoint advertises two hours while the
+        // caller pinned the cache to 30 seconds because the org's session
+        // policy is short. Honouring the server value would keep shipping
+        // a dead token until the advertised lifetime elapsed, so the
+        // configured bound has to win.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok",
+                    "instance_url": "https://my-org.my.salesforce.com",
+                    "expires_in": 7200
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            // Shorter than the 60s refresh margin, so a token cached for
+            // this long is always already stale.
+            .token_ttl(Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        let _ = auth.access_token().await.unwrap();
+        let _ = auth.access_token().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_cleartext_login_url() {
+        let err = builder_with_required_fields()
+            .login_url("http://my-org.my.salesforce.com")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -538,7 +595,10 @@ mod tests {
             .unwrap();
 
         let err = auth.access_token().await.unwrap_err();
-        assert!(matches!(err, AuthError::Other(_)));
+        assert!(
+            matches!(err, AuthError::InstanceUrlMismatch { .. }),
+            "{err:?}"
+        );
     }
 
     /// Counts invocations and returns a fixed response. Same shape as the

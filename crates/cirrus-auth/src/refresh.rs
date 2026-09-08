@@ -1,10 +1,26 @@
 //! OAuth 2.0 Refresh Token grant for long-lived Salesforce sessions.
 //!
 //! Several Salesforce OAuth flows hand back a `refresh_token` alongside
-//! the initial access token. Refresh tokens are long-lived and can be
-//! exchanged for fresh access tokens indefinitely (until revoked). This
-//! module wraps that grant in an [`AuthSession`] so the rest of the SDK
-//! doesn't care which flow originally produced the refresh token.
+//! the initial access token. This module wraps that grant in an
+//! [`AuthSession`] so the rest of the SDK doesn't care which flow
+//! originally produced the refresh token.
+//!
+//! ## Refresh token lifetime
+//!
+//! How long a refresh token keeps working is an org policy, not a
+//! property of the token. The connected app's `refreshTokenPolicy` is a
+//! required setting with four options: `infinite` (the default — valid
+//! until revoked), `zero`, a fixed `specific_lifetime:n:HOURS|DAYS|MONTHS`,
+//! or a sliding `specific_inactivity:n:HOURS|DAYS|MONTHS` window. So a
+//! refresh token can also die by exceeding its lifetime, by going unused
+//! past the inactivity window, or — under Refresh Token Rotation — by
+//! being superseded.
+//!
+//! All of those surface identically: the grant fails with
+//! [`AuthError::OAuth`] carrying `invalid_grant`. This session records no
+//! terminal state, so the next call retries the same doomed grant. Treat a
+//! persistent `invalid_grant` here as "the user must re-authorize" rather
+//! than as a transient fault, and alert on it.
 //!
 //! ## Usage
 //!
@@ -28,8 +44,8 @@
 //! Rotation is server-controlled — when it is enabled the session adopts
 //! each replacement transparently and keeps working. When it is disabled
 //! (the default for classic Connected Apps) refresh responses carry no new
-//! token and the original is reused indefinitely, so non-rotating orgs are
-//! unaffected.
+//! token and the original keeps being reused for as long as the org's
+//! `refreshTokenPolicy` allows, so non-rotating orgs are unaffected.
 //!
 //! Adopting a rotated token in memory is enough for a process that holds
 //! one session for its whole lifetime. Consumers that **persist** the
@@ -47,6 +63,15 @@
 //! (Minting spawns onto the ambient Tokio runtime — already required by
 //! this crate's HTTP stack — and panics outside one.)
 //!
+//! The flip side is that a detached mint holds the session's write lock
+//! until it finishes, and abandoning the caller's future does not shorten
+//! that. What bounds it is the token-endpoint client's own timeout, which
+//! the default client sets. A client supplied through
+//! [`RefreshTokenAuthBuilder::http_client`] with no timeouts of its own
+//! reintroduces the unbounded case: against an endpoint that accepts the
+//! connection and never answers, every concurrent `access_token` and
+//! `invalidate` on this session blocks for as long as the stall lasts.
+//!
 //! Because reusing a rotated-away token revokes the whole family, one
 //! stored token must back exactly one session: share a single
 //! `Arc<RefreshTokenAuth>` across clients rather than building several
@@ -54,7 +79,10 @@
 
 use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
-use crate::token_endpoint::{check_instance_url, exchange, token_is_fresh};
+use crate::token_endpoint::{
+    check_instance_url, default_http_client, exchange, normalize_url, require_secure_login_url,
+    token_is_fresh,
+};
 use async_trait::async_trait;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -173,7 +201,8 @@ impl RefreshTokenAuth {
     /// Refresh-token grant (RFC 6749 §6): once an access token is
     /// obtained through any flow that issues a refresh token (typically
     /// Web Server with PKCE), use that refresh token to mint new access
-    /// tokens at will. The refresh token itself is long-lived.
+    /// tokens for as long as the connected app's `refreshTokenPolicy`
+    /// keeps it valid — see the [module docs](self) for what ends that.
     ///
     /// # Example
     ///
@@ -301,9 +330,19 @@ impl AuthSession for RefreshTokenAuth {
         });
         match task.await {
             Ok(result) => result.map(Cow::Owned),
-            Err(join_error) => Err(AuthError::Other(format!(
-                "token mint task failed: {join_error}"
-            ))),
+            // Report only *that* the task failed. `JoinError`'s `Display`
+            // embeds the panic payload verbatim, and the one piece of
+            // caller code running inside the task is
+            // `RotationHandler::on_rotation`, whose argument is a live
+            // refresh token — a handler that panics with that value in its
+            // message would put it into an error that every other path in
+            // this crate would have redacted.
+            Err(join_error) if join_error.is_panic() => {
+                Err(AuthError::Other("token mint task panicked".to_string()))
+            }
+            Err(_) => Err(AuthError::Other(
+                "token mint task did not run to completion".to_string(),
+            )),
         }
     }
 
@@ -402,21 +441,25 @@ impl RefreshTokenAuthBuilder {
 
     /// Login URL — the host that issued the refresh token. Defaults to
     /// [`PRODUCTION_LOGIN_URL`]. Use [`SANDBOX_LOGIN_URL`] for sandboxes,
-    /// or your org's My Domain login URL where required.
+    /// or your org's My Domain login URL where required. Must be `https`
+    /// (loopback hosts excepted, for local test servers).
     pub fn login_url(mut self, url: impl Into<String>) -> Self {
         self.login_url = Some(url.into());
         self
     }
 
     /// REST instance URL — the org's My Domain. Required. Must match the
-    /// `instance_url` returned by the token-exchange response.
+    /// `instance_url` returned by the token-exchange response (compared
+    /// after trailing slashes are trimmed, ignoring ASCII case).
     pub fn instance_url(mut self, url: impl Into<String>) -> Self {
         self.instance_url = Some(url.into());
         self
     }
 
-    /// How long to cache an access token before re-minting. Defaults to 30
-    /// minutes.
+    /// Upper bound on how long an access token is cached before
+    /// re-minting. Defaults to 30 minutes. Raising it does not extend a
+    /// token past a shorter `expires_in` advertised by the token
+    /// endpoint, which always wins.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.token_ttl = Some(ttl);
         self
@@ -424,6 +467,16 @@ impl RefreshTokenAuthBuilder {
 
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool.
+    ///
+    /// The client built by default applies connect and request timeouts
+    /// and refuses to follow redirects, so a stalled endpoint cannot park
+    /// a mint indefinitely and a redirect cannot replay the refresh token
+    /// to another host. A client supplied here replaces those defaults
+    /// wholesale: without its own timeouts, a token endpoint that accepts
+    /// the connection and never answers blocks every concurrent
+    /// [`access_token`](crate::AuthSession::access_token) and
+    /// [`invalidate`](crate::AuthSession::invalidate) call on this session
+    /// for as long as it stalls.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -437,20 +490,22 @@ impl RefreshTokenAuthBuilder {
         let refresh_token = self
             .refresh_token
             .ok_or(AuthError::MissingField("refresh_token"))?;
-        let mut instance_url = self
-            .instance_url
-            .ok_or(AuthError::MissingField("instance_url"))?;
-        if instance_url.ends_with('/') {
-            instance_url.pop();
-        }
-        let mut login_url = self
-            .login_url
-            .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string());
-        if login_url.ends_with('/') {
-            login_url.pop();
-        }
+        let instance_url = normalize_url(
+            &self
+                .instance_url
+                .ok_or(AuthError::MissingField("instance_url"))?,
+        );
+        let login_url = normalize_url(
+            &self
+                .login_url
+                .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string()),
+        );
+        require_secure_login_url(&login_url)?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
-        let http = self.http_client.unwrap_or_default();
+        let http = match self.http_client {
+            Some(client) => client,
+            None => default_http_client()?,
+        };
 
         Ok(RefreshTokenAuth {
             config: Arc::new(MintConfig {
@@ -519,11 +574,20 @@ mod tests {
     #[test]
     fn builder_strips_trailing_slashes_and_defaults_login_url() {
         let auth = builder_with_required_fields()
-            .instance_url("https://my-org.my.salesforce.com/")
+            .instance_url("https://my-org.my.salesforce.com//")
             .build()
             .unwrap();
         assert_eq!(auth.instance_url(), "https://my-org.my.salesforce.com");
         assert_eq!(auth.config.login_url, PRODUCTION_LOGIN_URL);
+    }
+
+    #[test]
+    fn builder_rejects_cleartext_login_url() {
+        let err = builder_with_required_fields()
+            .login_url("http://my-org.my.salesforce.com")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -700,11 +764,8 @@ mod tests {
 
         let err = auth.access_token().await.unwrap_err();
         match &err {
-            AuthError::Other(msg) => {
-                assert!(msg.contains("502"));
-                assert!(!msg.contains("LEAKED_SECRET"), "raw body leaked: {msg}");
-            }
-            other => panic!("expected Other, got {other:?}"),
+            AuthError::UnexpectedResponse { status } => assert_eq!(*status, 502),
+            other => panic!("expected UnexpectedResponse, got {other:?}"),
         }
         // Neither Display nor Debug should surface the body either.
         assert!(!format!("{err}").contains("LEAKED_SECRET"));
@@ -729,7 +790,10 @@ mod tests {
             .unwrap();
 
         let err = auth.access_token().await.unwrap_err();
-        assert!(matches!(err, AuthError::Other(_)));
+        assert!(
+            matches!(err, AuthError::InstanceUrlMismatch { .. }),
+            "{err:?}"
+        );
     }
 
     /// Counts invocations and returns a fixed response. Same as the JWT
@@ -1027,7 +1091,7 @@ mod tests {
 
         let err = auth.access_token().await.unwrap_err();
         assert!(
-            matches!(err, AuthError::Other(_)),
+            matches!(err, AuthError::InstanceUrlMismatch { .. }),
             "expected mismatch error, got {err:?}"
         );
         assert_eq!(
@@ -1118,13 +1182,15 @@ mod tests {
         );
     }
 
-    /// Panics when notified — drives the mint task's panic-recovery path.
+    /// Panics when notified, with the live refresh token in the payload —
+    /// drives the mint task's panic-recovery path and proves the payload
+    /// never reaches the returned error.
     struct PanickingHandler;
 
     #[async_trait]
     impl RotationHandler for PanickingHandler {
-        async fn on_rotation(&self, _new_refresh_token: &str) {
-            panic!("handler panic");
+        async fn on_rotation(&self, new_refresh_token: &str) {
+            panic!("failed to persist refresh token {new_refresh_token}");
         }
     }
 
@@ -1147,6 +1213,17 @@ mod tests {
         assert!(
             matches!(err, AuthError::Other(_)),
             "handler panic must surface as an AuthError, got {err:?}"
+        );
+        // tokio's `JoinError: Display` embeds the panic payload verbatim.
+        // Formatting it into the error would put the rotated refresh token
+        // into any log that prints the failure.
+        assert!(
+            !format!("{err}").contains("R2"),
+            "panic payload leaked into Display: {err}"
+        );
+        assert!(
+            !format!("{err:?}").contains("R2"),
+            "panic payload leaked into Debug: {err:?}"
         );
 
         // R2 was adopted before the handler ran, and the unwinding task

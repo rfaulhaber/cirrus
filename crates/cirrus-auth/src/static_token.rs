@@ -7,6 +7,7 @@
 
 use crate::AuthSession;
 use crate::error::AuthResult;
+use crate::token_endpoint::normalize_url;
 use async_trait::async_trait;
 use std::borrow::Cow;
 
@@ -33,8 +34,10 @@ impl std::fmt::Debug for StaticTokenAuth {
 impl StaticTokenAuth {
     /// Constructs a session from a known token and instance URL.
     ///
-    /// `instance_url` is normalized by trimming a trailing slash so that
-    /// path concatenation in the client always produces clean URLs.
+    /// `instance_url` is normalized by trimming surrounding whitespace
+    /// and every trailing slash, so path concatenation in the client
+    /// always produces clean URLs — the same normalization the OAuth
+    /// flow builders apply.
     ///
     /// Static-token auth doesn't refresh — when the token expires, calls
     /// will surface 401. Use for short-lived scripts, CLI tools, or
@@ -55,13 +58,9 @@ impl StaticTokenAuth {
     /// assert_eq!(auth.instance_url(), "https://my-org.my.salesforce.com");
     /// ```
     pub fn new(access_token: impl Into<String>, instance_url: impl Into<String>) -> Self {
-        let mut instance_url: String = instance_url.into();
-        if instance_url.ends_with('/') {
-            instance_url.pop();
-        }
         Self {
             access_token: access_token.into(),
-            instance_url,
+            instance_url: normalize_url(&instance_url.into()),
         }
     }
 }
@@ -90,8 +89,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strips_trailing_slash_from_instance_url() {
-        let auth = StaticTokenAuth::new("tok", "https://example.my.salesforce.com/");
+    async fn strips_every_trailing_slash_from_instance_url() {
+        let auth = StaticTokenAuth::new("tok", "https://example.my.salesforce.com//");
         assert_eq!(auth.instance_url(), "https://example.my.salesforce.com");
     }
 }

@@ -46,10 +46,60 @@ pub enum AuthError {
         error_description: Option<String>,
     },
 
+    /// The `state` echoed back on an OAuth callback did not match the
+    /// value the flow issued.
+    ///
+    /// This is a security event, not a configuration problem: it means
+    /// the callback was forged, replayed, or crossed with another
+    /// authorization attempt. Match on it to answer 400 and raise an
+    /// audit alert rather than retrying.
+    #[error("OAuth callback state does not match the value this flow issued")]
+    StateMismatch,
+
+    /// The token response reported a different `instance_url` than the
+    /// one configured on the builder, which usually means the connected
+    /// app points at another org.
+    ///
+    /// Both values are normalized (trailing slashes trimmed) before the
+    /// comparison, which is ASCII-case-insensitive.
+    #[error(
+        "token response instance_url ({returned}) does not match configured instance_url ({configured})"
+    )]
+    InstanceUrlMismatch {
+        configured: String,
+        returned: String,
+    },
+
+    /// The token endpoint answered non-2xx with a body that is not the
+    /// RFC 6749 §5.2 error shape — typically a proxy or gateway page
+    /// rather than Salesforce.
+    ///
+    /// The body is deliberately not carried: non-standard error pages
+    /// can echo request parameters, including credentials. It is logged
+    /// at `TRACE` on the `cirrus::auth` target instead.
+    #[error("token endpoint returned status {status} with an unrecognized error body")]
+    UnexpectedResponse { status: u16 },
+
+    /// A configured login URL would carry credentials over cleartext
+    /// HTTP. Salesforce serves every OAuth endpoint over HTTPS; loopback
+    /// hosts are the only exception the SDK accepts.
+    #[error("login URL {url} is not https; OAuth credentials must not cross the wire in cleartext")]
+    InsecureLoginUrl { url: String },
+
+    /// Signing the JWT bearer assertion failed (bad key material,
+    /// unsupported key type).
+    #[error("JWT signing failed: {0}")]
+    Signing(String),
+
+    /// The operating system's cryptographic RNG failed while generating
+    /// a PKCE verifier or CSRF nonce.
+    #[error("CSPRNG failure: {0}")]
+    Randomness(String),
+
     /// Catch-all for auth failures not modelled by a dedicated variant
-    /// (system clock skew, JWT signing failure, CSPRNG failure,
-    /// malformed token responses, etc.). Carries the underlying
-    /// message.
+    /// (system clock outside the UNIX epoch, private-key loading, a
+    /// token-mint task that did not run to completion). Carries the
+    /// underlying message.
     #[error("authentication failed: {0}")]
     Other(String),
 
@@ -87,6 +137,25 @@ impl std::fmt::Debug for AuthError {
                     &error_description.as_ref().map(|_| "[redacted]"),
                 )
                 .finish(),
+            Self::StateMismatch => f.write_str("StateMismatch"),
+            Self::InstanceUrlMismatch {
+                configured,
+                returned,
+            } => f
+                .debug_struct("InstanceUrlMismatch")
+                .field("configured", configured)
+                .field("returned", returned)
+                .finish(),
+            Self::UnexpectedResponse { status } => f
+                .debug_struct("UnexpectedResponse")
+                .field("status", status)
+                .finish(),
+            Self::InsecureLoginUrl { url } => f
+                .debug_struct("InsecureLoginUrl")
+                .field("url", url)
+                .finish(),
+            Self::Signing(msg) => f.debug_tuple("Signing").field(msg).finish(),
+            Self::Randomness(msg) => f.debug_tuple("Randomness").field(msg).finish(),
             Self::Other(msg) => f.debug_tuple("Other").field(msg).finish(),
             Self::Http(e) => f.debug_tuple("Http").field(e).finish(),
             Self::Serialization(e) => f.debug_tuple("Serialization").field(e).finish(),
