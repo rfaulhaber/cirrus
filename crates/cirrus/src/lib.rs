@@ -354,6 +354,60 @@ impl Cirrus {
             .await
     }
 
+    /// Sends a request carrying extra request headers, deserializing
+    /// the response into `R`.
+    ///
+    /// Salesforce defines a family of request headers that change how a
+    /// call behaves — `Sforce-Auto-Assign`,
+    /// `Sforce-Duplicate-Rule-Header`, `Sforce-Call-Options`,
+    /// `Sforce-Query-Options`, `Sforce-Mru` — and this attaches one
+    /// while keeping the retry policy, the 401 auto-refresh and the
+    /// `Sforce-Limit-Info` capture that the typed verb methods provide.
+    ///
+    /// `query` and `body` are optional; path resolution follows
+    /// [`Cirrus`]'s three-mode semantics.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::{Value, json};
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // Create a Lead without running the org's assignment rules.
+    /// let created: Value = sf
+    ///     .send_with_headers_as(
+    ///         cirrus::reqwest::Method::POST,
+    ///         "sobjects/Lead",
+    ///         None,
+    ///         &[("Sforce-Auto-Assign", "FALSE")],
+    ///         Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+    ///     )
+    ///     .await?;
+    /// # let _ = created;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_with_headers_as<R, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: Option<&B>,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = self.resolve_url(path);
+        self.send_with_replay(method, &url, query, headers, body, retry::Replay::ByMethod)
+            .await
+    }
+
     /// GET with query parameters for a resource whose GET has side
     /// effects, so a lost response must never be replayed. Same wire
     /// behavior as [`Self::get_with_query`]; only the retry
@@ -372,6 +426,7 @@ impl Cirrus {
             reqwest::Method::GET,
             &url,
             Some(query),
+            &[],
             None,
             retry::Replay::Never,
         )
@@ -448,9 +503,22 @@ impl Cirrus {
     /// then free to add headers, configure timeouts, set a custom body
     /// (multipart, form, raw bytes), and `.send()` the request.
     ///
-    /// Response parsing is *not* applied — call sites that want
-    /// Salesforce-error-aware deserialization should use the typed verb
-    /// methods ([`Self::get`], [`Self::post`], etc.) instead.
+    /// The request this returns leaves the SDK's request loop behind,
+    /// so none of the following applies to it:
+    ///
+    /// - Salesforce-error-aware response parsing — the caller gets a
+    ///   raw [`reqwest::Response`] to interpret.
+    /// - The [`RetryPolicy`]: no backoff on a transient 5xx, no
+    ///   `Retry-After` handling on a 429.
+    /// - The 401 auto-refresh. The bearer token is fetched once, here;
+    ///   once it expires the caller sees the 401 and has to invalidate
+    ///   the session and rebuild the request.
+    /// - `Sforce-Limit-Info` capture, so [`Self::last_limit_info`]
+    ///   stops advancing.
+    ///
+    /// To add Salesforce request headers and keep all of that, use
+    /// [`Self::send_with_headers_as`]; for a plain typed call, one of
+    /// the verb methods ([`Self::get`], [`Self::post`], …).
     pub async fn request_builder(
         &self,
         method: reqwest::Method,
@@ -654,7 +722,7 @@ impl Cirrus {
         Q: Serialize + ?Sized,
         B: Serialize + ?Sized,
     {
-        self.send_with_replay(method, url, query, body, retry::Replay::ByMethod)
+        self.send_with_replay(method, url, query, &[], body, retry::Replay::ByMethod)
             .await
     }
 
@@ -663,6 +731,7 @@ impl Cirrus {
         method: reqwest::Method,
         url: &str,
         query: Option<&Q>,
+        headers: &[(&str, &str)],
         body: Option<&B>,
         replay: retry::Replay,
     ) -> CirrusResult<R>
@@ -677,6 +746,9 @@ impl Cirrus {
             replay,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), url).bearer_auth(token);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
                 if let Some(q) = query {
                     request = request.query(q);
                 }
@@ -1442,6 +1514,87 @@ mod tests {
 
             let sf = server_fixture(server.uri());
             sf.delete::<()>("sobjects/Account/001").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn send_with_headers_as_attaches_salesforce_request_headers() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_autoassign.htm
+            // "Field name: Sforce-Auto-Assign ... If the header is not
+            // provided in the request, the default value is TRUE."
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/services/data/v66.0/sobjects/Lead"))
+                .and(header("sforce-auto-assign", "FALSE"))
+                .and(header("authorization", "Bearer tok"))
+                .and(body_json(json!({"LastName": "Chen", "Company": "Initech"})))
+                .respond_with(
+                    ResponseTemplate::new(201).set_body_json(
+                        json!({"id": "00Q000000000001", "success": true, "errors": []}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let sf = server_fixture(server.uri());
+            let created: Value = sf
+                .send_with_headers_as(
+                    reqwest::Method::POST,
+                    "sobjects/Lead",
+                    None,
+                    &[("Sforce-Auto-Assign", "FALSE")],
+                    Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created["id"], "00Q000000000001");
+        }
+
+        #[tokio::test]
+        async fn send_with_headers_as_keeps_the_retry_policy() {
+            // The point of the method over request_builder: a
+            // header-carrying call still gets retry, 401 refresh and
+            // Sforce-Limit-Info capture.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/query"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/query"))
+                .and(header("sforce-query-options", "batchSize=200"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"totalSize": 0, "done": true, "records": []}))
+                        .insert_header("Sforce-Limit-Info", "api-usage=7/15000"),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy {
+                    base_delay: std::time::Duration::ZERO,
+                    max_delay: std::time::Duration::ZERO,
+                    jitter: false,
+                    ..RetryPolicy::default()
+                })
+                .build()
+                .unwrap();
+            let result: Value = sf
+                .send_with_headers_as::<_, ()>(
+                    reqwest::Method::GET,
+                    "query",
+                    Some(&[("q", "SELECT Id FROM Account")]),
+                    &[("Sforce-Query-Options", "batchSize=200")],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["done"], true);
+            assert_eq!(sf.last_limit_info().unwrap().used, 7);
         }
 
         #[tokio::test]

@@ -131,9 +131,26 @@ sf.get::<MyShape>("https://...").await?;                   // fully-qualified
 Three-mode path resolution: relative → `/services/data/{version}/...`,
 leading-`/` → instance-rooted, `http(s)://` → passthrough.
 
-For unusual cases (custom headers, binary download, SSE), `request_builder` and
-`execute` give you a pre-authenticated `reqwest::RequestBuilder` and full bypass
-respectively.
+Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
+`Sforce-Query-Options`, …) go through `send_with_headers_as`, which keeps retry,
+the 401 auto-refresh and the `Sforce-Limit-Info` capture:
+
+```rust,ignore
+let created: Value = sf
+    .send_with_headers_as(
+        Method::POST,
+        "sobjects/Lead",
+        None,
+        &[("Sforce-Auto-Assign", "FALSE")],
+        Some(&lead),
+    )
+    .await?;
+```
+
+For the remaining unusual cases (binary download, SSE), `request_builder` and
+`execute` give you a pre-authenticated `reqwest::RequestBuilder` and a full
+bypass respectively — both step outside the request loop, so retry, the 401
+auto-refresh and the limit-info capture no longer apply.
 
 ## Examples
 
