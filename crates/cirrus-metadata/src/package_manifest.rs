@@ -305,12 +305,15 @@ impl PackageManifest {
     /// Repeated `all` calls for the same type collapse to a single
     /// `"*"` entry.
     ///
-    /// Not all metadata types support wildcards — types like `Profile`
-    /// or `Settings` require explicit `fullName` values. Salesforce's
-    /// `describeMetadata` response lists which types are
-    /// wildcardable; this builder doesn't validate, so a wildcard on
-    /// a non-supporting type will surface as a server-side error at
-    /// deploy/retrieve time.
+    /// Not all metadata types support the wildcard —
+    /// `StandardValueSet`, `RecordType`, `Report`, `Dashboard`,
+    /// `Document` and `EmailTemplate` are among the types that must be
+    /// listed by explicit `fullName`. Whether a given type accepts `*`
+    /// is stated in that type's reference topic in the Metadata API
+    /// Developer Guide and summarized in the "Allows Wildcard (*)?"
+    /// column of the Metadata Types list. This builder doesn't
+    /// validate, so a wildcard on a non-supporting type surfaces as a
+    /// server-side error at deploy/retrieve time.
     pub fn all<T: Into<MetadataType>>(mut self, type_name: T) -> Self {
         let type_name: MetadataType = type_name.into();
         if let Some(entry) = self
