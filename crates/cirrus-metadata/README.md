@@ -88,10 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // List every Apex class in the org.
     let classes = md
-        .list_metadata(vec![ListMetadataQuery {
-            type_name: "ApexClass".into(),
-            folder: None,
-        }])
+        .list_metadata(
+            vec![ListMetadataQuery {
+                type_name: "ApexClass".into(),
+                folder: None,
+            }],
+            md.api_version(),
+        )
         .await?;
 
     for f in &classes {
@@ -106,16 +109,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let async_result = md
         .retrieve(RetrieveRequest {
             api_version: md.api_version().to_string(),
-            package_names: vec![],
             single_package: true,
-            specific_files: vec![],
             unpackaged: Some(manifest),
+            ..Default::default()
         })
         .await?;
 
     let result = md.wait_for_retrieve(&async_result.id).await?;
 
-    if let Some(zip) = result.zip_file {
+    // `zip_file` is base64 on the wire; `zip_bytes` decodes it.
+    if let Some(zip) = result.zip_bytes()? {
         fs_err::write("retrieved.zip", zip)?;
     }
 
