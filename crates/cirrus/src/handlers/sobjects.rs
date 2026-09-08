@@ -740,15 +740,22 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_percent_encodes_external_value() {
-        // External-ID value contains characters that MUST be percent-encoded
-        // in a URL path segment: '/', '=', '#', and a space.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_patch.htm
+        // "URI: /services/data/vXX.X/sobjects/sObject/fieldName/fieldValue"
+        // — the external-ID value occupies exactly one path segment, so a
+        // '/' inside it has to arrive encoded or the request targets a
+        // different resource.
         let server = MockServer::start().await;
 
-        // wiremock's `path` matcher works on the decoded path, so we assert
-        // the literal value is what arrives at the server.
+        // wiremock matches on `Url::path()`, which is percent-encoded, so
+        // both matchers below see the value as it goes over the wire. The
+        // `[^/]+` anchor is what fails if the encoding regresses.
         Mock::given(method("PATCH"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Account/External_Id__c/a%2Fb=c%20d",
+            ))
             .and(path_regex(
-                r"^/services/data/v66\.0/sobjects/Account/External_Id__c/.+$",
+                r"^/services/data/v66\.0/sobjects/Account/External_Id__c/[^/]+$",
             ))
             .and(body_json(json!({"Name": "Edge"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
