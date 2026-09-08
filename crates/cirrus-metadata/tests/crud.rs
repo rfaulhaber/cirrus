@@ -5,6 +5,15 @@
 //! happy-path fixtures exercise the SOAP wire shapes; the
 //! partial-success and 11-cap tests cover the realistic failure
 //! modes.
+//!
+//! ## Fixture provenance
+//!
+//! Every fixture's elements come from a property table or Java sample
+//! in the Metadata API Developer Guide; each test names the page. The
+//! guide publishes no SOAP envelope example, so the
+//! `<soapenv:Envelope><soapenv:Body><xxxResponse>` framing follows the
+//! WSDL's document-literal binding rather than a published sample —
+//! only what sits inside `<result>` is doc-cited.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -38,6 +47,15 @@ fn client_against(server: &MockServer) -> MetadataClient {
 
 // -- create_metadata ---------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_createMetadata.htm
+/// "SaveResult[] = metadataConnection.createMetadata(Metadata[]
+/// metadata)"; the call "can save a partial set of records for records
+/// with no errors" by default in API 34.0 and later, which is the
+/// mixed result below.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_saveResult.htm
+/// SaveResult: `fullName`, `success`, and `errors` ("An array of
+/// errors returned if the operation wasn't successful") whose entries
+/// carry `statusCode`, `message` and `fields`.
 #[tokio::test]
 async fn create_metadata_returns_save_results_per_component() {
     let server = MockServer::start().await;
@@ -100,6 +118,8 @@ async fn create_metadata_returns_save_results_per_component() {
     assert_eq!(results[1].errors[0].fields, vec!["fullName".to_string()]);
 }
 
+/// An empty component array has nothing to save, so it is rejected
+/// before an envelope is built rather than spending a round trip.
 #[tokio::test]
 async fn create_metadata_rejects_empty_input_before_sending() {
     // No mock — the rejection happens client-side.
@@ -116,6 +136,9 @@ async fn create_metadata_rejects_empty_input_before_sending() {
     }
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_createMetadata.htm
+/// Arguments table, `metadata Metadata[]`: "Limit: 10. (For
+/// CustomMetadata and CustomApplication only, the limit is 200.)"
 #[tokio::test]
 async fn create_metadata_rejects_more_than_ten_components() {
     let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.example.com"));
@@ -136,6 +159,9 @@ async fn create_metadata_rejects_more_than_ten_components() {
 
 // -- update_metadata ---------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_updateMetadata.htm
+/// updateMetadata() returns SaveResult[], the same shape
+/// createMetadata() does.
 #[tokio::test]
 async fn update_metadata_returns_save_results() {
     let server = MockServer::start().await;
@@ -201,6 +227,11 @@ async fn upsert_metadata_caps_large_types_at_ten_like_every_other_type() {
     }
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_upsertResult.htm
+/// UpsertResult adds `created` to the SaveResult shape: "Indicates
+/// whether the upsert operation resulted in the creation of the
+/// component (true) or not (false). If false and the upsert operation
+/// was successful, the component was updated."
 #[tokio::test]
 async fn upsert_metadata_returns_created_flag_per_component() {
     let server = MockServer::start().await;
@@ -246,6 +277,9 @@ async fn upsert_metadata_returns_created_flag_per_component() {
 
 // -- delete_metadata ---------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deleteResult.htm
+/// DeleteResult: `fullName` ("The full name of the deleted
+/// component"), `success`, and `errors`.
 #[tokio::test]
 async fn delete_metadata_returns_one_result_per_full_name() {
     let server = MockServer::start().await;
@@ -308,6 +342,10 @@ struct ApexClassRecord {
     status: Option<String>,
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_readResult.htm
+/// ReadResult: "records | Metadata[] | An array of metadata components
+/// returned from readMetadata()." The children of each `<records>`
+/// element are the caller's own metadata type — here an ApexClass.
 #[tokio::test]
 async fn read_metadata_deserializes_records_into_caller_type() {
     let server = MockServer::start().await;
@@ -352,6 +390,8 @@ async fn read_metadata_deserializes_records_into_caller_type() {
     assert_eq!(records[1].status, Some("Deleted".into()));
 }
 
+/// A ReadResult whose `records` array is empty; the handler must
+/// answer with an empty `Vec` rather than a deserialization error.
 #[tokio::test]
 async fn read_metadata_empty_result_yields_empty_vec() {
     let server = MockServer::start().await;
@@ -429,6 +469,10 @@ async fn read_metadata_tolerates_the_placeholder_for_a_missing_full_name() {
 
 // -- rename_metadata ---------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_renameMetadata.htm
+/// "SaveResult = metadataConnection.renameMetadata(string
+/// metadataType, String oldFullname, String newFullname)" — one
+/// component per call, so `<result>` holds a single SaveResult.
 #[tokio::test]
 async fn rename_metadata_returns_single_save_result() {
     let server = MockServer::start().await;
@@ -467,6 +511,9 @@ async fn rename_metadata_returns_single_save_result() {
     assert_eq!(result.full_name, "NewName");
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_saveResult.htm
+/// A rename that fails reports it in the SaveResult's `errors` array,
+/// not as a SOAP fault.
 #[tokio::test]
 async fn rename_metadata_propagates_error_in_save_result() {
     let server = MockServer::start().await;

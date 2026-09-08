@@ -5,10 +5,19 @@
 //! - the SOAP request body Salesforce should see, and
 //! - the response envelope shape we parse into typed results.
 //!
-//! Response fixtures are modeled after the documented examples in the
-//! Metadata API Developer Guide; field coverage is deliberately
-//! generous so we exercise as much of the typed envelope surface as
+//! ## Fixture provenance
+//!
+//! Every fixture's element names and values come from a property table
+//! or Java sample in the Metadata API Developer Guide; each test names
+//! the page it was built from. Field coverage is deliberately generous
+//! so the fixtures exercise as much of the typed envelope surface as
 //! possible.
+//!
+//! The guide publishes no SOAP envelope example for any call, so the
+//! `<soapenv:Envelope><soapenv:Body><xxxResponse><result>` framing
+//! around every fixture below follows the WSDL's document-literal
+//! binding rather than a published sample. Only what sits *inside*
+//! `<result>` is doc-cited.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -48,6 +57,12 @@ fn client_against(server: &MockServer) -> MetadataClient {
 
 // -- deploy ------------------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+/// deploy() takes "base64Binary ZipFile" plus DeployOptions, whose
+/// table defines `checkOnly` and `testLevel`.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_asyncresult.htm
+/// The response is an AsyncResult: "id | ID | Required. The ID of the
+/// component that's being deployed or retrieved."
 #[tokio::test]
 async fn deploy_sends_zip_base64_and_returns_async_result() {
     let server = MockServer::start().await;
@@ -91,6 +106,10 @@ async fn deploy_sends_zip_base64_and_returns_async_result() {
 
 // -- check_deploy_status -----------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+/// Elements below are the "API version 29.0 and later" DeployResult
+/// table plus the DeployDetails, DeployMessage and RunTestsResult
+/// tables on the same page.
 #[tokio::test]
 async fn check_deploy_status_parses_full_deploy_result() {
     let server = MockServer::start().await;
@@ -178,6 +197,10 @@ async fn check_deploy_status_parses_full_deploy_result() {
     assert_eq!(test_result.total_time, 1234.5);
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+/// DeployMessage table: `problem` is "a description of the problem
+/// that caused the compile to fail", `problemType` is Warning or
+/// Error, and `lineNumber`/`columnNumber` locate it in the source.
 #[tokio::test]
 async fn check_deploy_status_parses_failure_details() {
     let server = MockServer::start().await;
@@ -440,6 +463,9 @@ async fn check_deploy_status_surfaces_the_post_deploy_retrieve_result() {
     assert_eq!(&retrieved.zip_bytes().unwrap().unwrap()[..], b"PKzip");
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+/// DeployOptions defines both `performRetrieve` and
+/// `autoUpdatePackage`; neither is reserved on the SOAP endpoint.
 #[tokio::test]
 async fn deploy_emits_the_retrieve_side_options() {
     let server = MockServer::start().await;
@@ -521,6 +547,10 @@ async fn cancel_deploy_round_trip() {
 
 // -- deploy_recent_validation ------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployRecentValidation.htm
+/// "string = metadatabinding.deployRecentValidation(ID validationID)"
+/// — the call takes a validation id and returns the new deployment's
+/// id, so `<result>` here holds a bare string rather than a struct.
 #[tokio::test]
 async fn deploy_recent_validation_returns_new_deploy_id() {
     let server = MockServer::start().await;
@@ -550,6 +580,12 @@ async fn deploy_recent_validation_returns_new_deploy_id() {
 
 // -- retrieve ----------------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieve_request.htm
+/// RetrieveRequest: `apiVersion` (required), `singlePackage`, and
+/// `unpackaged` ("A list of components to retrieve that aren't in a
+/// package"), which carries a Package manifest.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_asyncresult.htm
+/// retrieve() answers with an AsyncResult, same as deploy().
 #[tokio::test]
 async fn retrieve_sends_unpackaged_manifest_and_returns_async_result() {
     let server = MockServer::start().await;
@@ -634,6 +670,11 @@ async fn retrieve_sends_root_types_with_dependencies() {
 
 // -- check_retrieve_status ---------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+/// RetrieveResult: `fileProperties` ("information about the properties
+/// of each component in the .zip file"), and `zipFile` — "base64Binary
+/// … client applications must decode the base64 data to binary". The
+/// FileProperties table on the same page names the child elements.
 #[tokio::test]
 async fn check_retrieve_status_decodes_zip_bytes() {
     let server = MockServer::start().await;
@@ -767,6 +808,10 @@ async fn check_retrieve_status_parses_failure_messages() {
 
 // -- wait_for_deploy ---------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_checkdeploystatus.htm
+/// checkDeployStatus() takes an id and an `includeDetails` flag, and
+/// the same page prescribes issuing it "in a loop until the done field
+/// of the returned DeployResult contains true".
 #[tokio::test]
 async fn wait_for_deploy_polls_until_done() {
     let server = MockServer::start().await;
@@ -834,6 +879,10 @@ async fn wait_for_deploy_polls_until_done() {
     assert_eq!(counter.load(Ordering::SeqCst), 4);
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_checkdeploystatus.htm
+/// `includeDetails` "Sets the DeployResult object to include
+/// DeployDetails information", so the details fetch is a second call
+/// that can fail on its own.
 #[tokio::test]
 async fn wait_for_deploy_returns_terminal_result_when_details_fetch_fails() {
     let server = MockServer::start().await;
@@ -896,6 +945,9 @@ async fn wait_for_deploy_returns_terminal_result_when_details_fetch_fails() {
     assert_eq!(counter.load(Ordering::SeqCst), 5);
 }
 
+/// A deploy that never reports `done`. The timeout is the SDK's own
+/// contract — the guide prescribes no bound on how long a deployment
+/// may run.
 #[tokio::test]
 async fn wait_for_deploy_times_out_when_never_done() {
     let server = MockServer::start().await;

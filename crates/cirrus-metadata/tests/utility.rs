@@ -2,8 +2,16 @@
 //!
 //! Covers `list_metadata`, `describe_metadata`, and
 //! `describe_value_type` happy paths plus the client-side query-cap
-//! check on `list_metadata`. Response fixtures are modeled after the
-//! documented examples in the Metadata API Developer Guide.
+//! check on `list_metadata`.
+//!
+//! ## Fixture provenance
+//!
+//! Every fixture's elements come from a property table or Java sample
+//! in the Metadata API Developer Guide; each test names the page. The
+//! guide publishes no SOAP envelope example, so the
+//! `<soapenv:Envelope><soapenv:Body><xxxResponse>` framing follows the
+//! WSDL's document-literal binding rather than a published sample —
+//! only what sits inside `<result>` is doc-cited.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -36,6 +44,13 @@ fn client_against(server: &MockServer) -> MetadataClient {
 
 // -- list_metadata -----------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_listmetadata.htm
+/// "FileProperties[] = metadataConnection.listMetadata(ListMetadataQuery[]
+/// queries, double asOfVersion)" — the response is one FileProperties
+/// per matching component.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+/// The FileProperties table (created/lastModified ids and names,
+/// fileName, fullName, id, type) lives on the RetrieveResult page.
 #[tokio::test]
 async fn list_metadata_returns_file_properties_for_each_match() {
     let server = MockServer::start().await;
@@ -100,6 +115,9 @@ async fn list_metadata_returns_file_properties_for_each_match() {
     assert_eq!(results[1].full_name, "Bar");
 }
 
+/// A query that matches nothing. `listMetadata` returns an array, so
+/// the wrapper arrives with no `<result>` children rather than as an
+/// error.
 #[tokio::test]
 async fn list_metadata_empty_results_deserialize_as_empty_vec() {
     let server = MockServer::start().await;
@@ -133,6 +151,10 @@ async fn list_metadata_empty_results_deserialize_as_empty_vec() {
     assert!(results.is_empty());
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_listmetadataquery.htm
+/// ListMetadataQuery: `folder` is "The folder associated with the
+/// component. This field is required for components that use folders,
+/// such as Dashboard, Document, EmailTemplate, or Report."
 #[tokio::test]
 async fn list_metadata_emits_folder_for_folder_based_types() {
     let server = MockServer::start().await;
@@ -166,6 +188,9 @@ async fn list_metadata_emits_folder_for_folder_based_types() {
         .unwrap();
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_listmetadata.htm
+/// "The queries array can contain up to three ListMetadataQuery
+/// queries for each call."
 #[tokio::test]
 async fn list_metadata_rejects_more_than_three_queries() {
     // No mock server needed — the rejection happens client-side.
@@ -208,6 +233,11 @@ async fn list_metadata_rejects_empty_query_list() {
 
 // -- describe_metadata -------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describemeta_result.htm
+/// DescribeMetadataResult: `metadataObjects`, `organizationNamespace`,
+/// `partialSaveAllowed` and `testRequired`; the DescribeMetadataObject
+/// table on the same page names `directoryName`, `inFolder`,
+/// `metaFile`, `suffix`, `xmlName` and `childXmlNames`.
 #[tokio::test]
 async fn describe_metadata_parses_object_catalog() {
     let server = MockServer::start().await;
@@ -376,6 +406,10 @@ async fn blank_string_elements_normalize_to_none() {
 
 // -- describe_value_type -----------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describeValueTypeResult.htm
+/// DescribeValueTypeResult (`apiCreatable`/`apiDeletable`/
+/// `apiReadable`/`apiUpdatable`, `valueTypeFields`) plus the
+/// ValueTypeField and PicklistEntry tables on the same page.
 #[tokio::test]
 async fn describe_value_type_parses_field_schema() {
     let server = MockServer::start().await;
