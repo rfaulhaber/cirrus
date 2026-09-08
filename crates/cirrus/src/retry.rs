@@ -188,6 +188,11 @@ pub(crate) fn should_retry_status(
 /// connect timeout) mean the request never reached the server, so
 /// retrying is safe for any method. Same policy as the
 /// `cirrus-metadata` sibling.
+///
+/// Errors raised while *building* the request — an instance URL that
+/// doesn't parse, a header value reqwest rejects — are permanent: no
+/// amount of backoff turns them into a request, so they surface on the
+/// first attempt instead of burning the budget on identical failures.
 pub(crate) fn should_retry_network(
     policy: &RetryPolicy,
     method: &reqwest::Method,
@@ -201,6 +206,9 @@ pub(crate) fn should_retry_network(
     let CirrusError::Http(http) = error else {
         return false;
     };
+    if http.is_builder() {
+        return false;
+    }
     if http.is_connect() {
         return true;
     }
@@ -425,6 +433,30 @@ mod tests {
             Replay::ByMethod,
             &err,
             3
+        ));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_request_builder_errors() {
+        // An unparseable URL is latched by the builder and returned
+        // from send(); replaying it can only fail the same way.
+        let p = RetryPolicy::default();
+        let err: CirrusError = reqwest::Client::new()
+            .get("not a url/services/data/v66.0/limits")
+            .send()
+            .await
+            .unwrap_err()
+            .into();
+        match &err {
+            CirrusError::Http(http) => assert!(http.is_builder(), "expected a builder error"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert!(!should_retry_network(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            &err,
+            0
         ));
     }
 
