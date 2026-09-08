@@ -547,12 +547,11 @@ impl std::fmt::Debug for BulkQueryResults {
 ///
 /// - `Id`, `EventType`, `LogFile`, `LogDate`, `LogFileLength` are
 ///   present whenever you `SELECT` them.
-/// - `Interval` and `Sequence` are populated when an org has hourly
-///   event log files enabled. `Interval` is `"Hourly"` for hourly
-///   files, `"Daily"` (or absent on older orgs) for 24-hour files.
-///   `Sequence` is `0` for daily files and increments per hourly file
-///   in the same hour bucket. Filter on `Interval = 'Hourly'` (or
-///   `Sequence != 0`) to read only hourly files.
+/// - `Interval` is `"Hourly"` for hourly files and `"Daily"` for
+///   24-hour files. `Sequence` is `0` for daily files and starts at 1
+///   for hourly files, incrementing per file within the same hour.
+///   Filter on `Interval = 'Hourly'` (or `Sequence != 0`) to read only
+///   hourly files.
 /// - `CreatedDate` is the timestamp the log file became downloadable —
 ///   not the same as `LogDate` (when the events occurred). Use
 ///   `CreatedDate > <last-fetch>` to drive incremental ingestion (per
@@ -584,9 +583,9 @@ pub struct EventLogFileRecord {
     /// store as `f64` to absorb both.
     #[serde(rename = "LogFileLength", default)]
     pub log_file_length: Option<f64>,
-    /// `"Hourly"` for hourly logs (orgs with the feature enabled),
-    /// otherwise typically absent. Filter on this when you only want
-    /// the hourly stream.
+    /// `"Hourly"` for hourly log files, `"Daily"` for 24-hour log
+    /// files. `None` only when the SELECT clause didn't ask for the
+    /// field. Match on the value when you want just the hourly stream.
     #[serde(rename = "Interval", default)]
     pub interval: Option<String>,
     /// Increment ordinal per hour bucket — `0` for daily files; `>= 1`
