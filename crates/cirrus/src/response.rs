@@ -345,6 +345,16 @@ pub struct BulkIngestJob {
     pub column_delimiter: BulkColumnDelimiter,
     #[serde(rename = "contentType")]
     pub content_type: String,
+    /// Where to PUT the job's CSV, populated while the job is `Open`.
+    ///
+    /// Salesforce sends this instance-relative and **without** a leading
+    /// slash (`services/data/vXX.X/jobs/ingest/{id}/batches`), which the
+    /// verb methods on [`crate::Cirrus`] would resolve as a versioned
+    /// path and so double the `/services/data/{version}` prefix. Prefer
+    /// [`BulkIngestHandler::upload`], which builds the path itself; if
+    /// you must use this value directly, prefix it with `/`.
+    ///
+    /// [`BulkIngestHandler::upload`]: crate::handlers::bulk::BulkIngestHandler::upload
     #[serde(rename = "contentUrl", default)]
     pub content_url: Option<String>,
     /// The wire sends a JSON number (e.g. `60.0`), so this is a float
@@ -1406,30 +1416,40 @@ mod tests {
 
     #[test]
     fn parses_bulk_ingest_job_response() {
-        // Mirrors the documented create-job response.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
+        // Example response for an Open ingest job, verbatim — including the
+        // slash-less, instance-relative `contentUrl`.
         let body = json!({
-            "id": "750xx0000004C92AAE",
+            "id": "7506g00000DhRA2AAN",
             "operation": "insert",
             "object": "Account",
-            "createdById": "005xx000001IECDAA4",
-            "createdDate": "2018-12-10T17:50:19.000+0000",
-            "systemModstamp": "2018-12-10T17:51:27.000+0000",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
             "state": "Open",
             "concurrencyMode": "Parallel",
             "contentType": "CSV",
-            "apiVersion": 60.0,
-            "contentUrl": "/services/data/v66.0/jobs/ingest/750xx0000004C92AAE/batches",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
             "lineEnding": "LF",
             "columnDelimiter": "COMMA",
-            "jobType": "V2Ingest"
+            "retries": 0,
+            "totalProcessingTime": 0,
+            "apiActiveProcessingTime": 0,
+            "apexProcessingTime": 0
         })
         .to_string();
         let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
-        assert_eq!(job.id, "750xx0000004C92AAE");
+        assert_eq!(job.id, "7506g00000DhRA2AAN");
         assert_eq!(job.operation, BulkOperation::Insert);
         assert_eq!(job.state, BulkJobState::Open);
         assert_eq!(job.line_ending, BulkLineEnding::LF);
         assert_eq!(job.column_delimiter, BulkColumnDelimiter::Comma);
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches")
+        );
         assert!(job.number_records_processed.is_none());
     }
 
