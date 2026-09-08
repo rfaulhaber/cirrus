@@ -14,8 +14,11 @@
 //! # Path encoding
 //!
 //! The handler does **not** percent-encode path segments. For paths
-//! containing reserved characters (spaces, `?`, `#`, `&`), pre-encode the
-//! segments yourself before calling.
+//! containing reserved characters (spaces, `&`), pre-encode the
+//! segments yourself before calling. `?` and `#` end the path when the
+//! URL is parsed — everything after the first of them becomes the query
+//! string or the fragment — so percent-encode those (`%3F`, `%23`) to
+//! address a segment that really contains one.
 //!
 //! Relative segments (`.` and `..`, in either literal or percent-encoded
 //! spelling) are rejected with [`CirrusError::InvalidInput`], because URL
@@ -145,11 +148,12 @@ impl ApexHandler<'_> {
 /// The leading `/` triggers [`crate::Cirrus`]'s instance-rooted branch,
 /// bypassing the versioned `/services/data/{version}/` prefix.
 ///
-/// Errors when any content-bearing segment is empty or relative, or when
-/// the path contains a backslash or any character up to and including
-/// `U+0020`, so that a path built from untrusted input cannot resolve
-/// outside the Apex REST root. A single trailing slash is kept: Apex
-/// `urlMapping` values are documented with one.
+/// Errors when any content-bearing segment of the addressed path is
+/// empty or relative, or when the path contains a backslash or any
+/// character up to and including `U+0020`, so that a path built from
+/// untrusted input cannot resolve outside the Apex REST root. A single
+/// trailing slash is kept: Apex `urlMapping` values are documented with
+/// one.
 fn apex_path(path: &str) -> CirrusResult<String> {
     // For a special scheme, WHATWG URL parsing treats `\` as a path
     // separator, removes tab, LF and CR from anywhere in the input, and
@@ -171,7 +175,15 @@ fn apex_path(path: &str) -> CirrusResult<String> {
         });
     }
     let trimmed = path.trim_start_matches('/');
-    let body = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    // The first `?` or `#` ends the path; what follows is the query
+    // string or the fragment and can't move the request off the Apex
+    // REST root. Only the part before it is worth checking — and it
+    // has to be checked, because a terminator closes the segment it
+    // follows, so `..?` is still a dot segment.
+    let addressed = trimmed
+        .find(['?', '#'])
+        .map_or(trimmed, |end| &trimmed[..end]);
+    let body = addressed.strip_suffix('/').unwrap_or(addressed);
     for segment in body.split('/') {
         if segment.is_empty() || is_relative_segment(segment) {
             return Err(CirrusError::InvalidInput {
@@ -281,6 +293,12 @@ mod tests {
             ".. ",
             "%2e%2e ",
             "Cases/..\u{0}",
+            // `?` and `#` end the path, which closes the segment in
+            // front of them — so the dot segment still resolves.
+            "..?",
+            "..#",
+            "%2e%2e?x=1",
+            "Cases/..#fragment",
         ] {
             let err = apex_path(candidate).unwrap_err();
             assert!(
@@ -298,6 +316,87 @@ mod tests {
                 "{candidate:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn apex_path_keeps_a_query_string_or_fragment() {
+        // Only `get_with_query` takes a separate query value, so an
+        // inline one is the only way to put a query on the other verbs.
+        assert_eq!(
+            apex_path("MyEndpoint?foo=bar").unwrap(),
+            "/services/apexrest/MyEndpoint?foo=bar"
+        );
+        assert_eq!(
+            apex_path("Cases/12345/?foo=bar").unwrap(),
+            "/services/apexrest/Cases/12345/?foo=bar"
+        );
+        assert_eq!(
+            apex_path("MyEndpoint#anchor").unwrap(),
+            "/services/apexrest/MyEndpoint#anchor"
+        );
+    }
+
+    #[test]
+    fn accepted_paths_stay_under_the_apex_rest_root_once_parsed() {
+        // The per-segment checks exist to survive URL parsing, which is
+        // where dot-segment removal actually happens — so assert on the
+        // parsed path rather than on the string the handler built.
+        for candidate in [
+            "MyEndpoint",
+            "/MyEndpoint",
+            "packageNamespace/MyMethod/",
+            "Cases/12345/comments",
+            "Cases/%252e%252e/comments",
+            "MyEndpoint?foo=bar",
+            "MyEndpoint#anchor",
+            "Cases/..%2f..%2fadmin",
+        ] {
+            let resolved = apex_path(candidate).unwrap();
+            let parsed = url::Url::parse(&format!("https://acme.my.salesforce.com{resolved}"))
+                .unwrap_or_else(|e| panic!("{candidate:?} produced an unparseable URL: {e}"));
+            assert!(
+                parsed.path().starts_with("/services/apexrest/"),
+                "{candidate:?} escaped to {}",
+                parsed.path()
+            );
+        }
+    }
+
+    #[test]
+    fn no_accepted_path_escapes_the_apex_rest_root() {
+        // Exhaustive over the pieces WHATWG URL parsing gives special
+        // treatment — dot segments in each spelling, the separators,
+        // the terminators, and the characters parsing strips — because
+        // the escapes that matter come from combining them, not from
+        // any one of them alone.
+        const ATOMS: [&str; 18] = [
+            "..", ".", "%2e%2e", "%2E.", ".%2e", "%2e", "%252e", "a", "", "?", "#", "&", "\\", " ",
+            "\t", "\u{0}", "%2f", "..%2f",
+        ];
+        let mut checked = 0usize;
+        let mut confine = |candidate: &str| {
+            let Ok(resolved) = apex_path(candidate) else {
+                return;
+            };
+            checked += 1;
+            let parsed = url::Url::parse(&format!("https://acme.my.salesforce.com{resolved}"))
+                .unwrap_or_else(|e| panic!("{candidate:?} produced an unparseable URL: {e}"));
+            assert!(
+                parsed.path().starts_with("/services/apexrest/"),
+                "{candidate:?} resolved to {}",
+                parsed.path()
+            );
+        };
+        for a in ATOMS {
+            for b in ATOMS {
+                for c in ATOMS {
+                    confine(&format!("{a}{b}{c}"));
+                    confine(&format!("{a}/{b}/{c}"));
+                    confine(&format!("Cases/{a}{b}/{c}/comments"));
+                }
+            }
+        }
+        assert!(checked > 0, "every candidate was rejected");
     }
 
     #[test]
@@ -321,6 +420,7 @@ mod tests {
             "Cases\\..\\..\\..\\services/data/v66.0/sobjects/Account/001xx",
             "Cases/.\t./.\t./.\t./services/data/v66.0/limits",
             "Cases/..\u{0}",
+            "..?",
         ] {
             let err = sf.apex().delete::<()>(candidate).await.unwrap_err();
             assert!(
