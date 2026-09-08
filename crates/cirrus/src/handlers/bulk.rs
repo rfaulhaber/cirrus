@@ -58,7 +58,7 @@ impl Cirrus {
     /// let bulk = sf.bulk();
     /// let ingest = bulk.ingest();
     /// let spec = BulkIngestSpec {
-    ///     object: "Account".into(),
+    ///     object: Some("Account".into()),
     ///     operation: BulkOperation::Insert,
     ///     external_id_field_name: None,
     ///     line_ending: None,
@@ -386,14 +386,32 @@ impl BulkQueryHandler<'_> {
 /// to `Comma` and `line_ending` to `LF` when omitted.
 #[derive(Debug, Clone, Serialize)]
 pub struct BulkIngestSpec {
-    /// API name of the target sObject (e.g. `"Account"`).
-    pub object: String,
-    /// Operation kind — must be one of the ingest values: `Insert`,
-    /// `Update`, `Upsert`, `Delete`, `HardDelete`. Query/QueryAll on a
-    /// `BulkIngestSpec` will produce a server-side error.
+    /// API name of the object the data belongs to — for a marketing
+    /// object, its API name. Required for every operation except
+    /// [`ConsentImport`](BulkOperation::ConsentImport): consent ingest
+    /// isn't backed by an object type, and a create request that sends
+    /// `object` alongside it returns an error, so leave this `None`
+    /// there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    /// Processing operation for the job. The ingest endpoint takes
+    /// [`Insert`](BulkOperation::Insert),
+    /// [`Delete`](BulkOperation::Delete),
+    /// [`HardDelete`](BulkOperation::HardDelete),
+    /// [`Update`](BulkOperation::Update),
+    /// [`Upsert`](BulkOperation::Upsert),
+    /// [`Refresh`](BulkOperation::Refresh) and
+    /// [`ConsentImport`](BulkOperation::ConsentImport); which of them
+    /// applies depends on the target. Standard objects support
+    /// `insert`, `delete`, `hardDelete`, `update` and `upsert`;
+    /// marketing objects support `insert`, `upsert` and `refresh`;
+    /// consent ingest uses `consentImport`.
     pub operation: BulkOperation,
-    /// External ID field name. Required when `operation` is `Upsert`,
-    /// must be `None` for the other operations.
+    /// External ID field in the object being updated. Required for an
+    /// upsert, whose CSV job data must carry values for it too. Not
+    /// supported for a marketing-object upsert — that matches on the
+    /// record's primary key — nor for
+    /// [`ConsentImport`](BulkOperation::ConsentImport).
     #[serde(
         rename = "externalIdFieldName",
         skip_serializing_if = "Option::is_none"
@@ -405,7 +423,11 @@ pub struct BulkIngestSpec {
     /// CSV column delimiter. Defaults server-side to `Comma` when `None`.
     #[serde(rename = "columnDelimiter", skip_serializing_if = "Option::is_none")]
     pub column_delimiter: Option<crate::response::BulkColumnDelimiter>,
-    /// Optional assignment-rule ID (Lead/Case routing).
+    /// ID of an assignment rule to run for a Case or a Lead; the rule
+    /// may be active or inactive. Available in API version 49.0 and
+    /// later, and not supported for
+    /// [`Refresh`](BulkOperation::Refresh) or
+    /// [`ConsentImport`](BulkOperation::ConsentImport).
     #[serde(rename = "assignmentRuleId", skip_serializing_if = "Option::is_none")]
     pub assignment_rule_id: Option<String>,
 }
@@ -517,7 +539,7 @@ mod tests {
             .bulk()
             .ingest()
             .create(&BulkIngestSpec {
-                object: "Account".into(),
+                object: Some("Account".into()),
                 operation: BulkOperation::Insert,
                 external_id_field_name: None,
                 line_ending: None,
@@ -528,6 +550,56 @@ mod tests {
             .unwrap();
         assert_eq!(job.id, "750xx");
         assert_eq!(job.state, BulkJobState::Open);
+    }
+
+    #[tokio::test]
+    async fn ingest_create_omits_object_for_consent_import() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // Request body, `object`: "Omit this property for the
+        // consentImport operation. Consent ingest isn't backed by an
+        // object type. Including object with consentImport returns an
+        // error." Response body, `object`: "The object type for the
+        // data being processed. Empty for jobs created with the
+        // consentImport operation."
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .and(body_json(json!({ "operation": "consentImport" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "750xx",
+                "operation": "consentImport",
+                "object": "",
+                "createdById": "005xx",
+                "createdDate": "2024-01-01T00:00:00.000+0000",
+                "systemModstamp": "2024-01-01T00:00:00.000+0000",
+                "state": "Open",
+                "concurrencyMode": "Parallel",
+                "contentType": "CSV",
+                "apiVersion": 60.0,
+                "lineEnding": "LF",
+                "columnDelimiter": "COMMA",
+                "jobType": "V2Ingest"
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let job = sf
+            .bulk()
+            .ingest()
+            .create(&BulkIngestSpec {
+                object: None,
+                operation: BulkOperation::ConsentImport,
+                external_id_field_name: None,
+                line_ending: None,
+                column_delimiter: None,
+                assignment_rule_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(job.operation, BulkOperation::ConsentImport);
+        assert_eq!(job.object, "");
     }
 
     #[tokio::test]
@@ -553,7 +625,7 @@ mod tests {
         sf.bulk()
             .ingest()
             .create(&BulkIngestSpec {
-                object: "Account".into(),
+                object: Some("Account".into()),
                 operation: BulkOperation::Upsert,
                 external_id_field_name: Some("External_Id__c".into()),
                 line_ending: Some(BulkLineEnding::CRLF),

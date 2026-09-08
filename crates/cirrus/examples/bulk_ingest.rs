@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ingest = bulk.ingest();
 
     let spec = BulkIngestSpec {
-        object: "Account".into(),
+        object: Some("Account".into()),
         operation: BulkOperation::Insert,
         external_id_field_name: None,
         line_ending: None,
