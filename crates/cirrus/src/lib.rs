@@ -135,12 +135,17 @@ pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
 ///   e.g. `/services/data` → `{instance}/services/data`.
 /// - **Versioned** (anything else): prefixed with `/services/data/{version}/`,
 ///   e.g. `limits` → `{instance}/services/data/{version}/limits`.
+///
+/// Whichever mode applies, the resolved target has to be `https` (or a
+/// loopback host) before the session token is attached — see
+/// [`CirrusBuilder::allow_insecure_transport`] for the opt-out.
 #[derive(Clone)]
 pub struct Cirrus {
     client: reqwest::Client,
     auth: SharedAuth,
     api_version: String,
     retry_policy: RetryPolicy,
+    allow_insecure_transport: bool,
     /// Most recent `Sforce-Limit-Info` header value, parsed. Wrapped
     /// in `Arc<RwLock<...>>` so updates are visible across cloned
     /// clients (clones share state).
@@ -155,6 +160,7 @@ impl std::fmt::Debug for Cirrus {
             .field("api_version", &self.api_version)
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
+            .field("allow_insecure_transport", &self.allow_insecure_transport)
             .finish_non_exhaustive()
     }
 }
@@ -283,6 +289,12 @@ impl Cirrus {
                 path
             )
         }
+    }
+
+    /// Refuses to put the session token on a target that isn't
+    /// TLS-protected. See [`check_transport_security`].
+    fn check_transport_security(&self, url: &str) -> CirrusResult<()> {
+        check_transport_security("request URL", url, self.allow_insecure_transport)
     }
 
     /// Builds a versioned URL by appending percent-encoded path segments.
@@ -445,6 +457,7 @@ impl Cirrus {
         path: &str,
     ) -> CirrusResult<reqwest::RequestBuilder> {
         let url = self.resolve_url(path);
+        self.check_transport_security(&url)?;
         let token = self.auth.access_token().await?;
         Ok(self.client.request(method, url).bearer_auth(&*token))
     }
@@ -535,6 +548,7 @@ impl Cirrus {
     async fn dispatch<T, MakeReq, Parse>(
         &self,
         method: &reqwest::Method,
+        url: &str,
         replay: retry::Replay,
         make_request: MakeReq,
         parse: Parse,
@@ -543,6 +557,7 @@ impl Cirrus {
         MakeReq: Fn(&str) -> CirrusResult<reqwest::RequestBuilder>,
         Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
     {
+        self.check_transport_security(url)?;
         let mut auth_retried = false;
         let mut attempt: u32 = 0;
         loop {
@@ -651,6 +666,7 @@ impl Cirrus {
     {
         self.dispatch(
             &method,
+            url,
             replay,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), url).bearer_auth(token);
@@ -691,6 +707,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
             replay,
             |token: &str| {
                 // bytes::Bytes is Arc-backed — clone is cheap.
@@ -741,6 +758,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
             retry::Replay::ByMethod,
             |token: &str| {
                 // Build a fresh Form per attempt — Form isn't Clone.
@@ -793,6 +811,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
             retry::Replay::ByMethod,
             |token: &str| {
                 let mut request = self
@@ -836,6 +855,7 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
             retry::Replay::ByMethod,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), &url).bearer_auth(token);
@@ -877,6 +897,7 @@ pub struct CirrusBuilder {
     // caller asking for no deadline at all.
     connect_timeout: Option<Option<Duration>>,
     read_timeout: Option<Option<Duration>>,
+    allow_insecure_transport: bool,
 }
 
 impl CirrusBuilder {
@@ -951,17 +972,35 @@ impl CirrusBuilder {
         self
     }
 
+    /// Allows requests to carry the Salesforce session token over
+    /// plaintext `http://` to a non-loopback host.
+    ///
+    /// Off by default: the token is the org session id, and RFC 6750
+    /// §5.3 requires TLS for any request that bears one. Turn this on
+    /// only for a deliberate plaintext hop you control, such as a
+    /// recording proxy on a trusted network.
+    pub fn allow_insecure_transport(mut self, allow: bool) -> Self {
+        self.allow_insecure_transport = allow;
+        self
+    }
+
     /// Finalizes the builder.
     ///
-    /// Fails when no [`auth`](Self::auth) session was supplied, or when
+    /// Fails when no [`auth`](Self::auth) session was supplied, when
     /// [`api_version`](Self::api_version) isn't a version segment
-    /// Salesforce recognizes.
+    /// Salesforce recognizes, or when the auth session's instance URL
+    /// would send the session token in the clear.
     pub fn build(self) -> CirrusResult<Cirrus> {
         let auth = self.auth.ok_or(CirrusError::MissingField("auth"))?;
         let api_version = self
             .api_version
             .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
         validate_api_version(&api_version)?;
+        check_transport_security(
+            "instance URL",
+            auth.instance_url(),
+            self.allow_insecure_transport,
+        )?;
 
         let client = if let Some(c) = self.http_client {
             c
@@ -1000,6 +1039,7 @@ impl CirrusBuilder {
             auth,
             api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
+            allow_insecure_transport: self.allow_insecure_transport,
             last_limit_info: Arc::new(RwLock::new(None)),
         })
     }
@@ -1038,6 +1078,45 @@ impl CirrusBuilder {
             ..bootstrap
         })
     }
+}
+
+/// Rejects a target that would carry the Salesforce session token in
+/// the clear.
+///
+/// RFC 6750 §5.3 makes TLS mandatory for requests bearing an OAuth
+/// bearer token, and the value here is the org session id: anything
+/// on the path can replay it for the session's lifetime. Loopback
+/// hosts are exempt (local mock servers and sidecar proxies never
+/// leave the machine), and `allow_insecure` reflects the caller's
+/// deliberate opt-out.
+fn check_transport_security(
+    field: &'static str,
+    url: &str,
+    allow_insecure: bool,
+) -> CirrusResult<()> {
+    if allow_insecure {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url)?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
+        None => false,
+    };
+    if loopback {
+        return Ok(());
+    }
+    Err(CirrusError::InvalidInput {
+        field,
+        message: format!(
+            "`{url}` is not an https target, and the Salesforce session token must not travel in the clear; \
+             opt out with CirrusBuilder::allow_insecure_transport if the plaintext hop is deliberate",
+        ),
+    })
 }
 
 /// Accepts the two forms Salesforce documents for the version segment
@@ -1124,6 +1203,63 @@ mod tests {
         let sf = fixture("https://my.salesforce.com");
         let absolute = "http://localhost:1234/path";
         assert_eq!(sf.resolve_url(absolute), absolute);
+    }
+
+    #[test]
+    fn build_rejects_a_plaintext_instance_url() {
+        // RFC 6750 §5.3: "Clients MUST always use TLS [RFC5246] (https)
+        // or equivalent transport security when making requests with
+        // bearer tokens." An org URL that lost its `s` would otherwise
+        // put the session id on the wire in the clear.
+        let auth = Arc::new(StaticTokenAuth::new(
+            "tok",
+            "http://my-org.my.salesforce.com",
+        ));
+        let err = Cirrus::builder().auth(auth).build().unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, .. } => assert_eq!(field, "instance URL"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_accepts_a_plaintext_instance_url_when_opted_in() {
+        let auth = Arc::new(StaticTokenAuth::new(
+            "tok",
+            "http://my-org.my.salesforce.com",
+        ));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            sf.resolve_url("limits"),
+            "http://my-org.my.salesforce.com/services/data/v66.0/limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_send_the_token_to_a_plaintext_absolute_url() {
+        // The passthrough mode takes a fully-qualified URL, which can
+        // come from data the caller doesn't control (a locator, a
+        // config value). The token must not follow it onto a plaintext
+        // hop — and nothing should be sent at all.
+        let sf = fixture("https://my-org.my.salesforce.com");
+        let err = sf
+            .get::<serde_json::Value>("http://elsewhere.example.com/collect")
+            .await
+            .unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, .. } => assert_eq!(field, "request URL"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        let err = sf
+            .request_builder(reqwest::Method::GET, "http://elsewhere.example.com/collect")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CirrusError::InvalidInput { .. }));
     }
 
     #[test]
