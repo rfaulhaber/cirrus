@@ -75,6 +75,22 @@ pub use cirrus_auth as auth;
 /// `reqwest` version aligned with the SDK's.
 pub use reqwest;
 
+/// Re-export of [`bytes::Bytes`].
+///
+/// [`MetadataClient::deploy`] takes the deployment zip as `Bytes` and
+/// [`RetrieveResult::zip_bytes`] hands the retrieved zip back the same
+/// way, so naming the type doesn't need a separate `bytes` dependency.
+pub use bytes::Bytes;
+
+/// Re-export of `base64::DecodeError`, the error
+/// [`RetrieveResult::zip_bytes`] returns when the server's
+/// base64-encoded zip can't be decoded.
+///
+/// Renamed here because "decode error" alone is ambiguous at the crate
+/// root; it is the same type `base64` exports, so a `From` impl written
+/// against it works for `?`-propagation.
+pub use base64::DecodeError as Base64DecodeError;
+
 pub use auth::{AuthError, AuthSession, SharedAuth};
 pub use error::{MetadataError, MetadataResult, SoapFault};
 pub use handlers::file_based::WaitConfig;
@@ -360,6 +376,16 @@ mod tests {
             .build()
             .unwrap();
         assert!(md.endpoint_url().ends_with("/services/Soap/m/58.0"));
+    }
+
+    #[test]
+    fn re_exports_name_the_types_the_public_api_uses() {
+        // Callers must be able to name every type in a signature
+        // without adding `bytes` or `base64` to their own manifest.
+        let zip: Bytes = Bytes::from_static(b"PKzip");
+        let err: Base64DecodeError = base64::DecodeError::InvalidPadding;
+        assert_eq!(&zip[..], b"PKzip");
+        assert!(matches!(err, base64::DecodeError::InvalidPadding));
     }
 
     #[test]
