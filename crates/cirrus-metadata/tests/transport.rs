@@ -10,7 +10,8 @@
 //! - HTTP 503 → retry per `RetryPolicy`,
 //! - non-envelope body → `MetadataError::Http4xx5xx`,
 //! - 3xx redirect → surfaced as an error, never followed,
-//! - builder read timeout → transport error once the deadline passes.
+//! - builder read timeout → transport error once the deadline passes,
+//! - a body that stops mid-stream → replayed like a failed send.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -609,4 +610,71 @@ async fn the_builder_read_timeout_bounds_a_call_the_org_never_answers() {
         MetadataError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
         other => panic!("expected a transport error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_response_body_that_stops_mid_stream_is_replayed() {
+    // A body failure arrives after the response head, so it can't be
+    // classified by status the way a 503 is — it is exactly as
+    // ambiguous as a send that never got an answer, and follows the
+    // same replay rules. `Ping` is declared idempotent, so it replays.
+    //
+    // wiremock always sends a complete body, so this serves the
+    // truncated response from a raw socket: headers promising 400
+    // bytes, a fragment, then a hang-up.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = success_body("hello");
+    let server = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let _ = sock.read(&mut buf).await;
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 400\r\n\r\n<?xml version=\"1.0\"?><soapenv:Envelope",
+        )
+        .await
+        .unwrap();
+        sock.flush().await.unwrap();
+        drop(sock);
+
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let _ = sock.read(&mut buf).await;
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", format!("http://{addr}")));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .retry_policy(RetryPolicy {
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            jitter: false,
+            ..RetryPolicy::default()
+        })
+        .build()
+        .unwrap();
+
+    let resp = md.call(&Ping).await.unwrap();
+    assert_eq!(
+        resp,
+        PingResponse {
+            result: PingResult {
+                msg: "hello".into()
+            }
+        }
+    );
+    server.await.unwrap();
 }

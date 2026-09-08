@@ -32,7 +32,10 @@ async-trait.workspace = true
 bytes.workspace = true
 dotenvy.workspace = true
 proptest.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `net` and `io-util` back the hand-rolled TCP server the transport
+# tests use for a wire-level failure wiremock can't produce: a response
+# body that stops mid-stream.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 url.workspace = true
 wiremock.workspace = true
 zip.workspace = true
