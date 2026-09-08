@@ -102,6 +102,17 @@ impl SoapOperation for CheckDeployStatusOp {
     }
 }
 
+// Wire-shape provenance (api_meta doc page IDs):
+// - `meta_canceldeploy` names this argument `id` ("CancelDeployResult
+//   = metadatabinding.cancelDeploy(string id)"), but that table prints
+//   the Java parameter name rather than the wire element name:
+//   `meta_checkdeploystatus` likewise prints `id` for the argument
+//   this crate sends -- and Salesforce accepts -- as
+//   `<asyncProcessId>`. The guide publishes no request envelope for
+//   any call, so the element name below is carried over from the two
+//   status calls rather than read off a page. Anything asserting the
+//   name (the fixture in tests/file_based.rs included) is pinning that
+//   inference, not a documented shape.
 struct CancelDeployOp {
     async_process_id: String,
 }

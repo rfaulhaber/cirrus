@@ -228,6 +228,14 @@ async fn check_deploy_status_parses_failure_details() {
 
 // -- cancel_deploy -----------------------------------------------------------
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
+/// CancelDeployResult carries `id` and `done`; "If the done field
+/// value is true, the deployment has been canceled".
+///
+/// The request's element name is not documented — see the wire-shape
+/// provenance note on `CancelDeployOp`. The assertion below pins the
+/// name the crate sends so a change to it is deliberate, not a claim
+/// that a page specifies it.
 #[tokio::test]
 async fn cancel_deploy_round_trip() {
     let server = MockServer::start().await;
