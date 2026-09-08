@@ -178,6 +178,23 @@ impl SoapOperation for RetrieveOp {
                 "RetrieveRequest.api_version is required (e.g. \"66.0\")".into(),
             ));
         }
+        // specificFiles is documented as usable only on its own: it
+        // requires singlePackage true and no packageNames. Default
+        // gives single_package false, so the natural
+        // `..Default::default()` construction would otherwise render
+        // an invalid combination.
+        if !self.request.specific_files.is_empty() {
+            if !self.request.single_package {
+                return Err(MetadataError::InvalidArgument(
+                    "RetrieveRequest.specific_files requires single_package == true".into(),
+                ));
+            }
+            if !self.request.package_names.is_empty() {
+                return Err(MetadataError::InvalidArgument(
+                    "RetrieveRequest.specific_files requires an empty package_names".into(),
+                ));
+            }
+        }
         let mut out = String::with_capacity(256);
         out.push_str("<met:RetrieveRequest>");
         out.push_str("<met:apiVersion>");
@@ -707,6 +724,55 @@ mod tests {
         let op = RetrieveOp { request: req };
         let body = op.render_body().unwrap();
         assert!(body.contains("<met:specificFiles>a&lt;b&gt;c</met:specificFiles>"));
+    }
+
+    /// meta_retrieve_request, specificFiles row: "If a value is
+    /// specified for this property, packageNames must be set to null
+    /// and singlePackage must be set to true."
+    #[test]
+    fn retrieve_op_rejects_specific_files_without_single_package() {
+        // The Default-derived single_package is false, so this is the
+        // shape `..Default::default()` produces.
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            specific_files: vec!["unpackaged/classes/MyClass.cls".into()],
+            ..Default::default()
+        };
+        let op = RetrieveOp { request: req };
+        let err = op.render_body().unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("specific_files"), "{msg}");
+        assert!(msg.contains("single_package"), "{msg}");
+    }
+
+    #[test]
+    fn retrieve_op_rejects_specific_files_alongside_package_names() {
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            single_package: true,
+            package_names: vec!["MyManagedPackage".into()],
+            specific_files: vec!["unpackaged/classes/MyClass.cls".into()],
+            ..Default::default()
+        };
+        let op = RetrieveOp { request: req };
+        let err = op.render_body().unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        assert!(err.to_string().contains("package_names"));
+    }
+
+    #[test]
+    fn retrieve_op_allows_package_names_without_specific_files() {
+        // The coupling is one-directional: packageNames on its own is
+        // the ordinary packaged-retrieve shape.
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            package_names: vec!["MyManagedPackage".into()],
+            ..Default::default()
+        };
+        let op = RetrieveOp { request: req };
+        let body = op.render_body().unwrap();
+        assert!(body.contains("<met:packageNames>MyManagedPackage</met:packageNames>"));
     }
 
     #[test]

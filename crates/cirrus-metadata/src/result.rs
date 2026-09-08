@@ -452,7 +452,12 @@ pub struct RetrieveRequest {
     pub single_package: bool,
     /// Specific file paths to retrieve, e.g.
     /// `["unpackaged/classes/MyClass.cls"]`. When set, `package_names`
-    /// must be empty and `single_package` must be `true`.
+    /// must be empty and `single_package` must be `true` —
+    /// [`retrieve`] rejects any other combination with
+    /// [`MetadataError::InvalidArgument`] rather than sending it.
+    ///
+    /// [`retrieve`]: crate::MetadataClient::retrieve
+    /// [`MetadataError::InvalidArgument`]: crate::MetadataError::InvalidArgument
     pub specific_files: Vec<String>,
     /// Unpackaged components to retrieve, expressed as a
     /// [`PackageManifest`]. Built with the same fluent API used for
