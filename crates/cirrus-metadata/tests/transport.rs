@@ -8,7 +8,8 @@
 //! - `INVALID_SESSION_ID` fault → token invalidate + retry once,
 //! - same fault with non-refreshable auth → surfaced verbatim,
 //! - HTTP 503 → retry per `RetryPolicy`,
-//! - non-envelope body → `MetadataError::Http4xx5xx`.
+//! - non-envelope body → `MetadataError::Http4xx5xx`,
+//! - 3xx redirect → surfaced as an error, never followed.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -549,4 +550,36 @@ async fn response_text_reaches_the_caller_verbatim() {
 
     let resp = md.call(&Ping).await.unwrap();
     assert_eq!(resp.result.msg, "Tom & Jerry");
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let target = MockServer::start().await;
+    let server = MockServer::start().await;
+
+    // Nothing may reach the redirect target: the session token rides in
+    // the SOAP envelope, so following the hop would hand it to whatever
+    // host the Location named.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header("location", format!("{}/x", target.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Http4xx5xx { status, .. } => assert_eq!(status, 307),
+        other => panic!("expected Http4xx5xx with status 307, got {other:?}"),
+    }
 }
