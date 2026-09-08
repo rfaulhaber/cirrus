@@ -85,6 +85,17 @@ pub enum CirrusError {
     #[error("invalid header value: {0}")]
     InvalidHeader(String),
 
+    /// A caller-supplied value was rejected before any request went out
+    /// — a builder setting the SDK can't use, or a value that can't be
+    /// expressed as a URL path segment.
+    #[error("invalid {field}: {message}")]
+    InvalidInput {
+        /// What was rejected, e.g. `"api_version"` or `"path segment"`.
+        field: &'static str,
+        /// Why it was rejected, and which form is accepted instead.
+        message: String,
+    },
+
     /// Response could not be interpreted as the requested type or shape.
     #[error("invalid response: {0}")]
     InvalidResponse(String),

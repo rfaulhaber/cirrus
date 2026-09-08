@@ -290,7 +290,20 @@ impl Cirrus {
     /// Use this when any segment may contain reserved characters (slash,
     /// equals, percent, etc.) — e.g. an upsert external-ID value. Each
     /// element of `segments` is encoded as a single path segment.
+    ///
+    /// A segment of `.` or `..` is rejected: URL path resolution drops
+    /// those rather than encoding them, so the request would quietly
+    /// land one segment short — on a different Salesforce resource —
+    /// instead of failing.
     pub(crate) fn versioned_segments(&self, segments: &[&str]) -> CirrusResult<String> {
+        if let Some(dotted) = segments.iter().find(|s| matches!(**s, "." | "..")) {
+            return Err(CirrusError::InvalidInput {
+                field: "path segment",
+                message: format!(
+                    "`{dotted}` is a relative path reference, so it cannot address a resource",
+                ),
+            });
+        }
         let base = format!(
             "{}/services/data/{}/",
             self.auth.instance_url(),
@@ -1966,6 +1979,18 @@ mod property_tests {
         "[A-Za-z0-9_-]{1,32}"
     }
 
+    /// Segment strategy that reaches the dot-segment forms URL path
+    /// resolution treats specially, for the "no segment ever vanishes"
+    /// property below.
+    fn maybe_dotted_segment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[A-Za-z0-9_-]{1,8}",
+            "\\.{1,3}",
+            "[A-Za-z0-9_-]{0,4}\\.[A-Za-z0-9_-]{0,4}",
+        ]
+        .prop_filter("segments are non-empty", |s: &String| !s.is_empty())
+    }
+
     proptest! {
         /// For any non-fully-qualified path, `resolve_url` produces a
         /// URL that parses cleanly and never contains a `//` outside
@@ -2036,6 +2061,39 @@ mod property_tests {
             prop_assert_eq!(segments[4], seg2);
         }
 
+        /// `versioned_segments` either keeps every segment it was given
+        /// or refuses the call — it never returns a URL that is a
+        /// segment short. Dot segments are the way that happens:
+        /// URL path resolution drops them instead of encoding them.
+        #[test]
+        fn versioned_segments_never_silently_drops_a_segment(
+            segs in proptest::collection::vec(maybe_dotted_segment(), 1..5),
+        ) {
+            let sf = fixture("https://my.salesforce.com");
+            let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+            match sf.versioned_segments(&refs) {
+                Ok(url_str) => {
+                    let parsed = url::Url::parse(&url_str).unwrap();
+                    let segments: Vec<&str> = parsed
+                        .path_segments()
+                        .map(|s| s.collect())
+                        .unwrap_or_default();
+                    // ["services", "data", "{version}", ..segs]
+                    prop_assert_eq!(
+                        segments.len(),
+                        3 + segs.len(),
+                        "segments {:?} lost a component: {}",
+                        segs,
+                        url_str,
+                    );
+                }
+                Err(e) => prop_assert!(
+                    matches!(e, CirrusError::InvalidInput { .. }),
+                    "unexpected error {e:?}",
+                ),
+            }
+        }
+
         /// `versioned_segments` never emits double slashes between
         /// segments. The pop_if_empty trick guards against that; this
         /// property pins it.
@@ -2051,6 +2109,27 @@ mod property_tests {
                 !after_scheme.contains("//"),
                 "got double slash in {url}",
             );
+        }
+    }
+
+    /// Targeted regression: a `.` or `..` external-ID value must not
+    /// silently shorten the URL. `PATCH .../sobjects/Account/Ext__c/.`
+    /// would otherwise resolve to the sObject Rows resource with
+    /// `Ext__c` read as the record ID.
+    #[test]
+    fn versioned_segments_rejects_relative_path_references() {
+        let sf = fixture("https://my.salesforce.com");
+        for value in [".", ".."] {
+            let err = sf
+                .versioned_segments(&["sobjects", "Account", "Ext_Id__c", value])
+                .unwrap_err();
+            match err {
+                CirrusError::InvalidInput { field, message } => {
+                    assert_eq!(field, "path segment");
+                    assert!(message.contains(value), "message should name the segment");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
         }
     }
 
