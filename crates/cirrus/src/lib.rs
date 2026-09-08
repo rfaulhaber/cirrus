@@ -889,6 +889,12 @@ impl CirrusBuilder {
 
     /// Sets the Salesforce REST API version, e.g. `"v66.0"`. Defaults to
     /// [`DEFAULT_API_VERSION`].
+    ///
+    /// Salesforce writes this URI segment as `vXX.X`, or as the alias
+    /// `latest` to track the org's newest release. Anything else — the
+    /// bare `"66.0"` that [`ApiVersion::version`] carries, for instance
+    /// — is rejected by [`build`](Self::build) rather than turning every
+    /// later call into a `NOT_FOUND`.
     pub fn api_version(mut self, version: impl Into<String>) -> Self {
         self.api_version = Some(version.into());
         self
@@ -946,8 +952,16 @@ impl CirrusBuilder {
     }
 
     /// Finalizes the builder.
+    ///
+    /// Fails when no [`auth`](Self::auth) session was supplied, or when
+    /// [`api_version`](Self::api_version) isn't a version segment
+    /// Salesforce recognizes.
     pub fn build(self) -> CirrusResult<Cirrus> {
         let auth = self.auth.ok_or(CirrusError::MissingField("auth"))?;
+        let api_version = self
+            .api_version
+            .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
+        validate_api_version(&api_version)?;
 
         let client = if let Some(c) = self.http_client {
             c
@@ -984,9 +998,7 @@ impl CirrusBuilder {
         Ok(Cirrus {
             client,
             auth,
-            api_version: self
-                .api_version
-                .unwrap_or_else(|| DEFAULT_API_VERSION.to_string()),
+            api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
             last_limit_info: Arc::new(RwLock::new(None)),
         })
@@ -1026,6 +1038,36 @@ impl CirrusBuilder {
             ..bootstrap
         })
     }
+}
+
+/// Accepts the two forms Salesforce documents for the version segment
+/// of a REST URI: `vXX.X` and the alias `latest`.
+///
+/// The bare numeric form (`"66.0"`) is what `GET /services/data`
+/// reports in `ApiVersion::version`, and it is the mistake worth
+/// catching here: the SDK would happily build
+/// `/services/data/66.0/query` and every call would come back as a
+/// generic `NOT_FOUND` that never mentions the version.
+fn validate_api_version(version: &str) -> CirrusResult<()> {
+    let numeric = version.strip_prefix('v').and_then(|v| v.split_once('.'));
+    let well_formed = match numeric {
+        Some((major, minor)) => {
+            !major.is_empty()
+                && !minor.is_empty()
+                && major.bytes().all(|b| b.is_ascii_digit())
+                && minor.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    };
+    if version == "latest" || well_formed {
+        return Ok(());
+    }
+    Err(CirrusError::InvalidInput {
+        field: "api_version",
+        message: format!(
+            "expected `vXX.X` (for example `{DEFAULT_API_VERSION}`) or `latest`, got `{version}`",
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -1082,6 +1124,47 @@ mod tests {
         let sf = fixture("https://my.salesforce.com");
         let absolute = "http://localhost:1234/path";
         assert_eq!(sf.resolve_url(absolute), absolute);
+    }
+
+    #[test]
+    fn build_rejects_a_version_segment_salesforce_would_not_recognize() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_query.htm
+        // "URI: /services/data/vXX.X/query?q=query" — the segment
+        // carries the `v`. `ApiVersion::version` reports "66.0"
+        // without it, which is the value callers copy by mistake.
+        for bad in ["66.0", "v66", "V66.0", "vXX.X", ""] {
+            let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+            let err = Cirrus::builder()
+                .auth(auth)
+                .api_version(bad)
+                .build()
+                .unwrap_err();
+            match err {
+                CirrusError::InvalidInput { field, message } => {
+                    assert_eq!(field, "api_version");
+                    assert!(message.contains("latest"), "message should name both forms");
+                }
+                other => panic!("expected InvalidInput for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_accepts_the_latest_version_alias() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_versions.htm
+        // "Version alias: Instead of a numeric version (for example,
+        // vXX.X), you can use latest in the URI to resolve to the most
+        // recently released API version."
+        let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("latest")
+            .build()
+            .unwrap();
+        assert_eq!(
+            sf.resolve_url("limits"),
+            "https://my.salesforce.com/services/data/latest/limits"
+        );
     }
 
     #[test]
