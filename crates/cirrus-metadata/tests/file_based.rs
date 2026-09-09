@@ -564,49 +564,69 @@ async fn wait_for_deploy_times_out_when_never_done() {
 }
 
 // -- wait_for_retrieve -------------------------------------------------------
+//
+// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_checkretrievestatus.htm
+// "By default, checkRetrieveStatus() returns the zip file on the last
+// call to this operation when the retrieval is completed
+// (RetrieveResult.isDone() == true) and then deletes the zip file from
+// the server. Subsequent calls to checkRetrieveStatus() for the same
+// retrieve operation can't retrieve the zip file after it has been
+// deleted." The documented pattern polls with includeZip false and
+// fetches the zip with one final includeZip-true call.
+
+fn retrieve_status_body(done: bool, success: bool, zip: Option<&str>) -> String {
+    let status = if !done {
+        "InProgress"
+    } else if success {
+        "Succeeded"
+    } else {
+        "Failed"
+    };
+    let zip_element = zip
+        .map(|z| format!("<zipFile>{z}</zipFile>"))
+        .unwrap_or_default();
+    format!(
+        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkRetrieveStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>09S00000poll</id>
+        <done>{done}</done>
+        <success>{success}</success>
+        <status>{status}</status>
+        {zip_element}
+      </result>
+    </checkRetrieveStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+    )
+}
+
+fn fast_wait() -> WaitConfig {
+    WaitConfig {
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        total_timeout: None,
+    }
+}
 
 #[tokio::test]
-async fn wait_for_retrieve_returns_final_result_with_zip() {
+async fn wait_for_retrieve_polls_without_zip_then_fetches_it_once() {
     let server = MockServer::start().await;
-    let counter = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
 
+    // Status polls: the first is still running, the second is done.
+    // Neither asks for the zip.
     Mock::given(method("POST"))
-        .and(body_string_contains("<met:checkRetrieveStatus>"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
         .respond_with({
-            let counter = counter.clone();
+            let polls = polls.clone();
             move |_: &wiremock::Request| {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-                let body = if n == 0 {
-                    r#"<?xml version="1.0"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
-  <soapenv:Body>
-    <checkRetrieveStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
-      <result>
-        <id>09S00000poll</id>
-        <done>false</done>
-        <status>InProgress</status>
-      </result>
-    </checkRetrieveStatusResponse>
-  </soapenv:Body>
-</soapenv:Envelope>"#
-                        .to_string()
-                } else {
-                    r#"<?xml version="1.0"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
-  <soapenv:Body>
-    <checkRetrieveStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
-      <result>
-        <id>09S00000poll</id>
-        <done>true</done>
-        <success>true</success>
-        <status>Succeeded</status>
-        <zipFile>UEt6aXA=</zipFile>
-      </result>
-    </checkRetrieveStatusResponse>
-  </soapenv:Body>
-</soapenv:Envelope>"#
-                        .to_string()
-                };
+                let n = polls.fetch_add(1, Ordering::SeqCst);
+                let body = retrieve_status_body(n > 0, n > 0, None);
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/xml; charset=UTF-8")
                     .set_body_string(body)
@@ -615,20 +635,119 @@ async fn wait_for_retrieve_returns_final_result_with_zip() {
         .mount(&server)
         .await;
 
+    // The zip is served exactly once, by the single includeZip-true call.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>true</met:includeZip>",
+        ))
+        .respond_with(xml_response(&retrieve_status_body(
+            true,
+            true,
+            Some("UEt6aXA="),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
     let md = client_against(&server);
     let result = md
-        .wait_for_retrieve_with(
-            "09S00000poll",
-            WaitConfig {
-                initial_delay: Duration::from_millis(1),
-                max_delay: Duration::from_millis(5),
-                total_timeout: None,
-            },
-        )
+        .wait_for_retrieve_with("09S00000poll", fast_wait())
         .await
         .unwrap();
     assert!(result.done);
     let zip = result.zip_bytes().unwrap().unwrap();
     assert_eq!(&zip[..], b"PKzip");
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn wait_for_retrieve_skips_the_zip_fetch_when_the_retrieve_failed() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(xml_response(&retrieve_status_body(true, false, None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // A failed retrieve produced no zip; asking for one would spend an
+    // API call for nothing.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>true</met:includeZip>",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .wait_for_retrieve_with("09S00000poll", fast_wait())
+        .await
+        .unwrap();
+    assert!(result.done);
+    assert!(!result.success);
+    assert_eq!(result.status, Some(RetrieveStatus::Failed));
+}
+
+#[tokio::test]
+async fn check_retrieve_status_with_zip_is_never_replayed() {
+    let server = MockServer::start().await;
+
+    // 503 from an intermediary after the origin already served — and
+    // deleted — the zip. Replaying can only lose the payload, so the
+    // status is surfaced on the first attempt.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>true</met:includeZip>",
+        ))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let err = md
+        .check_retrieve_status("09S00000poll", true)
+        .await
+        .unwrap_err();
+    match err {
+        MetadataError::Http4xx5xx { status, .. } => assert_eq!(status, 503),
+        other => panic!("expected Http4xx5xx, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn check_retrieve_status_without_zip_is_retried() {
+    let server = MockServer::start().await;
+
+    // The status-only poll carries no payload, so a 503 replays like
+    // any other read.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(xml_response(&retrieve_status_body(false, false, None)))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .check_retrieve_status("09S00000poll", false)
+        .await
+        .unwrap();
+    assert!(!result.done);
 }

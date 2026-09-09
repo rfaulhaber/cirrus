@@ -75,6 +75,22 @@ pub use cirrus_auth as auth;
 /// `reqwest` version aligned with the SDK's.
 pub use reqwest;
 
+/// Re-export of [`bytes::Bytes`].
+///
+/// [`MetadataClient::deploy`] takes the deployment zip as `Bytes` and
+/// [`RetrieveResult::zip_bytes`] hands the retrieved zip back the same
+/// way, so naming the type doesn't need a separate `bytes` dependency.
+pub use bytes::Bytes;
+
+/// Re-export of `base64::DecodeError`, the error
+/// [`RetrieveResult::zip_bytes`] returns when the server's
+/// base64-encoded zip can't be decoded.
+///
+/// Renamed here because "decode error" alone is ambiguous at the crate
+/// root; it is the same type `base64` exports, so a `From` impl written
+/// against it works for `?`-propagation.
+pub use base64::DecodeError as Base64DecodeError;
+
 pub use auth::{AuthError, AuthSession, SharedAuth};
 pub use error::{MetadataError, MetadataResult, SoapFault};
 pub use handlers::file_based::WaitConfig;
@@ -95,6 +111,17 @@ pub use transport::SoapOperation;
 /// SOAP endpoint paths use bare version numbers without the `v` prefix
 /// (`/services/Soap/m/66.0`).
 pub const DEFAULT_API_VERSION: &str = "66.0";
+
+/// Deadline for establishing a connection to the SOAP endpoint.
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Deadline for each read from an open response body.
+///
+/// A per-read deadline rather than a whole-request one: a retrieve can
+/// legitimately stream tens of megabytes of base64 zip, so the transfer
+/// gets as long as it needs while a peer that stops sending altogether
+/// still surfaces an error the retry policy can act on.
+const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Default User-Agent header sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -258,6 +285,13 @@ impl MetadataClientBuilder {
     /// a connection pool across multiple SDK clients or for installing
     /// custom middleware. When provided, the builder's `user_agent`
     /// setting is ignored — configure that on the supplied client.
+    ///
+    /// The supplied client also brings its own timeouts and redirect
+    /// policy. The client this builder constructs otherwise sets a
+    /// 30 s connect timeout, a 60 s read timeout, and disables redirects
+    /// so the session token in the SOAP envelope is never re-POSTed to a
+    /// redirect target; a client configured here should do the same
+    /// unless you have a reason not to.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -285,6 +319,14 @@ impl MetadataClientBuilder {
             );
             reqwest::Client::builder()
                 .default_headers(headers)
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .read_timeout(DEFAULT_READ_TIMEOUT)
+                // The Metadata API carries the session token in the
+                // request body, where a redirect's cross-host header
+                // stripping can't reach it. Surfacing a 3xx as an error
+                // beats re-POSTing the envelope — token included — to
+                // whatever host the Location named.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(MetadataError::HttpClient)?
         };
@@ -334,6 +376,16 @@ mod tests {
             .build()
             .unwrap();
         assert!(md.endpoint_url().ends_with("/services/Soap/m/58.0"));
+    }
+
+    #[test]
+    fn re_exports_name_the_types_the_public_api_uses() {
+        // Callers must be able to name every type in a signature
+        // without adding `bytes` or `base64` to their own manifest.
+        let zip: Bytes = Bytes::from_static(b"PKzip");
+        let err: Base64DecodeError = base64::DecodeError::InvalidPadding;
+        assert_eq!(&zip[..], b"PKzip");
+        assert!(matches!(err, base64::DecodeError::InvalidPadding));
     }
 
     #[test]

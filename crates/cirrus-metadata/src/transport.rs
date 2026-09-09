@@ -8,9 +8,12 @@
 //! 2. Builds the envelope around the rendered body.
 //! 3. POSTs to `/services/Soap/m/{api_version}` with the SOAP-required
 //!    headers (`Content-Type: text/xml; charset=UTF-8`, `SOAPAction: ""`).
-//! 4. Retries transient HTTP failures per the client's [`RetryPolicy`].
-//! 5. Parses the response envelope into either a typed `O::Response` or
+//! 4. Parses the response envelope into either a typed `O::Response` or
 //!    a [`MetadataError::Soap`] carrying the [`SoapFault`].
+//! 5. Retries transient failures per the client's [`RetryPolicy`]. The
+//!    envelope is parsed first, so an application-level fault is
+//!    surfaced immediately instead of being replayed under the 5xx
+//!    rule.
 //! 6. On `INVALID_SESSION_ID` faults, invalidates the cached token and
 //!    retries the entire call once with a freshly-minted token.
 //!
@@ -58,13 +61,16 @@ pub trait SoapOperation {
     /// Whether the operation is safe to replay when the outcome of a
     /// sent request is unknown (a 5xx from an intermediary, a
     /// mid-request network failure). Every SOAP call is an HTTP POST,
-    /// so this declaration is the only idempotency signal the retry
-    /// policy has. Defaults to `false` (never replay); read-only
-    /// operations (`checkDeployStatus`, `listMetadata`, …) opt in.
+    /// so the HTTP method carries no idempotency signal; the retry path
+    /// reads [`idempotent()`](Self::idempotent), which defaults to this
+    /// const. Defaults to `false` (never replay); read-only operations
+    /// (`checkDeployStatus`, `listMetadata`, …) opt in. An operation
+    /// whose replay safety depends on its arguments overrides
+    /// [`idempotent()`](Self::idempotent) instead of setting this.
     const IDEMPOTENT: bool = false;
 
     /// The typed response shape. Deserialized via `quick-xml`'s serde
-    /// implementation from the bytes of the full
+    /// implementation from the full
     /// `<{NAME}Response>...</{NAME}Response>` element.
     type Response: DeserializeOwned;
 
@@ -75,6 +81,17 @@ pub trait SoapOperation {
     /// The renderer is responsible for any inner XML namespaces; the
     /// outer `met:` prefix is added by the transport.
     fn render_body(&self) -> MetadataResult<String>;
+
+    /// Whether *this* request is safe to replay. Defaults to
+    /// [`IDEMPOTENT`](Self::IDEMPOTENT).
+    ///
+    /// Override when replay safety depends on the arguments rather than
+    /// the operation — `checkRetrieveStatus` is a plain status read
+    /// while `includeZip` is `false`, but the call that fetches the zip
+    /// also deletes it from the server and must never be replayed.
+    fn idempotent(&self) -> bool {
+        Self::IDEMPOTENT
+    }
 }
 
 /// Dispatch one SOAP operation through the client.
@@ -85,8 +102,12 @@ pub(crate) async fn soap_call<O: SoapOperation>(
     let response_local = format!("{}Response", O::NAME);
     let body_xml = op.render_body()?;
     let inner =
-        call_with_auth_retry(client, O::NAME, O::IDEMPOTENT, &body_xml, &response_local).await?;
-    let parsed: O::Response = quick_xml::de::from_reader(inner.as_slice())?;
+        call_with_auth_retry(client, O::NAME, op.idempotent(), &body_xml, &response_local).await?;
+    // `from_str` borrows text nodes straight out of `inner`; the
+    // `from_reader` path would copy every event — including the
+    // multi-megabyte base64 `<zipFile>` — through an internal buffer
+    // first.
+    let parsed: O::Response = quick_xml::de::from_str(&inner)?;
     Ok(parsed)
 }
 
@@ -99,7 +120,7 @@ async fn call_with_auth_retry(
     idempotent: bool,
     body_xml: &str,
     response_local: &str,
-) -> MetadataResult<Vec<u8>> {
+) -> MetadataResult<String> {
     // First iteration fetches a token from the auth session. On a
     // refresh-after-INVALID_SESSION_ID we thread the *already-fetched*
     // fresh token in here, instead of calling access_token() a second
@@ -151,15 +172,15 @@ async fn call_with_auth_retry(
     }
 }
 
-/// Inner loop: retries transient HTTP failures per [`RetryPolicy`].
-/// Returns the bytes of the response envelope's
-/// `<{NAME}Response>...</{NAME}Response>` element on success.
+/// Inner loop: retries transient failures per [`RetryPolicy`]. Returns
+/// the response envelope's `<{NAME}Response>...</{NAME}Response>`
+/// element on success.
 async fn send_with_retries(
     client: &MetadataClient,
     idempotent: bool,
     envelope_bytes: Bytes,
     response_local: &str,
-) -> MetadataResult<Vec<u8>> {
+) -> MetadataResult<String> {
     let url = client.endpoint_url();
     let mut attempt: u32 = 0;
     loop {
@@ -178,26 +199,58 @@ async fn send_with_retries(
             Ok(response) => {
                 let status = response.status().as_u16();
                 let headers = response.headers().clone();
+                let status_retryable =
+                    retry::should_retry_status(&client.retry_policy, idempotent, status, attempt);
 
-                if retry::should_retry_status(&client.retry_policy, idempotent, status, attempt) {
-                    // Drain the body so the connection returns clean.
-                    let _ = response.bytes().await;
-                    let retry_after = retry::parse_retry_after(&headers);
-                    let delay = retry::compute_delay(&client.retry_policy, attempt, retry_after);
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                }
+                let bytes = match response.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // The response died mid-body — as ambiguous as
+                        // a failed send, so it follows the same replay
+                        // rules.
+                        let err: MetadataError = e.into();
+                        if status_retryable
+                            || retry::should_retry_network(
+                                &client.retry_policy,
+                                idempotent,
+                                &err,
+                                attempt,
+                            )
+                        {
+                            sleep_before_retry(client, attempt, &headers).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                };
 
-                let bytes = response.bytes().await?;
-                // SOAP faults can arrive with HTTP 500 or (uncommonly) HTTP 200.
-                // Parse the envelope regardless and let it decide.
+                // SOAP faults can arrive with HTTP 500 or (uncommonly)
+                // HTTP 200, so the body decides the outcome — not the
+                // status. Parsing before the retry decision is what
+                // keeps a deterministic application fault (INVALID_TYPE,
+                // REQUEST_LIMIT_EXCEEDED, INVALID_SESSION_ID) from being
+                // replayed under the 5xx rule and surfaced only after
+                // the whole retry budget is spent.
                 match envelope::parse_envelope(&bytes, response_local) {
                     Ok(EnvelopeBody::Success(inner)) => return Ok(inner),
                     Ok(EnvelopeBody::Fault(fault)) => {
+                        if status_retryable && retry::is_transient_fault(&fault) {
+                            sleep_before_retry(client, attempt, &headers).await;
+                            attempt += 1;
+                            continue;
+                        }
                         return Err(MetadataError::Soap { status, fault });
                     }
                     Err(parse_err) => {
+                        // No SOAP envelope means the response came from
+                        // an intermediary rather than the org, so the
+                        // status is all we have to go on.
+                        if status_retryable {
+                            sleep_before_retry(client, attempt, &headers).await;
+                            attempt += 1;
+                            continue;
+                        }
                         // 2xx with a body we couldn't parse is a
                         // server-shape problem, not an HTTP error:
                         // route through InvalidResponse so the variant
@@ -227,4 +280,16 @@ async fn send_with_retries(
             }
         }
     }
+}
+
+/// Wait out the backoff for `attempt`, honoring a `Retry-After` hint on
+/// the response that prompted the retry.
+async fn sleep_before_retry(
+    client: &MetadataClient,
+    attempt: u32,
+    headers: &reqwest::header::HeaderMap,
+) {
+    let retry_after = retry::parse_retry_after(headers);
+    let delay = retry::compute_delay(&client.retry_policy, attempt, retry_after);
+    tokio::time::sleep(delay).await;
 }

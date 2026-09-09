@@ -8,7 +8,8 @@
 //! - `INVALID_SESSION_ID` fault → token invalidate + retry once,
 //! - same fault with non-refreshable auth → surfaced verbatim,
 //! - HTTP 503 → retry per `RetryPolicy`,
-//! - non-envelope body → `MetadataError::Http4xx5xx`.
+//! - non-envelope body → `MetadataError::Http4xx5xx`,
+//! - 3xx redirect → surfaced as an error, never followed.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -225,13 +226,22 @@ async fn envelope_includes_session_token_and_operation_name() {
 async fn soap_fault_surfaces_as_typed_error() {
     let server = MockServer::start().await;
 
-    // Salesforce sends faults with HTTP 500 by default.
+    // Salesforce sends faults with HTTP 500 by default. An application
+    // fault returns the same answer on every attempt, so the 500 must
+    // not draw the operation through the retry budget first — one
+    // request, then the typed error.
+    //
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_error_handling.htm
+    // "it uses SOAP fault messages defined in those WSDLs for errors
+    // resulting from badly formed messages, failed authentication, or
+    // similar problems."
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(500)
                 .insert_header("content-type", "text/xml; charset=UTF-8")
                 .set_body_string(fault_body("INVALID_TYPE", "no such metadata type")),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -443,4 +453,133 @@ async fn request_builder_escape_hatch_returns_post_with_soap_headers() {
 
     let resp = md.request_builder().body("<custom/>").send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn transient_fault_on_idempotent_op_is_retried() {
+    let server = MockServer::start().await;
+
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_calls_concepts_core_data_objects.htm
+    // ExceptionCode SERVER_UNAVAILABLE: "A server that's necessary for
+    // this call is unavailable. Other types of requests could still
+    // work." Unlike a request-shape fault, that can clear on a replay.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(fault_body("SERVER_UNAVAILABLE", "try again")),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body("recovered")),
+        )
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let resp = md.call(&Ping).await.unwrap();
+    assert_eq!(resp.result.msg, "recovered");
+}
+
+#[tokio::test]
+async fn invalid_session_refresh_does_not_resend_the_stale_token() {
+    let server = MockServer::start().await;
+
+    // The refresh path is reached on the first fault rather than after
+    // the retry budget has been spent re-sending a token the server has
+    // already rejected — so the stale token goes out exactly once.
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains(
+            "<met:sessionId>stale-token</met:sessionId>",
+        ))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(fault_body("INVALID_SESSION_ID", "session expired")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains(
+            "<met:sessionId>fresh-token</met:sessionId>",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body("after-refresh")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = RotatingAuth::new(server.uri(), vec!["stale-token", "fresh-token"]);
+    let md = client_for(&server, auth);
+
+    let resp = md.call(&Ping).await.unwrap();
+    assert_eq!(resp.result.msg, "after-refresh");
+}
+
+#[tokio::test]
+async fn response_text_reaches_the_caller_verbatim() {
+    let server = MockServer::start().await;
+
+    // Entity references split character data into separate parser
+    // events; the whitespace on either side must survive the round trip
+    // so metadata values arrive exactly as the org stores them.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body("Tom &amp; Jerry")),
+        )
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let resp = md.call(&Ping).await.unwrap();
+    assert_eq!(resp.result.msg, "Tom & Jerry");
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let target = MockServer::start().await;
+    let server = MockServer::start().await;
+
+    // Nothing may reach the redirect target: the session token rides in
+    // the SOAP envelope, so following the hop would hand it to whatever
+    // host the Location named.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header("location", format!("{}/x", target.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Http4xx5xx { status, .. } => assert_eq!(status, 307),
+        other => panic!("expected Http4xx5xx with status 307, got {other:?}"),
+    }
 }
