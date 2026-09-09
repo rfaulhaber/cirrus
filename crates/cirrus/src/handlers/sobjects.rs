@@ -81,13 +81,15 @@ impl SObjectsHandler<'_> {
     /// response.
     ///
     /// `since` is formatted as RFC 7231 IMF-fixdate (e.g.
-    /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) via the `httpdate` crate
-    /// before being sent.
+    /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) before being sent. A `since`
+    /// before the Unix epoch, or in year 9999 or later, can't be
+    /// expressed in that format and returns
+    /// [`CirrusError::InvalidHeader`].
     pub async fn describe_global_if_modified_since(
         &self,
         since: SystemTime,
     ) -> CirrusResult<Option<DescribeGlobal>> {
-        let date = httpdate::fmt_http_date(since);
+        let date = http_date(since)?;
         let (status, bytes) = self
             .client
             .send_with_headers(
@@ -145,7 +147,8 @@ impl<'a> SObjectHandler<'a> {
     /// [`SObjectsHandler::describe_global_if_modified_since`]:
     /// pass the timestamp of your last fetch; Salesforce returns 304
     /// (and you can keep your cached metadata) when nothing has
-    /// changed.
+    /// changed. A `since` that RFC 7231's IMF-fixdate format can't
+    /// express returns [`CirrusError::InvalidHeader`].
     pub async fn describe_if_modified_since(
         &self,
         since: SystemTime,
@@ -165,7 +168,7 @@ impl<'a> SObjectHandler<'a> {
         let url = self
             .client
             .versioned_segments(&["sobjects", self.name, "describe"])?;
-        let date = httpdate::fmt_http_date(since);
+        let date = http_date(since)?;
         let (status, bytes) = self
             .client
             .send_with_headers(
@@ -307,10 +310,9 @@ impl<'a> SObjectHandler<'a> {
     ///
     /// Sends a `multipart/form-data` request with the metadata as one
     /// part and the binary as a second part. See [`BlobUploadSpec`] for
-    /// the per-object naming conventions Salesforce requires (the JSON
-    /// part name and the blob field name vary by sObject — and even by
-    /// operation; Document inserts use `entity_document` but updates
-    /// use `entity_content`).
+    /// how the two parts are named: the binary part must carry the
+    /// sObject's blob field API name, and the JSON part's name is
+    /// caller-chosen.
     ///
     /// Calls
     /// `POST /services/data/{api_version}/sobjects/{name}` with a
@@ -387,12 +389,10 @@ impl<'a> SObjectHandler<'a> {
     /// `PATCH /services/data/{api_version}/sobjects/{name}/{id}` with
     /// a multipart body. Salesforce returns 204 No Content on success.
     ///
-    /// # Wire-shape gotcha
-    ///
-    /// Per the docs, the `json_part_name` for *updates* is
-    /// `entity_content` even when the object is `Document` (which
-    /// uses `entity_document` on insert). Caller specifies which name
-    /// to use; we don't try to derive it.
+    /// The doc's update example names its JSON part `entity_content`
+    /// where the insert example uses `entity_document`; neither name is
+    /// required, so pass whichever you like — only
+    /// [`BlobUploadSpec::blob_field_name`] is constrained.
     ///
     /// [`create_with_blob`]: Self::create_with_blob
     pub async fn update_with_blob<B>(
@@ -424,44 +424,76 @@ impl<'a> SObjectHandler<'a> {
     }
 }
 
+/// Formats a [`SystemTime`] as an RFC 7231 IMF-fixdate for
+/// `If-Modified-Since`.
+///
+/// `httpdate::fmt_http_date` is partial: it panics for times before the
+/// Unix epoch and for year 9999 onwards. Both bounds are checked here so
+/// a caller-supplied watermark — a stored sentinel, a clock skewed
+/// backwards — surfaces as an error instead of unwinding the calling
+/// task.
+fn http_date(since: SystemTime) -> CirrusResult<String> {
+    // httpdate's own ceiling, in seconds since the epoch: 9999-01-01.
+    const YEAR_9999: u64 = 253_402_300_800;
+
+    let secs = since
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| {
+            CirrusError::InvalidHeader(
+                "If-Modified-Since requires a time at or after the Unix epoch".into(),
+            )
+        })?
+        .as_secs();
+    if secs >= YEAR_9999 {
+        return Err(CirrusError::InvalidHeader(
+            "If-Modified-Since requires a time before year 9999".into(),
+        ));
+    }
+    Ok(httpdate::fmt_http_date(since))
+}
+
 /// Specification for a multipart blob upload via
 /// [`SObjectHandler::create_with_blob`] or
 /// [`SObjectHandler::update_with_blob`].
 ///
-/// # Per-sObject naming conventions
+/// # Naming the two parts
 ///
-/// Salesforce's blob upload format requires two specific part names
-/// that vary by sObject and operation. The docs document a few
-/// well-known combinations:
+/// Only one of the two part names is constrained. Per the
+/// [Insert or Update Blob Data] doc: "In the non-binary part of the
+/// request body, use any value for the name attribute. For single
+/// documents, in the binary part of the request body, use the name
+/// attribute to specify the name of the blob data field for the
+/// object."
 ///
-/// | sObject          | Operation | `json_part_name`    | `blob_field_name` |
-/// |------------------|-----------|---------------------|-------------------|
-/// | `ContentVersion` | insert    | `entity_content`    | `VersionData`     |
-/// | `Document`       | insert    | `entity_document`   | `Body`            |
-/// | `Document`       | update    | `entity_content`    | `Body`            |
-/// | `Attachment`     | insert    | `entity_attachment` | `Body`            |
+/// So [`blob_field_name`](Self::blob_field_name) must be the sObject's
+/// blob field API name, while
+/// [`json_part_name`](Self::json_part_name) is yours to choose. The
+/// doc's examples happen to use these:
 ///
-/// Note that `Document` insert and update use different
-/// `json_part_name` values, per Salesforce's documentation.
+/// | sObject          | Operation | Example `json_part_name` | Required `blob_field_name` |
+/// |------------------|-----------|--------------------------|----------------------------|
+/// | `ContentVersion` | insert    | `entity_content`         | `VersionData`              |
+/// | `Document`       | insert    | `entity_document`        | `Body`                     |
+/// | `Document`       | update    | `entity_content`         | `Body`                     |
 ///
-/// For other blob-bearing objects, consult the
-/// [Insert or Update Blob Data] doc — the convention is generally
-/// `entity_<lowercased-object>` for the JSON part and the
-/// blob-field's API name for the binary part, but always verify.
+/// The two different names for `Document` are just what the two
+/// examples happen to show — either works for either operation.
+///
+/// For other blob-bearing objects, look up the blob field's API name on
+/// the object; the JSON part name needs no lookup.
 ///
 /// [Insert or Update Blob Data]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
-#[derive(Debug)]
 pub struct BlobUploadSpec<'a, B: ?Sized> {
-    /// Name of the JSON metadata part. See the table on
-    /// [`BlobUploadSpec`] for known per-object values.
+    /// Name of the JSON metadata part. Any value works — see the
+    /// [type-level docs](BlobUploadSpec#naming-the-two-parts).
     pub json_part_name: &'a str,
     /// Non-binary record fields, serialized as JSON. Any
     /// [`Serialize`] value works — typed structs,
     /// `serde_json::json!({...})`, `HashMap<String, Value>`.
     pub metadata: &'a B,
-    /// Name of the binary part — must match the sObject's blob field
-    /// API name. `Body` for Document/Attachment, `VersionData` for
-    /// ContentVersion.
+    /// Name of the binary part. This one Salesforce does validate: it
+    /// must be the sObject's blob field API name — `Body` for
+    /// `Document`, `VersionData` for `ContentVersion`.
     pub blob_field_name: &'a str,
     /// Filename to declare in the binary part's `Content-Disposition`.
     /// Salesforce surfaces this as the `PathOnClient` / `Name` /
@@ -476,6 +508,21 @@ pub struct BlobUploadSpec<'a, B: ?Sized> {
     /// Binary payload. `bytes::Bytes` is Arc-backed and zero-copy
     /// across retries.
     pub blob: bytes::Bytes,
+}
+
+impl<B: ?Sized> std::fmt::Debug for BlobUploadSpec<'_, B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neither payload is safe to render: `blob` is the file being
+        // uploaded (up to 2 GB, and `bytes::Bytes` escapes every byte),
+        // and `metadata` is caller record data. Both are summarized.
+        f.debug_struct("BlobUploadSpec")
+            .field("json_part_name", &self.json_part_name)
+            .field("blob_field_name", &self.blob_field_name)
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("blob_len", &self.blob.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -694,15 +741,22 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_percent_encodes_external_value() {
-        // External-ID value contains characters that MUST be percent-encoded
-        // in a URL path segment: '/', '=', '#', and a space.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_patch.htm
+        // "URI: /services/data/vXX.X/sobjects/sObject/fieldName/fieldValue"
+        // — the external-ID value occupies exactly one path segment, so a
+        // '/' inside it has to arrive encoded or the request targets a
+        // different resource.
         let server = MockServer::start().await;
 
-        // wiremock's `path` matcher works on the decoded path, so we assert
-        // the literal value is what arrives at the server.
+        // wiremock matches on `Url::path()`, which is percent-encoded, so
+        // both matchers below see the value as it goes over the wire. The
+        // `[^/]+` anchor is what fails if the encoding regresses.
         Mock::given(method("PATCH"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Account/External_Id__c/a%2Fb=c%20d",
+            ))
             .and(path_regex(
-                r"^/services/data/v66\.0/sobjects/Account/External_Id__c/.+$",
+                r"^/services/data/v66\.0/sobjects/Account/External_Id__c/[^/]+$",
             ))
             .and(body_json(json!({"Name": "Edge"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -782,6 +836,7 @@ mod tests {
     /// contains the part-name + filename + JSON-snippet markers we
     /// expect.
     mod conditional {
+        use super::super::http_date;
         use super::*;
         use std::time::{Duration, SystemTime};
         use wiremock::matchers::header_regex;
@@ -923,6 +978,63 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, crate::CirrusError::Api { status: 403, .. }));
         }
+
+        #[test]
+        fn http_date_formats_a_representable_time() {
+            // RFC 7231 IMF-fixdate example: 1994-11-06T08:49:37Z.
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777);
+            assert_eq!(http_date(t).unwrap(), "Sun, 06 Nov 1994 08:49:37 GMT");
+        }
+
+        #[test]
+        fn http_date_rejects_times_before_the_epoch() {
+            let t = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+            assert!(matches!(
+                http_date(t),
+                Err(crate::CirrusError::InvalidHeader(_))
+            ));
+        }
+
+        #[test]
+        fn http_date_rejects_year_9999_and_later() {
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800);
+            assert!(matches!(
+                http_date(t),
+                Err(crate::CirrusError::InvalidHeader(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn conditional_describe_errors_on_unrepresentable_time() {
+            // A cache watermark computed defensively (a pre-epoch
+            // sentinel, a clock skewed backwards) must not unwind the
+            // caller's task.
+            let server = MockServer::start().await;
+            let sf = fixture(server.uri());
+            let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+
+            let err = sf
+                .sobjects()
+                .describe_global_if_modified_since(before_epoch)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::InvalidHeader(_)),
+                "{err:?}"
+            );
+
+            let err = sf
+                .sobject("Account")
+                .describe_if_modified_since(before_epoch)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::InvalidHeader(_)),
+                "{err:?}"
+            );
+
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
     }
 
     mod blob_upload {
@@ -932,8 +1044,10 @@ mod tests {
 
         #[tokio::test]
         async fn create_with_blob_posts_multipart_to_sobjects_endpoint() {
-            // Mirrors the documented ContentVersion insert: JSON part
-            // named entity_content, binary part named VersionData.
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
+            // Mirrors the documented ContentVersion insert: the example's
+            // JSON part name `entity_content`, and the required binary
+            // part name `VersionData`.
             let server = MockServer::start().await;
 
             Mock::given(method("POST"))
@@ -1044,13 +1158,35 @@ mod tests {
             }
         }
 
+        #[test]
+        fn blob_upload_spec_debug_summarizes_the_payload() {
+            // The blob is the file being shipped to Salesforce and the
+            // metadata is caller record data; neither may reach a log
+            // sink through a `?spec` capture.
+            let spec = BlobUploadSpec {
+                json_part_name: "entity_content",
+                metadata: &json!({"Title": "Signed contract", "OwnerId": "005xx"}),
+                blob_field_name: "VersionData",
+                filename: "contract.pdf",
+                content_type: Some("application/pdf"),
+                blob: bytes::Bytes::from_static(b"%PDF-1.7 secret bytes"),
+            };
+
+            let rendered = format!("{spec:?}");
+            assert!(rendered.contains("blob_len: 21"), "{rendered}");
+            assert!(!rendered.contains("secret"), "{rendered}");
+            assert!(!rendered.contains("Signed contract"), "{rendered}");
+            assert!(!rendered.contains("005xx"), "{rendered}");
+        }
+
         #[tokio::test]
         async fn update_with_blob_uses_patch_and_targets_record_id_path() {
             let server = MockServer::start().await;
 
-            // Document update example from the docs uses the
-            // `entity_content` JSON part name (not entity_document) on
-            // PATCH — verifying that quirk passes through.
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
+            // Mirrors the doc's "Updating a Document with Blob Data"
+            // example: an arbitrary JSON part name, and the binary part
+            // named for Document's blob field, `Body`.
             Mock::given(method("PATCH"))
                 .and(path("/services/data/v66.0/sobjects/Document/015D000000000"))
                 .and(header_regex(
@@ -1068,11 +1204,6 @@ mod tests {
                 .update_with_blob(
                     "015D000000000",
                     BlobUploadSpec {
-                        // Note: even though this is a Document update,
-                        // the doc shows the JSON part name as
-                        // `entity_content`, not `entity_document`.
-                        // That's a Salesforce wire-shape quirk — the
-                        // SDK doesn't try to derive it.
                         json_part_name: "entity_content",
                         metadata: &json!({"Name": "Updated"}),
                         blob_field_name: "Body",

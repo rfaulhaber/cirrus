@@ -70,7 +70,7 @@
 //! [`EventLogFileRecord`]: crate::EventLogFileRecord
 
 use crate::Cirrus;
-use crate::error::CirrusResult;
+use crate::error::{CirrusError, CirrusResult};
 
 const CSV_ACCEPT: &str = "text/csv";
 
@@ -147,28 +147,54 @@ impl EventMonitoringHandler<'_> {
     /// so it carries the API version of the originating query — same
     /// pattern as `nextRecordsUrl` on [`crate::QueryResult`]. Pass it
     /// through verbatim; the leading `/` is normalized into an
-    /// instance-rooted resolution by [`Cirrus::resolve_url`].
-    /// Fully-qualified URLs (`https://...`) also work.
+    /// instance-rooted resolution.
+    ///
+    /// # Errors
+    ///
+    /// A fully-qualified URL is accepted only when its origin matches
+    /// the session's instance URL. Anything else returns
+    /// [`CirrusError::InvalidResponse`] without issuing a request:
+    /// downloads are bearer-authenticated, and `log_file_url` is a
+    /// server-supplied value, so following it to another host would
+    /// hand the org's access token to that host.
     ///
     /// [`EventLogFileRecord`]: crate::EventLogFileRecord
-    /// [`Cirrus::resolve_url`]: crate::Cirrus
+    /// [`CirrusError::InvalidResponse`]: crate::CirrusError::InvalidResponse
     pub async fn download_url(&self, log_file_url: &str) -> CirrusResult<bytes::Bytes> {
-        // Normalize bare paths the way query_more does, so callers can
-        // pass the LogFile field straight through whether it has a
-        // leading slash or not.
-        let path = if log_file_url.starts_with('/')
-            || log_file_url.starts_with("http://")
-            || log_file_url.starts_with("https://")
-        {
-            log_file_url.to_string()
-        } else {
-            format!("/{log_file_url}")
-        };
+        let path = self.instance_rooted(log_file_url)?;
         let (_headers, bytes) = self
             .client
             .fetch_raw(reqwest::Method::GET, &path, CSV_ACCEPT, None)
             .await?;
         Ok(bytes)
+    }
+
+    /// Normalizes a `LogFile` value into something that resolves against
+    /// this session's instance, rejecting any absolute URL that points
+    /// somewhere else.
+    fn instance_rooted(&self, log_file_url: &str) -> CirrusResult<String> {
+        if !(log_file_url.starts_with("http://") || log_file_url.starts_with("https://")) {
+            // Bare paths are normalized the way query_more does, so
+            // callers can pass the LogFile field straight through
+            // whether or not it has a leading slash.
+            return Ok(if log_file_url.starts_with('/') {
+                log_file_url.to_string()
+            } else {
+                format!("/{log_file_url}")
+            });
+        }
+
+        let candidate = url::Url::parse(log_file_url)?;
+        let instance = url::Url::parse(self.client.auth().instance_url())?;
+        if candidate.origin() == instance.origin() {
+            Ok(log_file_url.to_string())
+        } else {
+            Err(CirrusError::InvalidResponse(format!(
+                "EventLogFile LogFile URL points at {}, not the org instance {}",
+                candidate.origin().ascii_serialization(),
+                instance.origin().ascii_serialization(),
+            )))
+        }
     }
 }
 
@@ -279,6 +305,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn download_url_accepts_absolute_url_on_the_instance_host() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok\n"))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let absolute = format!(
+            "{}/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile",
+            server.uri()
+        );
+        let bytes = sf.event_monitoring().download_url(&absolute).await.unwrap();
+        assert_eq!(&bytes[..], b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn download_url_refuses_a_foreign_host() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_event_log_file_query.htm
+        // Every documented LogFile value is an instance-relative path.
+        // Downloads are bearer-authenticated, so a value naming another
+        // host must never be followed — that would hand the org access
+        // token to that host.
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        let err = sf
+            .event_monitoring()
+            .download_url("https://collector.attacker.example/x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CirrusError::InvalidResponse(_)), "{err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

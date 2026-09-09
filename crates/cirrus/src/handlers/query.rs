@@ -188,6 +188,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_constructors_issue_no_request_until_polled() {
+        // The reason the constructors are marked #[must_use]: discarding
+        // the stream is silent, and no HTTP request is ever made.
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        drop(sf.query_stream("SELECT Id FROM Account"));
+        drop(sf.query_all_stream("SELECT Id FROM Account"));
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn query_passes_soql_in_q_param() {
         let server = MockServer::start().await;
 

@@ -92,6 +92,7 @@ type PageFuture<R> = BoxFuture<'static, CirrusResult<QueryResult<R>>>;
 /// [`Cirrus::query_stream_as`]: crate::Cirrus::query_stream_as
 /// [`Cirrus::query_all_stream`]: crate::Cirrus::query_all_stream
 /// [`Cirrus::query_all_stream_as`]: crate::Cirrus::query_all_stream_as
+#[must_use = "Records is a lazy Stream: no request is issued until it is polled"]
 pub struct Records<R> {
     client: Cirrus,
     state: State<R>,

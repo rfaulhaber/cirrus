@@ -16,9 +16,24 @@
 //! The handler does **not** percent-encode path segments. For paths
 //! containing reserved characters (spaces, `?`, `#`, `&`), pre-encode the
 //! segments yourself before calling.
+//!
+//! Relative segments (`.` and `..`, in either literal or percent-encoded
+//! spelling) are rejected with [`CirrusError`], because URL parsing
+//! resolves them away and a path assembled from untrusted input could
+//! otherwise reach an endpoint outside `/services/apexrest/` while still
+//! carrying the org's bearer token. Pre-encoding does not avoid this —
+//! `%2e%2e` normalizes to `..` — so such segments have to be refused
+//! rather than escaped.
+//!
+//! A backslash, or any character up to and including `U+0020` (every C0
+//! control plus the space), is refused for the same reason. URL parsing
+//! treats `\` as a path separator, removes tab, line feed and carriage
+//! return wherever they appear, and trims C0 controls and spaces from both
+//! ends of the URL — each of which can reconstitute a dot segment that a
+//! check on the literal text has already accepted, as `".. "` does.
 
 use crate::Cirrus;
-use crate::error::CirrusResult;
+use crate::error::{CirrusError, CirrusResult};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -56,6 +71,14 @@ impl Cirrus {
 /// slash) and forwards through the corresponding [`Cirrus`] verb.
 /// Body and response types are caller-defined since Apex REST endpoints
 /// have no platform-defined wire shape.
+///
+/// Every method returns [`CirrusError::InvalidResponse`] without issuing
+/// a request when the supplied path contains an empty or relative
+/// (`.` / `..`) segment, a backslash, or any character up to and
+/// including `U+0020` — the C0 controls and the space — see the
+/// [module docs](self#path-encoding).
+///
+/// [`CirrusError::InvalidResponse`]: crate::CirrusError::InvalidResponse
 #[derive(Debug)]
 pub struct ApexHandler<'a> {
     client: &'a Cirrus,
@@ -64,7 +87,7 @@ pub struct ApexHandler<'a> {
 impl ApexHandler<'_> {
     /// `GET /services/apexrest/{path}`.
     pub async fn get<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
-        self.client.get(&apex_path(path)).await
+        self.client.get(&apex_path(path)?).await
     }
 
     /// `GET /services/apexrest/{path}` with a query string. `query` is
@@ -75,7 +98,7 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
-        self.client.get_with_query(&apex_path(path), query).await
+        self.client.get_with_query(&apex_path(path)?, query).await
     }
 
     /// `POST /services/apexrest/{path}` with a JSON body.
@@ -84,7 +107,7 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.client.post(&apex_path(path), body).await
+        self.client.post(&apex_path(path)?, body).await
     }
 
     /// `PUT /services/apexrest/{path}` with a JSON body.
@@ -93,7 +116,7 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.client.put(&apex_path(path), body).await
+        self.client.put(&apex_path(path)?, body).await
     }
 
     /// `PATCH /services/apexrest/{path}` with a JSON body.
@@ -102,12 +125,12 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.client.patch(&apex_path(path), body).await
+        self.client.patch(&apex_path(path)?, body).await
     }
 
     /// `DELETE /services/apexrest/{path}`.
     pub async fn delete<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
-        self.client.delete(&apex_path(path)).await
+        self.client.delete(&apex_path(path)?).await
     }
 }
 
@@ -119,8 +142,54 @@ impl ApexHandler<'_> {
 ///
 /// The leading `/` triggers [`crate::Cirrus`]'s instance-rooted branch,
 /// bypassing the versioned `/services/data/{version}/` prefix.
-fn apex_path(path: &str) -> String {
-    format!("/services/apexrest/{}", path.trim_start_matches('/'))
+///
+/// Errors when any content-bearing segment is empty or relative, or when
+/// the path contains a backslash or any character up to and including
+/// `U+0020`, so that a path built from untrusted input cannot resolve
+/// outside the Apex REST root. A single trailing slash is kept: Apex
+/// `urlMapping` values are documented with one.
+fn apex_path(path: &str) -> CirrusResult<String> {
+    // For a special scheme, WHATWG URL parsing treats `\` as a path
+    // separator, removes tab, LF and CR from anywhere in the input, and
+    // trims every C0 control and space from both ends of the URL — all
+    // before it looks for dot segments. Each of those can reconstitute a
+    // dot segment that the split below has already accepted: `Cases\..\`,
+    // `Cases/.<TAB>./` and `".. "` all resolve out of the Apex REST root.
+    // Refusing the whole class up front is what makes the per-segment
+    // check trustworthy.
+    if let Some(c) = path.chars().find(|&c| c == '\\' || c <= '\u{20}') {
+        let reason = if c == '\\' {
+            "URL parsing treats it as a path separator for the org's https scheme"
+        } else {
+            "URL parsing removes or trims C0 controls and spaces before it resolves dot segments"
+        };
+        return Err(CirrusError::InvalidResponse(format!(
+            "Apex REST path contains {c:?}: {reason}"
+        )));
+    }
+    let trimmed = path.trim_start_matches('/');
+    let body = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    for segment in body.split('/') {
+        if segment.is_empty() || is_relative_segment(segment) {
+            return Err(CirrusError::InvalidResponse(format!(
+                "Apex REST path segment {segment:?} is not addressable under \
+                 /services/apexrest/ (empty and relative segments are rejected)"
+            )));
+        }
+    }
+    Ok(format!("/services/apexrest/{trimmed}"))
+}
+
+/// Whether a path segment is a dot segment that URL parsing would resolve
+/// away.
+///
+/// WHATWG URL parsing treats a segment as `.` or `..` after
+/// case-insensitively decoding `%2e`, so both spellings have to be caught.
+/// Doubly-encoded forms such as `%252e` decode to the literal text `%2e`
+/// and are left alone, matching the parser.
+fn is_relative_segment(segment: &str) -> bool {
+    let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+    decoded == "." || decoded == ".."
 }
 
 #[cfg(test)]
@@ -140,24 +209,120 @@ mod tests {
 
     #[test]
     fn apex_path_normalizes_relative_input() {
-        assert_eq!(apex_path("MyEndpoint"), "/services/apexrest/MyEndpoint");
+        assert_eq!(
+            apex_path("MyEndpoint").unwrap(),
+            "/services/apexrest/MyEndpoint"
+        );
     }
 
     #[test]
     fn apex_path_normalizes_leading_slash_input() {
-        assert_eq!(apex_path("/MyEndpoint"), "/services/apexrest/MyEndpoint");
+        assert_eq!(
+            apex_path("/MyEndpoint").unwrap(),
+            "/services/apexrest/MyEndpoint"
+        );
     }
 
     #[test]
     fn apex_path_preserves_subpaths() {
         assert_eq!(
-            apex_path("Cases/12345/comments"),
+            apex_path("Cases/12345/comments").unwrap(),
             "/services/apexrest/Cases/12345/comments"
         );
         assert_eq!(
-            apex_path("/Cases/12345/comments"),
+            apex_path("/Cases/12345/comments").unwrap(),
             "/services/apexrest/Cases/12345/comments"
         );
+    }
+
+    #[test]
+    fn apex_path_keeps_documented_trailing_slash() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_rest_methods.htm
+        // "the URL used via REST to call these methods would be of the form
+        // https://instance.salesforce.com/services/apexrest/packageNamespace/MyMethod/"
+        assert_eq!(
+            apex_path("packageNamespace/MyMethod/").unwrap(),
+            "/services/apexrest/packageNamespace/MyMethod/"
+        );
+    }
+
+    #[test]
+    fn apex_path_rejects_relative_segments() {
+        // `Url::parse` resolves dot segments away, so a path built from
+        // untrusted input would otherwise climb out of the Apex REST root
+        // and reach the data API with the caller's bearer token.
+        for candidate in [
+            "..",
+            "../../services/data/v66.0/sobjects/Account/001xx000003DGb2",
+            "Cases/../../../services/data/v66.0/limits",
+            "Cases/./comments",
+            // Percent-encoded spellings normalize identically.
+            "%2e%2e/services/data/v66.0/limits",
+            "Cases/%2E%2E/comments",
+            "Cases/.%2e/comments",
+            "Cases/%2e/comments",
+            // A backslash is a path separator for special schemes, so the
+            // whole thing would otherwise pass as one segment.
+            "Cases\\..\\..\\..\\services/data/v66.0/sobjects/Account/001xx",
+            // Tab, LF and CR are stripped before dot segments are
+            // resolved, so they can split a `..` in half.
+            "Cases/.\t./.\t./.\t./services/data/v66.0/limits",
+            "Cases/.\n./.\n./.\n./services/data/v66.0/limits",
+            "Cases/.\r./.\r./.\r./services/data/v66.0/limits",
+            // C0 controls and spaces are trimmed off both ends of the URL
+            // before dot segments resolve, so a trailing one puts a `..`
+            // back after the per-segment check has seen something else.
+            ".. ",
+            "%2e%2e ",
+            "Cases/..\u{0}",
+        ] {
+            let err = apex_path(candidate).unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidResponse(_)),
+                "{candidate:?} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apex_path_rejects_empty_segments() {
+        for candidate in ["", "/", "Cases//comments"] {
+            assert!(
+                apex_path(candidate).is_err(),
+                "{candidate:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn apex_path_allows_doubly_encoded_dots() {
+        // `%252e` decodes to the literal text `%2e`, which URL parsing
+        // leaves in place — it addresses a real segment, not a parent.
+        assert_eq!(
+            apex_path("Cases/%252e%252e/comments").unwrap(),
+            "/services/apexrest/Cases/%252e%252e/comments"
+        );
+    }
+
+    #[tokio::test]
+    async fn apex_traversal_path_errors_without_issuing_a_request() {
+        let server = MockServer::start().await;
+        // No mock is mounted: any outgoing request fails the test by
+        // returning a 404 that would surface as CirrusError::Api.
+        let sf = fixture(server.uri());
+        for candidate in [
+            "Cases/../../services/data/v66.0/sobjects/Account/001xx",
+            "Cases\\..\\..\\..\\services/data/v66.0/sobjects/Account/001xx",
+            "Cases/.\t./.\t./.\t./services/data/v66.0/limits",
+            "Cases/..\u{0}",
+        ] {
+            let err = sf.apex().delete::<()>(candidate).await.unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidResponse(_)),
+                "{candidate:?}: {err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

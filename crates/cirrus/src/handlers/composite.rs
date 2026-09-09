@@ -423,6 +423,12 @@ impl CompositeSObjectsHandler<'_> {
     /// Records that don't exist (or aren't visible to the caller) appear
     /// as `Value::Null` in the corresponding position of the returned
     /// slice — preserving 1:1 alignment with the input `ids`.
+    ///
+    /// Salesforce documents the ~800-ID ceiling as the point where the
+    /// URI passes its 16,384-byte limit and the request fails with HTTP
+    /// 414. Beyond that, switch to
+    /// [`retrieve_with_body`](Self::retrieve_with_body), which carries
+    /// the same arguments in a JSON body and allows 2000 records.
     pub async fn retrieve(
         &self,
         sobject: &str,
@@ -442,21 +448,26 @@ impl CompositeSObjectsHandler<'_> {
         ids: &[&str],
         fields: &[&str],
     ) -> CirrusResult<Vec<R>> {
-        let url = self
-            .client
-            .versioned_segments(&["composite", "sobjects", sobject])?;
-        let joined_ids = ids.join(",");
-        let joined_fields = fields.join(",");
+        let mut url = url::Url::parse(&self.client.versioned_segments(&[
+            "composite",
+            "sobjects",
+            sobject,
+        ])?)?;
+        // The query string is assembled here rather than handed to
+        // reqwest's form encoder, which would emit each separator as
+        // `%2C`. A comma is a legal sub-delim in a query, and the
+        // three-byte expansion costs ~1.6 KB across the 799 separators
+        // of a full 800-ID batch — enough to push a request that
+        // Salesforce documents as legal past the 16,384-byte URI limit.
+        // Only the separators are literal: every element is encoded on
+        // its own so caller input can't add a parameter of its own.
+        url.set_query(Some(&format!(
+            "ids={}&fields={}",
+            encode_comma_separated(ids),
+            encode_comma_separated(fields)
+        )));
         self.client
-            .send_at::<_, _, ()>(
-                reqwest::Method::GET,
-                &url,
-                Some(&[
-                    ("ids", joined_ids.as_str()),
-                    ("fields", joined_fields.as_str()),
-                ]),
-                None,
-            )
+            .send_at::<_, (), ()>(reqwest::Method::GET, url.as_str(), None, None)
             .await
     }
 
@@ -549,6 +560,21 @@ pub struct BatchSubrequest {
     pub rich_input: Option<serde_json::Value>,
 }
 
+/// Joins query-string list values with literal commas, percent-encoding
+/// each element.
+///
+/// `Url::set_query` re-parses what it's given and leaves `&`, `=` and `%`
+/// alone, so an element carrying one of those would otherwise start a
+/// parameter of its own. Encoding per element keeps the separators
+/// literal while the values stay inert.
+fn encode_comma_separated(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -557,7 +583,7 @@ mod tests {
     use crate::auth::StaticTokenAuth;
     use serde_json::json;
     use std::sync::Arc;
-    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::matchers::{body_json, header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fixture(uri: String) -> Cirrus {
@@ -810,11 +836,23 @@ mod tests {
         assert!(resp.results.iter().all(|r| r.is_success()));
     }
 
+    /// Wire shape per the `responses_composite_sobject_tree` "JSON
+    /// example upon failure" body.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/responses_composite_sobject_tree.htm
+    ///
+    /// Wire-shape provenance: that page prints the rollback response
+    /// body but no HTTP status line, and
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+    /// assigns 201 to "POST requests and some PATCH requests" without
+    /// singling out sObject Tree. The 201 below is therefore assumed,
+    /// not doc-verified — it has not been pinned against a live org.
+    /// What the test does prove is the handler contract that matters:
+    /// a 2xx rollback response is surfaced as
+    /// [`CompositeTreeResponse`] rather than an error, so callers reach
+    /// the per-record `referenceId`/`errors` payload.
     #[tokio::test]
     async fn tree_surfaces_per_record_failure() {
-        // All-or-nothing — has_errors=true, only the failing referenceId
-        // appears in results. The transport call returns 201 (yes, even
-        // for a rolled-back request — the docs document this).
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -850,13 +888,14 @@ mod tests {
 
     #[tokio::test]
     async fn tree_percent_encodes_sobject_name() {
-        // Custom-object names are alphanumeric + underscores in practice,
-        // but versioned_segments encodes any reserved character we hand it
-        // — covers the unlikely case of a dev sandbox name with a space.
+        // An sObject name carrying characters reserved in a URL path
+        // segment ('/', space) must stay inside one segment, so it can't
+        // inject extra segments into the composite tree URL.
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/services/data/v66.0/composite/tree/My_Custom__c"))
+            .and(path("/services/data/v66.0/composite/tree/a%2Fb=c%20d"))
+            .and(path_regex(r"^/services/data/v66\.0/composite/tree/[^/]+$"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "hasErrors": false,
                 "results": []
@@ -867,7 +906,7 @@ mod tests {
         let sf = fixture(server.uri());
         let resp = sf
             .composite()
-            .tree("My_Custom__c", &json!({"records": []}))
+            .tree("a/b=c d", &json!({"records": []}))
             .await
             .unwrap();
         assert!(!resp.has_errors);
@@ -1325,6 +1364,106 @@ mod tests {
         assert_eq!(records[0]["Name"], "Acme");
         assert!(records[1].is_null());
         assert_eq!(records[2]["Name"], "Other");
+    }
+
+    #[tokio::test]
+    async fn sobjects_retrieve_sends_literal_comma_separators() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_retrieve.htm
+        // The documented request separates ids and fields with literal
+        // commas: `?ids=001xx000003DGb1AAG,...&fields=id,name`.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+        // "414  The length of the URI exceeds the 16,384-byte limit." —
+        // percent-encoding each separator as `%2C` triples its cost and
+        // pushes a documented-size batch over that limit.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .and(|request: &wiremock::Request| {
+                request.url.query()
+                    == Some("ids=001xx000003DGb1AAG,001xx000003DGb0AAG&fields=id,name")
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"attributes": {"type": "Account"}, "Id": "001xx000003DGb1AAG", "Name": "Acme"},
+                {"attributes": {"type": "Account"}, "Id": "001xx000003DGb0AAG", "Name": "Global Media"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let records = sf
+            .composite()
+            .sobjects()
+            .retrieve(
+                "Account",
+                &["001xx000003DGb1AAG", "001xx000003DGb0AAG"],
+                &["id", "name"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["Name"], "Acme");
+    }
+
+    #[tokio::test]
+    async fn sobjects_retrieve_encodes_elements_but_keeps_separators_literal() {
+        // Reserved characters in a caller-supplied id stay inside the
+        // `ids` value instead of starting a parameter of their own, while
+        // the separators remain the literal commas Salesforce documents.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([null, null])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let records = sf
+            .composite()
+            .sobjects()
+            .retrieve(
+                "Account",
+                &["a&fields=Secret__c x", "001xx000003DGb1AAG"],
+                &["Id", "Name"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].url.query(),
+            Some("ids=a%26fields%3DSecret__c+x,001xx000003DGb1AAG&fields=Id,Name")
+        );
+        let pairs: Vec<(String, String)> = requests[0]
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "ids".to_owned(),
+                    "a&fields=Secret__c x,001xx000003DGb1AAG".to_owned()
+                ),
+                ("fields".to_owned(), "Id,Name".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sobjects_retrieve_uri_stays_under_the_documented_800_id_ceiling() {
+        // 800 18-character ids joined by literal commas is the batch size
+        // Salesforce calls out as roughly the maximum; the resulting URI
+        // has to fit the 16,384-byte limit that produces HTTP 414.
+        let ids: Vec<String> = (0..800).map(|i| format!("001xx{i:013}")).collect();
+        let query = format!("ids={}&fields=Id,Name", ids.join(","));
+        assert_eq!(query.len(), 15_218);
+
+        let percent_encoded_len = query.len() + ids.len().saturating_sub(1) * 2;
+        assert!(percent_encoded_len > 16_384);
     }
 
     #[tokio::test]
