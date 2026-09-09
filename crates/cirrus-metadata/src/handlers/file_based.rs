@@ -102,6 +102,17 @@ impl SoapOperation for CheckDeployStatusOp {
     }
 }
 
+// Wire-shape provenance (api_meta doc page IDs):
+// - `meta_canceldeploy` names this argument `id` ("CancelDeployResult
+//   = metadatabinding.cancelDeploy(string id)"), but that table prints
+//   the Java parameter name rather than the wire element name:
+//   `meta_checkdeploystatus` likewise prints `id` for the argument
+//   this crate sends -- and Salesforce accepts -- as
+//   `<asyncProcessId>`. The guide publishes no request envelope for
+//   any call, so the element name below is carried over from the two
+//   status calls rather than read off a page. Anything asserting the
+//   name (the fixture in tests/file_based.rs included) is pinning that
+//   inference, not a documented shape.
 struct CancelDeployOp {
     async_process_id: String,
 }
@@ -167,6 +178,23 @@ impl SoapOperation for RetrieveOp {
                 "RetrieveRequest.api_version is required (e.g. \"66.0\")".into(),
             ));
         }
+        // specificFiles is documented as usable only on its own: it
+        // requires singlePackage true and no packageNames. Default
+        // gives single_package false, so the natural
+        // `..Default::default()` construction would otherwise render
+        // an invalid combination.
+        if !self.request.specific_files.is_empty() {
+            if !self.request.single_package {
+                return Err(MetadataError::InvalidArgument(
+                    "RetrieveRequest.specific_files requires single_package == true".into(),
+                ));
+            }
+            if !self.request.package_names.is_empty() {
+                return Err(MetadataError::InvalidArgument(
+                    "RetrieveRequest.specific_files requires an empty package_names".into(),
+                ));
+            }
+        }
         let mut out = String::with_capacity(256);
         out.push_str("<met:RetrieveRequest>");
         out.push_str("<met:apiVersion>");
@@ -176,6 +204,11 @@ impl SoapOperation for RetrieveOp {
             out.push_str("<met:packageNames>");
             out.push_str(&xml_escape(pkg));
             out.push_str("</met:packageNames>");
+        }
+        for ty in &self.request.root_types_with_dependencies {
+            out.push_str("<met:rootTypesWithDependencies>");
+            out.push_str(&xml_escape(ty));
+            out.push_str("</met:rootTypesWithDependencies>");
         }
         write_bool(&mut out, "singlePackage", self.request.single_package);
         for f in &self.request.specific_files {
@@ -290,12 +323,18 @@ fn render_unpackaged(pkg: &PackageManifest, out: &mut String) {
 /// [`RetryPolicy`]: crate::RetryPolicy
 #[derive(Debug, Clone)]
 pub struct WaitConfig {
-    /// Delay before the first poll. Default 2 s.
+    /// Delay between the first and second poll; the first poll is
+    /// issued immediately. Doubles each round up to
+    /// [`max_delay`](Self::max_delay). Default 2 s.
     pub initial_delay: Duration,
     /// Cap on the backoff delay. Default 30 s.
     pub max_delay: Duration,
     /// Total wall-clock budget. `None` = wait indefinitely. Default
     /// `None` — deploys can legitimately run for hours.
+    ///
+    /// Backoff sleeps are clamped to what's left of the budget, so the
+    /// timeout fires within one in-flight status call of it rather
+    /// than a whole backoff round past it.
     pub total_timeout: Option<Duration>,
 }
 
@@ -485,14 +524,21 @@ impl MetadataClient {
                     }
                 };
             }
-            if let Some(timeout) = config.total_timeout
-                && start.elapsed() >= timeout
-            {
-                return Err(MetadataError::PollTimeout(format!(
-                    "wait_for_deploy timed out after {timeout:?} (deploy still in progress)"
-                )));
+            if let Some(timeout) = config.total_timeout {
+                // Clamping the sleep to what's left of the budget is
+                // what keeps the deadline honest: an unclamped sleep
+                // would carry the next check up to `max_delay` past
+                // the budget before it could fire.
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(MetadataError::PollTimeout(format!(
+                        "wait_for_deploy timed out after {timeout:?} (deploy still in progress)"
+                    )));
+                }
+                tokio::time::sleep(delay.min(remaining)).await;
+            } else {
+                tokio::time::sleep(delay).await;
             }
-            tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(config.max_delay);
         }
     }
@@ -531,14 +577,21 @@ impl MetadataClient {
                 }
                 return self.check_retrieve_status(retrieve_id, true).await;
             }
-            if let Some(timeout) = config.total_timeout
-                && start.elapsed() >= timeout
-            {
-                return Err(MetadataError::PollTimeout(format!(
-                    "wait_for_retrieve timed out after {timeout:?} (retrieve still in progress)"
-                )));
+            if let Some(timeout) = config.total_timeout {
+                // Clamping the sleep to what's left of the budget is
+                // what keeps the deadline honest: an unclamped sleep
+                // would carry the next check up to `max_delay` past
+                // the budget before it could fire.
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Err(MetadataError::PollTimeout(format!(
+                        "wait_for_retrieve timed out after {timeout:?} (retrieve still in progress)"
+                    )));
+                }
+                tokio::time::sleep(delay.min(remaining)).await;
+            } else {
+                tokio::time::sleep(delay).await;
             }
-            tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(config.max_delay);
         }
     }
@@ -696,6 +749,55 @@ mod tests {
         let op = RetrieveOp { request: req };
         let body = op.render_body().unwrap();
         assert!(body.contains("<met:specificFiles>a&lt;b&gt;c</met:specificFiles>"));
+    }
+
+    /// meta_retrieve_request, specificFiles row: "If a value is
+    /// specified for this property, packageNames must be set to null
+    /// and singlePackage must be set to true."
+    #[test]
+    fn retrieve_op_rejects_specific_files_without_single_package() {
+        // The Default-derived single_package is false, so this is the
+        // shape `..Default::default()` produces.
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            specific_files: vec!["unpackaged/classes/MyClass.cls".into()],
+            ..Default::default()
+        };
+        let op = RetrieveOp { request: req };
+        let err = op.render_body().unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("specific_files"), "{msg}");
+        assert!(msg.contains("single_package"), "{msg}");
+    }
+
+    #[test]
+    fn retrieve_op_rejects_specific_files_alongside_package_names() {
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            single_package: true,
+            package_names: vec!["MyManagedPackage".into()],
+            specific_files: vec!["unpackaged/classes/MyClass.cls".into()],
+            ..Default::default()
+        };
+        let op = RetrieveOp { request: req };
+        let err = op.render_body().unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
+        assert!(err.to_string().contains("package_names"));
+    }
+
+    #[test]
+    fn retrieve_op_allows_package_names_without_specific_files() {
+        // The coupling is one-directional: packageNames on its own is
+        // the ordinary packaged-retrieve shape.
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            package_names: vec!["MyManagedPackage".into()],
+            ..Default::default()
+        };
+        let op = RetrieveOp { request: req };
+        let body = op.render_body().unwrap();
+        assert!(body.contains("<met:packageNames>MyManagedPackage</met:packageNames>"));
     }
 
     #[test]

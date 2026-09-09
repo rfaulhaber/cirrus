@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `zip_file` holds the base64 payload Salesforce returns;
     // `zip_bytes()` decodes it into the actual archive.
     if let Some(zip) = result.zip_bytes()? {
-        std::fs::write("retrieved.zip", zip)?;
+        fs_err::write("retrieved.zip", zip)?;
     }
 
     Ok(())
