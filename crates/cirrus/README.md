@@ -105,8 +105,10 @@ boundary between auth and REST without extra plumbing.
 
 - **Retry + backoff** — `RetryPolicy` covers 429, 503, and transient 5xx with
   full jitter; honors `Retry-After`. Configurable; off by default for non-idempotent 5xx.
-- **Sforce-Limit-Info capture** — every response's API quota header is parsed
-  and surfaced via `sf.last_limit_info()`.
+- **Sforce-Limit-Info capture** — every response sent through the typed verb
+  methods and handlers has its API quota header parsed and surfaced via
+  `sf.last_limit_info()`. `request_builder` and `execute` step outside the
+  request loop, so they don't advance it.
 - **Pagination as `futures::Stream`** — composes with `StreamExt` from any
   async ecosystem, so the consumer API surface isn't tied to a specific
   combinator crate. Drop the stream → no further fetches. (Execution still
@@ -115,6 +117,13 @@ boundary between auth and REST without extra plumbing.
   `Option<T>`; `None` on 304 Not Modified.
 - **Structured `tracing` events** — `cirrus::retry`, `cirrus::auth`,
   `cirrus::limit_info` targets. Never logs tokens or bodies.
+- **Transport defaults** — the HTTP client the builder creates advertises
+  gzip and decompresses responses, applies a 10 s connect timeout and a 30 s
+  per-read timeout (`CirrusBuilder::connect_timeout` / `read_timeout` override
+  either; there's no whole-request deadline, so a long Bulk transfer isn't cut
+  short mid-flight), and doesn't follow redirects — a 3xx surfaces as
+  `CirrusError::Api` rather than re-sending the token to the `Location` host.
+  Supplying your own client via `CirrusBuilder::http_client` replaces all of it.
 
 ### The escape hatch
 
@@ -130,10 +139,33 @@ sf.get::<MyShape>("https://...").await?;                   // fully-qualified
 
 Three-mode path resolution: relative → `/services/data/{version}/...`,
 leading-`/` → instance-rooted, `http(s)://` → passthrough.
+Whichever mode applies, the resolved target must be `https` (loopback hosts
+excepted) because the request carries the org session token — a plaintext
+target is rejected with `CirrusError::InvalidInput` and no request is sent,
+and `Cirrus::builder().build()` fails outright on an `http://` instance URL.
+`CirrusBuilder::allow_insecure_transport(true)` is the opt-out for a
+deliberate plaintext hop, such as a recording proxy on a trusted network.
 
-For unusual cases (custom headers, binary download, SSE), `request_builder` and
-`execute` give you a pre-authenticated `reqwest::RequestBuilder` and full bypass
-respectively.
+Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
+`Sforce-Query-Options`, …) go through `send_with_headers_as`, which keeps retry,
+the 401 auto-refresh and the `Sforce-Limit-Info` capture:
+
+```rust,ignore
+let created: Value = sf
+    .send_with_headers_as(
+        Method::POST,
+        "sobjects/Lead",
+        None,
+        &[("Sforce-Auto-Assign", "FALSE")],
+        Some(&lead),
+    )
+    .await?;
+```
+
+For the remaining unusual cases (binary download, SSE), `request_builder` and
+`execute` give you a pre-authenticated `reqwest::RequestBuilder` and a full
+bypass respectively. Both step outside the request loop, so retry, the 401
+auto-refresh and the limit-info capture don't apply to them.
 
 ## Examples
 

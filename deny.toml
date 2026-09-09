@@ -37,6 +37,9 @@ allow = [
     "MIT",
     "MIT-0",
     "Unicode-3.0",
+    # Permissive, OSI-approved. Reaches the graph through `zlib-rs`, the
+    # inflate backend behind reqwest's gzip response decompression.
+    "Zlib",
 ]
 # Per-crate license overrides go here when a crate has no SPDX-tagged license
 # but is known to be permissively licensed.

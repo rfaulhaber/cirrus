@@ -95,9 +95,22 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Default Salesforce REST API version when the caller doesn't override it.
 pub const DEFAULT_API_VERSION: &str = "v66.0";
+
+/// Connect-phase timeout applied to the HTTP client the builder
+/// creates. Override with [`CirrusBuilder::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read timeout applied to the HTTP client the builder creates:
+/// the maximum time the client waits for the *next chunk* of a
+/// response, not for the whole response. Bulk 2.0 result pages and
+/// event log files can be large enough that a whole-request deadline
+/// would cut a healthy transfer short, so none is set. Override with
+/// [`CirrusBuilder::read_timeout`].
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default User-Agent header value sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -122,12 +135,17 @@ pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
 ///   e.g. `/services/data` → `{instance}/services/data`.
 /// - **Versioned** (anything else): prefixed with `/services/data/{version}/`,
 ///   e.g. `limits` → `{instance}/services/data/{version}/limits`.
+///
+/// Whichever mode applies, the resolved target has to be `https` (or a
+/// loopback host) before the session token is attached — see
+/// [`CirrusBuilder::allow_insecure_transport`] for the opt-out.
 #[derive(Clone)]
 pub struct Cirrus {
     client: reqwest::Client,
     auth: SharedAuth,
     api_version: String,
     retry_policy: RetryPolicy,
+    allow_insecure_transport: bool,
     /// Most recent `Sforce-Limit-Info` header value, parsed. Wrapped
     /// in `Arc<RwLock<...>>` so updates are visible across cloned
     /// clients (clones share state).
@@ -142,6 +160,7 @@ impl std::fmt::Debug for Cirrus {
             .field("api_version", &self.api_version)
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
+            .field("allow_insecure_transport", &self.allow_insecure_transport)
             .finish_non_exhaustive()
     }
 }
@@ -272,12 +291,31 @@ impl Cirrus {
         }
     }
 
+    /// Refuses to put the session token on a target that isn't
+    /// TLS-protected. See [`check_transport_security`].
+    fn check_transport_security(&self, url: &str) -> CirrusResult<()> {
+        check_transport_security("request URL", url, self.allow_insecure_transport)
+    }
+
     /// Builds a versioned URL by appending percent-encoded path segments.
     ///
     /// Use this when any segment may contain reserved characters (slash,
     /// equals, percent, etc.) — e.g. an upsert external-ID value. Each
     /// element of `segments` is encoded as a single path segment.
+    ///
+    /// A segment of `.` or `..` is rejected: URL path resolution drops
+    /// those rather than encoding them, so the request would quietly
+    /// land one segment short — on a different Salesforce resource —
+    /// instead of failing.
     pub(crate) fn versioned_segments(&self, segments: &[&str]) -> CirrusResult<String> {
+        if let Some(dotted) = segments.iter().find(|s| matches!(**s, "." | "..")) {
+            return Err(CirrusError::InvalidInput {
+                field: "path segment",
+                message: format!(
+                    "`{dotted}` is a relative path reference, so it cannot address a resource",
+                ),
+            });
+        }
         let base = format!(
             "{}/services/data/{}/",
             self.auth.instance_url(),
@@ -314,6 +352,85 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.send::<R, Q, ()>(reqwest::Method::GET, &url, Some(query), None)
             .await
+    }
+
+    /// Sends a request carrying extra request headers, deserializing
+    /// the response into `R`.
+    ///
+    /// Salesforce defines a family of request headers that change how a
+    /// call behaves — `Sforce-Auto-Assign`,
+    /// `Sforce-Duplicate-Rule-Header`, `Sforce-Call-Options`,
+    /// `Sforce-Query-Options`, `Sforce-Mru` — and this attaches one
+    /// while keeping the retry policy, the 401 auto-refresh and the
+    /// `Sforce-Limit-Info` capture that the typed verb methods provide.
+    ///
+    /// `query` and `body` are optional; path resolution follows
+    /// [`Cirrus`]'s three-mode semantics.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::{Value, json};
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // Create a Lead without running the org's assignment rules.
+    /// let created: Value = sf
+    ///     .send_with_headers_as(
+    ///         cirrus::reqwest::Method::POST,
+    ///         "sobjects/Lead",
+    ///         None,
+    ///         &[("Sforce-Auto-Assign", "FALSE")],
+    ///         Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+    ///     )
+    ///     .await?;
+    /// # let _ = created;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_with_headers_as<R, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: Option<&B>,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = self.resolve_url(path);
+        self.send_with_replay(method, &url, query, headers, body, retry::Replay::ByMethod)
+            .await
+    }
+
+    /// GET with query parameters for a resource whose GET has side
+    /// effects, so a lost response must never be replayed. Same wire
+    /// behavior as [`Self::get_with_query`]; only the retry
+    /// classification differs.
+    pub(crate) async fn get_with_query_no_replay<R, Q>(
+        &self,
+        path: &str,
+        query: &Q,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        Q: Serialize + ?Sized,
+    {
+        let url = self.resolve_url(path);
+        self.send_with_replay::<R, Q, ()>(
+            reqwest::Method::GET,
+            &url,
+            Some(query),
+            &[],
+            None,
+            retry::Replay::Never,
+        )
+        .await
     }
 
     /// POST a JSON body.
@@ -386,15 +503,29 @@ impl Cirrus {
     /// then free to add headers, configure timeouts, set a custom body
     /// (multipart, form, raw bytes), and `.send()` the request.
     ///
-    /// Response parsing is *not* applied — call sites that want
-    /// Salesforce-error-aware deserialization should use the typed verb
-    /// methods ([`Self::get`], [`Self::post`], etc.) instead.
+    /// The request this returns leaves the SDK's request loop behind,
+    /// so none of the following applies to it:
+    ///
+    /// - Salesforce-error-aware response parsing — the caller gets a
+    ///   raw [`reqwest::Response`] to interpret.
+    /// - The [`RetryPolicy`]: no backoff on a transient 5xx, no
+    ///   `Retry-After` handling on a 429.
+    /// - The 401 auto-refresh. The bearer token is fetched once, here;
+    ///   once it expires the caller sees the 401 and has to invalidate
+    ///   the session and rebuild the request.
+    /// - `Sforce-Limit-Info` capture, so [`Self::last_limit_info`]
+    ///   stops advancing.
+    ///
+    /// To add Salesforce request headers and keep all of that, use
+    /// [`Self::send_with_headers_as`]; for a plain typed call, one of
+    /// the verb methods ([`Self::get`], [`Self::post`], …).
     pub async fn request_builder(
         &self,
         method: reqwest::Method,
         path: &str,
     ) -> CirrusResult<reqwest::RequestBuilder> {
         let url = self.resolve_url(path);
+        self.check_transport_security(&url)?;
         let token = self.auth.access_token().await?;
         Ok(self.client.request(method, url).bearer_auth(&*token))
     }
@@ -406,6 +537,13 @@ impl Cirrus {
     /// response parsing. Useful for unusual cases where the caller has
     /// constructed the entire request themselves and just wants to share
     /// the SDK's connection pool.
+    ///
+    /// The request never enters the SDK's request loop, so — as with
+    /// [`Self::request_builder`] — the [`RetryPolicy`], the 401
+    /// auto-refresh and `Sforce-Limit-Info` capture do not apply:
+    /// a transient 5xx or a 429 comes back as-is, an expired token
+    /// surfaces as a 401 the caller must handle, and
+    /// [`Self::last_limit_info`] stops advancing.
     ///
     /// To get an auth token for a custom request, use
     /// `client.auth().access_token().await?`.
@@ -478,9 +616,15 @@ impl Cirrus {
     /// retrying. `parse` maps the terminal response into the caller's
     /// result shape. `Sforce-Limit-Info` capture happens here, on every
     /// response, so no send path can forget it.
+    ///
+    /// `replay` lets a call site whose HTTP method understates its
+    /// effect (anonymous Apex, Bulk job-data upload) opt out of the
+    /// method-derived idempotency assumption.
     async fn dispatch<T, MakeReq, Parse>(
         &self,
         method: &reqwest::Method,
+        url: &str,
+        replay: retry::Replay,
         make_request: MakeReq,
         parse: Parse,
     ) -> CirrusResult<T>
@@ -488,6 +632,7 @@ impl Cirrus {
         MakeReq: Fn(&str) -> CirrusResult<reqwest::RequestBuilder>,
         Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
     {
+        self.check_transport_security(url)?;
         let mut auth_retried = false;
         let mut attempt: u32 = 0;
         loop {
@@ -496,13 +641,23 @@ impl Cirrus {
             let result: CirrusResult<T> = loop {
                 let request = make_request(&token)?;
 
-                match request.send().await {
+                // Both a request that never got a response and a
+                // response whose body dies mid-stream are transport
+                // failures with the same ambiguity, so they share one
+                // retry decision below.
+                let transport_error: CirrusError = match request.send().await {
                     Ok(response) => {
                         let status = response.status().as_u16();
                         let headers = response.headers().clone();
                         self.update_limit_info(&headers);
 
-                        if retry::should_retry_status(&self.retry_policy, method, status, attempt) {
+                        if retry::should_retry_status(
+                            &self.retry_policy,
+                            method,
+                            replay,
+                            status,
+                            attempt,
+                        ) {
                             // Drain the body so the connection returns
                             // to the pool clean.
                             let _ = response.bytes().await;
@@ -516,21 +671,33 @@ impl Cirrus {
 
                         match response.bytes().await {
                             Ok(bytes) => break parse(status, headers, bytes),
-                            Err(e) => break Err(e.into()),
+                            Err(e) => e.into(),
                         }
                     }
-                    Err(e) => {
-                        let err: CirrusError = e.into();
-                        if retry::should_retry_network(&self.retry_policy, method, &err, attempt) {
-                            let delay = retry::compute_delay(&self.retry_policy, attempt, None);
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue;
-                        }
-                        break Err(err);
-                    }
+                    Err(e) => e.into(),
+                };
+
+                if retry::should_retry_network(
+                    &self.retry_policy,
+                    method,
+                    replay,
+                    &transport_error,
+                    attempt,
+                ) {
+                    let delay = retry::compute_delay(&self.retry_policy, attempt, None);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
                 }
+                break Err(transport_error);
             };
+
+            // An unparsed error body is whatever an intermediary chose
+            // to return, and those pages echo the request that provoked
+            // them. Scrub the credential here, where the token for the
+            // attempt is still in hand, before the error can reach a
+            // log sink.
+            let result = result.map_err(|e| e.redact_secrets(&token));
 
             // 401 → invalidate the cached token and try once more with
             // a fresh one. If the auth session can't refresh (returns
@@ -562,10 +729,33 @@ impl Cirrus {
         Q: Serialize + ?Sized,
         B: Serialize + ?Sized,
     {
+        self.send_with_replay(method, url, query, &[], body, retry::Replay::ByMethod)
+            .await
+    }
+
+    async fn send_with_replay<R, Q, B>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        query: Option<&Q>,
+        headers: &[(&str, &str)],
+        body: Option<&B>,
+        replay: retry::Replay,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        Q: Serialize + ?Sized,
+        B: Serialize + ?Sized,
+    {
         self.dispatch(
             &method,
+            url,
+            replay,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), url).bearer_auth(token);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
                 if let Some(q) = query {
                     request = request.query(q);
                 }
@@ -585,12 +775,17 @@ impl Cirrus {
     /// Used by Bulk 2.0 ingest uploads — the request body is `text/csv`, the
     /// response is the standard JSON job envelope. Path resolution still
     /// follows [`Cirrus`]'s three-mode semantics.
+    ///
+    /// `replay` says whether a lost response may be re-sent; a body
+    /// that submits data (rather than replacing a resource) passes
+    /// [`retry::Replay::Never`] even on an idempotent method.
     pub(crate) async fn send_with_body<R>(
         &self,
         method: reqwest::Method,
         path: &str,
         body: bytes::Bytes,
         content_type: &str,
+        replay: retry::Replay,
     ) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -598,6 +793,8 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
+            replay,
             |token: &str| {
                 // bytes::Bytes is Arc-backed — clone is cheap.
                 Ok(self
@@ -647,6 +844,8 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
+            retry::Replay::ByMethod,
             |token: &str| {
                 // Build a fresh Form per attempt — Form isn't Clone.
                 // The Vec<u8> JSON clone is one alloc (typically <1KB
@@ -698,6 +897,8 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
+            retry::Replay::ByMethod,
             |token: &str| {
                 let mut request = self
                     .client
@@ -740,6 +941,8 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
+            &url,
+            retry::Replay::ByMethod,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), &url).bearer_auth(token);
                 for (name, value) in extra_headers {
@@ -776,6 +979,11 @@ pub struct CirrusBuilder {
     user_agent: Option<String>,
     http_client: Option<reqwest::Client>,
     retry_policy: Option<RetryPolicy>,
+    // Outer `Option` is "did the caller set this"; inner `None` is the
+    // caller asking for no deadline at all.
+    connect_timeout: Option<Option<Duration>>,
+    read_timeout: Option<Option<Duration>>,
+    allow_insecure_transport: bool,
 }
 
 impl CirrusBuilder {
@@ -788,6 +996,12 @@ impl CirrusBuilder {
 
     /// Sets the Salesforce REST API version, e.g. `"v66.0"`. Defaults to
     /// [`DEFAULT_API_VERSION`].
+    ///
+    /// Salesforce writes this URI segment as `vXX.X`, or as the alias
+    /// `latest` to track the org's newest release. Anything else — the
+    /// bare `"66.0"` that [`ApiVersion::version`] carries, for instance
+    /// — is rejected by [`build`](Self::build) rather than turning every
+    /// later call into a `NOT_FOUND`.
     pub fn api_version(mut self, version: impl Into<String>) -> Self {
         self.api_version = Some(version.into());
         self
@@ -801,10 +1015,36 @@ impl CirrusBuilder {
 
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool across multiple SDK clients or for installing custom
-    /// middleware. When provided, the builder's `user_agent` setting is
-    /// ignored — configure that on the supplied client instead.
+    /// middleware. When provided, the builder's `user_agent`,
+    /// `connect_timeout` and `read_timeout` settings are ignored — the
+    /// supplied client owns its own headers, timeouts, redirect policy and
+    /// content-encoding support.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout for the HTTP client this builder
+    /// creates. Defaults to [`DEFAULT_CONNECT_TIMEOUT`]; pass `None` to
+    /// wait indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the per-read timeout for the HTTP client this builder
+    /// creates — the maximum wait between two chunks of a response
+    /// body, not a deadline for the whole request. Defaults to
+    /// [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait indefinitely.
+    ///
+    /// Widen this when draining very large Bulk 2.0 result pages or
+    /// event log files over a slow link.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.read_timeout = Some(timeout.into());
         self
     }
 
@@ -818,9 +1058,35 @@ impl CirrusBuilder {
         self
     }
 
+    /// Allows requests to carry the Salesforce session token over
+    /// plaintext `http://` to a non-loopback host.
+    ///
+    /// Off by default: the token is the org session id, and RFC 6750
+    /// §5.3 requires TLS for any request that bears one. Turn this on
+    /// only for a deliberate plaintext hop you control, such as a
+    /// recording proxy on a trusted network.
+    pub fn allow_insecure_transport(mut self, allow: bool) -> Self {
+        self.allow_insecure_transport = allow;
+        self
+    }
+
     /// Finalizes the builder.
+    ///
+    /// Fails when no [`auth`](Self::auth) session was supplied, when
+    /// [`api_version`](Self::api_version) isn't a version segment
+    /// Salesforce recognizes, or when the auth session's instance URL
+    /// would send the session token in the clear.
     pub fn build(self) -> CirrusResult<Cirrus> {
         let auth = self.auth.ok_or(CirrusError::MissingField("auth"))?;
+        let api_version = self
+            .api_version
+            .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
+        validate_api_version(&api_version)?;
+        check_transport_security(
+            "instance URL",
+            auth.instance_url(),
+            self.allow_insecure_transport,
+        )?;
 
         let client = if let Some(c) = self.http_client {
             c
@@ -831,19 +1097,34 @@ impl CirrusBuilder {
                 USER_AGENT,
                 HeaderValue::from_str(ua).map_err(|e| CirrusError::InvalidHeader(e.to_string()))?,
             );
-            reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder()
                 .default_headers(headers)
-                .build()
-                .map_err(CirrusError::HttpClient)?
+                // Salesforce compresses a response only when the request
+                // carries Accept-Encoding, which this turns on.
+                .gzip(true)
+                // Following a 3xx would re-send the request — bearer
+                // token included — to whatever host the Location header
+                // names, so a redirect is surfaced as an error for the
+                // caller to inspect.
+                .redirect(reqwest::redirect::Policy::none());
+            if let Some(t) = self
+                .connect_timeout
+                .unwrap_or(Some(DEFAULT_CONNECT_TIMEOUT))
+            {
+                builder = builder.connect_timeout(t);
+            }
+            if let Some(t) = self.read_timeout.unwrap_or(Some(DEFAULT_READ_TIMEOUT)) {
+                builder = builder.read_timeout(t);
+            }
+            builder.build().map_err(CirrusError::HttpClient)?
         };
 
         Ok(Cirrus {
             client,
             auth,
-            api_version: self
-                .api_version
-                .unwrap_or_else(|| DEFAULT_API_VERSION.to_string()),
+            api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
+            allow_insecure_transport: self.allow_insecure_transport,
             last_limit_info: Arc::new(RwLock::new(None)),
         })
     }
@@ -882,6 +1163,75 @@ impl CirrusBuilder {
             ..bootstrap
         })
     }
+}
+
+/// Rejects a target that would carry the Salesforce session token in
+/// the clear.
+///
+/// RFC 6750 §5.3 makes TLS mandatory for requests bearing an OAuth
+/// bearer token, and the value here is the org session id: anything
+/// on the path can replay it for the session's lifetime. Loopback
+/// hosts are exempt (local mock servers and sidecar proxies never
+/// leave the machine), and `allow_insecure` reflects the caller's
+/// deliberate opt-out.
+fn check_transport_security(
+    field: &'static str,
+    url: &str,
+    allow_insecure: bool,
+) -> CirrusResult<()> {
+    if allow_insecure {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url)?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
+        None => false,
+    };
+    if loopback {
+        return Ok(());
+    }
+    Err(CirrusError::InvalidInput {
+        field,
+        message: format!(
+            "`{url}` is not an https target, and the Salesforce session token must not travel in the clear; \
+             opt out with CirrusBuilder::allow_insecure_transport if the plaintext hop is deliberate",
+        ),
+    })
+}
+
+/// Accepts the two forms Salesforce documents for the version segment
+/// of a REST URI: `vXX.X` and the alias `latest`.
+///
+/// The bare numeric form (`"66.0"`) is what `GET /services/data`
+/// reports in `ApiVersion::version`, and it is the mistake worth
+/// catching here: the SDK would happily build
+/// `/services/data/66.0/query` and every call would come back as a
+/// generic `NOT_FOUND` that never mentions the version.
+fn validate_api_version(version: &str) -> CirrusResult<()> {
+    let numeric = version.strip_prefix('v').and_then(|v| v.split_once('.'));
+    let well_formed = match numeric {
+        Some((major, minor)) => {
+            !major.is_empty()
+                && !minor.is_empty()
+                && major.bytes().all(|b| b.is_ascii_digit())
+                && minor.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    };
+    if version == "latest" || well_formed {
+        return Ok(());
+    }
+    Err(CirrusError::InvalidInput {
+        field: "api_version",
+        message: format!(
+            "expected `vXX.X` (for example `{DEFAULT_API_VERSION}`) or `latest`, got `{version}`",
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -938,6 +1288,104 @@ mod tests {
         let sf = fixture("https://my.salesforce.com");
         let absolute = "http://localhost:1234/path";
         assert_eq!(sf.resolve_url(absolute), absolute);
+    }
+
+    #[test]
+    fn build_rejects_a_plaintext_instance_url() {
+        // RFC 6750 §5.3: "Clients MUST always use TLS [RFC5246] (https)
+        // or equivalent transport security when making requests with
+        // bearer tokens." An org URL that lost its `s` would otherwise
+        // put the session id on the wire in the clear.
+        let auth = Arc::new(StaticTokenAuth::new(
+            "tok",
+            "http://my-org.my.salesforce.com",
+        ));
+        let err = Cirrus::builder().auth(auth).build().unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, .. } => assert_eq!(field, "instance URL"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_accepts_a_plaintext_instance_url_when_opted_in() {
+        let auth = Arc::new(StaticTokenAuth::new(
+            "tok",
+            "http://my-org.my.salesforce.com",
+        ));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            sf.resolve_url("limits"),
+            "http://my-org.my.salesforce.com/services/data/v66.0/limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_send_the_token_to_a_plaintext_absolute_url() {
+        // The passthrough mode takes a fully-qualified URL, which can
+        // come from data the caller doesn't control (a locator, a
+        // config value). The token must not follow it onto a plaintext
+        // hop — and nothing should be sent at all.
+        let sf = fixture("https://my-org.my.salesforce.com");
+        let err = sf
+            .get::<serde_json::Value>("http://elsewhere.example.com/collect")
+            .await
+            .unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, .. } => assert_eq!(field, "request URL"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        let err = sf
+            .request_builder(reqwest::Method::GET, "http://elsewhere.example.com/collect")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CirrusError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn build_rejects_a_version_segment_salesforce_would_not_recognize() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_query.htm
+        // "URI: /services/data/vXX.X/query?q=query" — the segment
+        // carries the `v`. `ApiVersion::version` reports "66.0"
+        // without it, which is the value callers copy by mistake.
+        for bad in ["66.0", "v66", "V66.0", "vXX.X", ""] {
+            let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+            let err = Cirrus::builder()
+                .auth(auth)
+                .api_version(bad)
+                .build()
+                .unwrap_err();
+            match err {
+                CirrusError::InvalidInput { field, message } => {
+                    assert_eq!(field, "api_version");
+                    assert!(message.contains("latest"), "message should name both forms");
+                }
+                other => panic!("expected InvalidInput for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_accepts_the_latest_version_alias() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_versions.htm
+        // "Version alias: Instead of a numeric version (for example,
+        // vXX.X), you can use latest in the URI to resolve to the most
+        // recently released API version."
+        let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("latest")
+            .build()
+            .unwrap();
+        assert_eq!(
+            sf.resolve_url("limits"),
+            "https://my.salesforce.com/services/data/latest/limits"
+        );
     }
 
     #[test]
@@ -1075,6 +1523,87 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn send_with_headers_as_attaches_salesforce_request_headers() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_autoassign.htm
+            // "Field name: Sforce-Auto-Assign ... If the header is not
+            // provided in the request, the default value is TRUE."
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/services/data/v66.0/sobjects/Lead"))
+                .and(header("sforce-auto-assign", "FALSE"))
+                .and(header("authorization", "Bearer tok"))
+                .and(body_json(json!({"LastName": "Chen", "Company": "Initech"})))
+                .respond_with(
+                    ResponseTemplate::new(201).set_body_json(
+                        json!({"id": "00Q000000000001", "success": true, "errors": []}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let sf = server_fixture(server.uri());
+            let created: Value = sf
+                .send_with_headers_as(
+                    reqwest::Method::POST,
+                    "sobjects/Lead",
+                    None,
+                    &[("Sforce-Auto-Assign", "FALSE")],
+                    Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created["id"], "00Q000000000001");
+        }
+
+        #[tokio::test]
+        async fn send_with_headers_as_keeps_the_retry_policy() {
+            // The point of the method over request_builder: a
+            // header-carrying call still gets retry, 401 refresh and
+            // Sforce-Limit-Info capture.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/query"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/query"))
+                .and(header("sforce-query-options", "batchSize=200"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"totalSize": 0, "done": true, "records": []}))
+                        .insert_header("Sforce-Limit-Info", "api-usage=7/15000"),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy {
+                    base_delay: std::time::Duration::ZERO,
+                    max_delay: std::time::Duration::ZERO,
+                    jitter: false,
+                    ..RetryPolicy::default()
+                })
+                .build()
+                .unwrap();
+            let result: Value = sf
+                .send_with_headers_as::<_, ()>(
+                    reqwest::Method::GET,
+                    "query",
+                    Some(&[("q", "SELECT Id FROM Account")]),
+                    &[("Sforce-Query-Options", "batchSize=200")],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["done"], true);
+            assert_eq!(sf.last_limit_info().unwrap().used, 7);
+        }
+
+        #[tokio::test]
         async fn request_builder_pre_injects_bearer_auth() {
             // Verifies the returned RequestBuilder already has the auth
             // header set — a caller adding their own headers shouldn't
@@ -1119,6 +1648,126 @@ mod tests {
             assert_eq!(resp.status().as_u16(), 200);
             let body: Value = resp.json().await.unwrap();
             assert_eq!(body["raw"], true);
+        }
+    }
+
+    /// Transport defaults the builder installs on the HTTP client it
+    /// creates: response compression, redirect handling, timeouts.
+    mod client_defaults {
+        use super::*;
+        use serde_json::{Value, json};
+        use std::time::Duration;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn requests_advertise_gzip_encoding() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_rest_compression.htm
+            // "Salesforce compresses a response only if the request
+            // contains an Accept-Encoding: gzip, Accept-Encoding:
+            // deflate, Accept-Encoding: br, or Accept-Encoding: zstd
+            // header."
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .and(header("accept-encoding", "gzip"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+        }
+
+        #[tokio::test]
+        async fn redirects_surface_as_errors_instead_of_being_followed() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(302).insert_header("Location", "/elsewhere"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/elsewhere"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 302, .. }));
+        }
+
+        #[tokio::test]
+        async fn an_echoed_request_in_an_error_body_is_scrubbed() {
+            // A gateway that answers with its own page — not the
+            // Salesforce error array — lands in CirrusError::Api::raw
+            // and in the error's Display. If it echoed the request, the
+            // session token must not come with it.
+            let token = "00D5f000000ABCD!AQcAQK_session_id";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(502).set_body_string(format!(
+                    "Bad Gateway\nGET /services/data/v66.0/limits\nAuthorization: Bearer {token}\n"
+                )))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+
+            assert!(!err.to_string().contains(token), "{err}");
+            match err {
+                CirrusError::Api {
+                    status,
+                    raw: Some(raw),
+                    ..
+                } => {
+                    assert_eq!(status, 502);
+                    assert!(!raw.contains(token), "{raw}");
+                    assert!(raw.contains("Bad Gateway"));
+                }
+                other => panic!("expected an Api error with a raw body, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn read_timeout_aborts_a_stalled_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"ok": true}))
+                        .set_delay(Duration::from_secs(30)),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .read_timeout(Duration::from_millis(50))
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            match err {
+                CirrusError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
+                other => panic!("expected a transport error, got {other:?}"),
+            }
         }
     }
 
@@ -1324,6 +1973,46 @@ mod tests {
             let sf = fixture_with_policy(server.uri(), RetryPolicy::none());
             let err = sf.get::<Value>("limits").await.unwrap_err();
             assert!(matches!(err, CirrusError::Api { status: 429, .. }));
+        }
+
+        #[tokio::test]
+        async fn retries_a_response_body_that_stops_mid_stream() {
+            // wiremock always sends a complete body, so this serves the
+            // truncated response from a raw socket: headers promising 40
+            // bytes, 5 bytes of body, then a hang-up. Replaying the GET
+            // is safe, and the retry budget is untouched at that point.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n{\"ok\"",
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+                drop(sock);
+
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let sf = fixture_with_policy(format!("http://{addr}"), fast_retry_policy());
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+            server.await.unwrap();
         }
 
         #[tokio::test]
@@ -1714,6 +2403,18 @@ mod property_tests {
         "[A-Za-z0-9_-]{1,32}"
     }
 
+    /// Segment strategy that reaches the dot-segment forms URL path
+    /// resolution treats specially, for the "no segment ever vanishes"
+    /// property below.
+    fn maybe_dotted_segment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[A-Za-z0-9_-]{1,8}",
+            "\\.{1,3}",
+            "[A-Za-z0-9_-]{0,4}\\.[A-Za-z0-9_-]{0,4}",
+        ]
+        .prop_filter("segments are non-empty", |s: &String| !s.is_empty())
+    }
+
     proptest! {
         /// For any non-fully-qualified path, `resolve_url` produces a
         /// URL that parses cleanly and never contains a `//` outside
@@ -1784,6 +2485,39 @@ mod property_tests {
             prop_assert_eq!(segments[4], seg2);
         }
 
+        /// `versioned_segments` either keeps every segment it was given
+        /// or refuses the call — it never returns a URL that is a
+        /// segment short. Dot segments are the way that happens:
+        /// URL path resolution drops them instead of encoding them.
+        #[test]
+        fn versioned_segments_never_silently_drops_a_segment(
+            segs in proptest::collection::vec(maybe_dotted_segment(), 1..5),
+        ) {
+            let sf = fixture("https://my.salesforce.com");
+            let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+            match sf.versioned_segments(&refs) {
+                Ok(url_str) => {
+                    let parsed = url::Url::parse(&url_str).unwrap();
+                    let segments: Vec<&str> = parsed
+                        .path_segments()
+                        .map(|s| s.collect())
+                        .unwrap_or_default();
+                    // ["services", "data", "{version}", ..segs]
+                    prop_assert_eq!(
+                        segments.len(),
+                        3 + segs.len(),
+                        "segments {:?} lost a component: {}",
+                        segs,
+                        url_str,
+                    );
+                }
+                Err(e) => prop_assert!(
+                    matches!(e, CirrusError::InvalidInput { .. }),
+                    "unexpected error {e:?}",
+                ),
+            }
+        }
+
         /// `versioned_segments` never emits double slashes between
         /// segments. The pop_if_empty trick guards against that; this
         /// property pins it.
@@ -1799,6 +2533,27 @@ mod property_tests {
                 !after_scheme.contains("//"),
                 "got double slash in {url}",
             );
+        }
+    }
+
+    /// Targeted regression: a `.` or `..` external-ID value must not
+    /// silently shorten the URL. `PATCH .../sobjects/Account/Ext__c/.`
+    /// would otherwise resolve to the sObject Rows resource with
+    /// `Ext__c` read as the record ID.
+    #[test]
+    fn versioned_segments_rejects_relative_path_references() {
+        let sf = fixture("https://my.salesforce.com");
+        for value in [".", ".."] {
+            let err = sf
+                .versioned_segments(&["sobjects", "Account", "Ext_Id__c", value])
+                .unwrap_err();
+            match err {
+                CirrusError::InvalidInput { field, message } => {
+                    assert_eq!(field, "path segment");
+                    assert!(message.contains(value), "message should name the segment");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
         }
     }
 

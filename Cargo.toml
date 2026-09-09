@@ -17,7 +17,10 @@ cirrus-auth = { path = "crates/cirrus-auth", version = "0.3.2" }
 cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.2.0" }
 
 # Runtime / HTTP
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "multipart", "query", "rustls", "charset", "system-proxy"] }
+# `gzip` makes reqwest send `Accept-Encoding: gzip` and transparently
+# decode the response — Salesforce compresses a response only when the
+# request asks for it.
+reqwest = { version = "0.13", default-features = false, features = ["form", "gzip", "json", "multipart", "query", "rustls", "charset", "system-proxy"] }
 tokio = { version = "1.52", features = ["sync", "time"] }
 url = "2.5"
 bytes = "1.11"
