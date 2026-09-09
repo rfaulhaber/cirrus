@@ -136,3 +136,62 @@ fn packaged_manifest_emits_full_name_before_types() {
     assert!(i_full < i_types);
     assert!(i_types < i_version);
 }
+
+#[test]
+fn wildcard_and_named_members_render_as_separate_types_blocks() {
+    // A `*` on CustomObject doesn't match standard objects, so the way
+    // to retrieve profile permissions for both every custom object and
+    // the standard Account object is a separate <types> element naming
+    // Account. The manifest below is the union of the two package.xml
+    // samples on that page; combining samples into one manifest is
+    // documented on manifest_samples.htm.
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_profile.htm
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/manifest_samples.htm
+    let pkg = PackageManifest::new("67.0")
+        .all(MetadataType::CUSTOM_OBJECT)
+        .add(MetadataType::CUSTOM_OBJECT, ["Account"])
+        .all(MetadataType::PROFILE);
+
+    let xml = pkg.to_xml();
+
+    // Walk the document, collecting each <types> block as
+    // (name, members) so the assertion is about parsed structure
+    // rather than substring positions.
+    let mut reader = Reader::from_str(&xml);
+    let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut members: Vec<String> = Vec::new();
+    let mut name: Option<String> = None;
+    let mut current_tag: Option<Vec<u8>> = None;
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Start(e) => current_tag = Some(e.name().local_name().as_ref().to_vec()),
+            Event::Text(t) => {
+                let text = unescape(&t.decode().unwrap()).unwrap().into_owned();
+                match current_tag.as_deref() {
+                    Some(b"members") => members.push(text),
+                    Some(b"name") => name = Some(text),
+                    _ => {}
+                }
+            }
+            Event::End(e) => {
+                if e.name().local_name().as_ref() == b"types" {
+                    blocks.push((name.take().unwrap(), std::mem::take(&mut members)));
+                }
+                current_tag = None;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        blocks,
+        vec![
+            ("CustomObject".to_string(), vec!["*".to_string()]),
+            ("CustomObject".to_string(), vec!["Account".to_string()]),
+            ("Profile".to_string(), vec!["*".to_string()]),
+        ]
+    );
+    // The builder still reports one entry per metadata type.
+    assert_eq!(pkg.type_count(), 2);
+}
