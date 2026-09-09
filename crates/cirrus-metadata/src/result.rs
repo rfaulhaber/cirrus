@@ -24,25 +24,32 @@
 
 use serde::Deserialize;
 
-/// Adapter that maps empty strings to `None`.
+/// Adapter that maps blank strings to `None`.
 ///
-/// Salesforce's SOAP responses encode null `Option<String>` fields as
-/// `<field xsi:nil="true"/>` self-closing elements. quick-xml's serde
-/// adapter surfaces these as `Some("")` rather than `None` — the
-/// `xsi:nil` attribute carries no semantics at the serde layer. Without
-/// this adapter, downstream code that branches on `.is_none()` would
-/// instead see `Some("")` for unnamespaced components, types with no
-/// file suffix, etc. — which are the common cases.
+/// Salesforce encodes a null `Option<String>` as either an empty
+/// `<field></field>` element or a self-closing `<field xsi:nil="true"/>`,
+/// and both reach serde as `Some("")`. quick-xml does honor `xsi:nil`,
+/// but only where the `xsi` prefix is declared in scope — and the
+/// prefix is declared on the SOAP envelope, which sits outside the
+/// response element the transport hands to the deserializer. Without
+/// this adapter, code branching on `.is_none()` would see `Some("")`
+/// for unnamespaced components, types with no file suffix, and the
+/// other common absent-value cases.
+///
+/// Whitespace counts as blank. Character data reaches the deserializer
+/// verbatim — the envelope reader deliberately leaves it untrimmed, so
+/// that entity references and stored leading whitespace survive — which
+/// means a pretty-printed `<field>\n  </field>` from an intermediary
+/// arrives as whitespace rather than as the empty string.
 ///
 /// Apply via `#[serde(default, deserialize_with = "deserialize_nil_string")]`
-/// on every `Option<String>` field that Salesforce can render as
-/// `xsi:nil="true"`.
+/// on every `Option<String>` field Salesforce can render blank.
 fn deserialize_nil_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(d)?;
-    Ok(opt.filter(|s| !s.is_empty()))
+    Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
 // -- Async kickoff envelopes -------------------------------------------------
@@ -104,7 +111,10 @@ pub struct DeployOptions {
     /// `package.xml` are missing from the zip. **Don't set on
     /// production deploys.**
     pub allow_missing_files: Option<bool>,
-    /// Reserved for future use.
+    /// Whether a file that's in the zip but not listed in
+    /// `package.xml` is automatically added to the package. A
+    /// `retrieve()` is issued with the updated `package.xml` that
+    /// includes the file. **Don't set on production deploys.**
     pub auto_update_package: Option<bool>,
     /// If `true`, performs a test deployment (validation) without
     /// actually committing the components. Pair with
@@ -113,7 +123,11 @@ pub struct DeployOptions {
     pub check_only: Option<bool>,
     /// Continue on warnings.
     pub ignore_warnings: Option<bool>,
-    /// Reserved for future use.
+    /// Whether a `retrieve()` runs immediately after the deployment.
+    /// Set `true` to retrieve whatever was deployed; its outcome
+    /// arrives in [`DeployDetails::retrieve_result`], which
+    /// `check_deploy_status` populates only when called with
+    /// `include_details: true`.
     pub perform_retrieve: Option<bool>,
     /// In dev/sandbox orgs only: skip the Recycle Bin when deleting
     /// components listed in `destructiveChanges.xml`.
@@ -195,6 +209,15 @@ pub struct DeployResult {
     pub number_tests_total: i32,
     #[serde(default)]
     pub number_test_errors: i32,
+
+    /// Total number of files included in this deployment. Available
+    /// in API version 64.0 and later; `0` on older versions.
+    #[serde(default)]
+    pub num_files: i32,
+    /// Size of the unzipped deployment folder, in bytes. Available in
+    /// API version 64.0 and later; `0` on older versions.
+    #[serde(default)]
+    pub zip_size: i64,
 
     /// Free-form description of the in-progress component or test
     /// class.
@@ -282,6 +305,11 @@ pub struct DeployDetails {
     /// Apex test results.
     #[serde(default)]
     pub run_test_result: Option<RunTestsResult>,
+    /// Outcome of the `retrieve()` Salesforce runs after the deploy
+    /// when [`DeployOptions::perform_retrieve`] was set. `None`
+    /// otherwise.
+    #[serde(default)]
+    pub retrieve_result: Option<RetrieveResult>,
 }
 
 /// Per-component status entry inside [`DeployDetails`].
@@ -325,10 +353,18 @@ pub struct DeployMessage {
     pub column_number: Option<i32>,
 }
 
+/// Whether a [`DeployMessage`] reports an error or a warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum DeployProblemType {
     Warning,
     Error,
+    /// A problem-type literal this SDK version doesn't know. This enum
+    /// rides inside every [`DeployMessage`], so without a fallback a
+    /// single new literal would fail deserialization of an entire
+    /// `check_deploy_status(id, true)` response — every component
+    /// success and failure with it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Apex test results inside [`DeployDetails`].
@@ -447,12 +483,23 @@ pub struct RetrieveRequest {
     pub api_version: String,
     /// Packaged components to retrieve by managed-package name.
     pub package_names: Vec<String>,
+    /// Component types to pull dependencies for. `"Bot"` is the only
+    /// value Salesforce currently allows; set it when the request
+    /// includes Bot components. Available in API version 64.0 and
+    /// later, and metered separately — 25 retrieves per day using this
+    /// field, each covering up to 100 components.
+    pub root_types_with_dependencies: Vec<String>,
     /// `true` if the result is one package (vs. a set). Required
     /// `true` when `specific_files` is non-empty.
     pub single_package: bool,
     /// Specific file paths to retrieve, e.g.
     /// `["unpackaged/classes/MyClass.cls"]`. When set, `package_names`
-    /// must be empty and `single_package` must be `true`.
+    /// must be empty and `single_package` must be `true` —
+    /// [`retrieve`] rejects any other combination with
+    /// [`MetadataError::InvalidArgument`] rather than sending it.
+    ///
+    /// [`retrieve`]: crate::MetadataClient::retrieve
+    /// [`MetadataError::InvalidArgument`]: crate::MetadataError::InvalidArgument
     pub specific_files: Vec<String>,
     /// Unpackaged components to retrieve, expressed as a
     /// [`PackageManifest`]. Built with the same fluent API used for
@@ -468,6 +515,12 @@ pub struct RetrieveRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveResult {
+    /// ID of the retrieve request. `done` is the only field Salesforce
+    /// documents as required on this object, so an omitted `id` reads
+    /// back as an empty string rather than failing the call —
+    /// including when this result arrives nested in
+    /// [`DeployDetails::retrieve_result`].
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub done: bool,
@@ -619,8 +672,9 @@ pub struct DescribeMetadataResult {
     /// etc. One entry per metadata type the org supports.
     #[serde(default)]
     pub metadata_objects: Vec<DescribeMetadataObject>,
-    /// Namespace prefix for managed packages in this org. Empty
-    /// (`""`) for orgs with no namespace.
+    /// Namespace prefix for managed packages in this org. `None` for
+    /// orgs with no namespace — Salesforce sends a blank element,
+    /// which this field normalizes to `None`.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub organization_namespace: Option<String>,
     /// Whether the org allows partial deployments (`rollbackOnError`
@@ -711,6 +765,16 @@ pub struct DescribeValueTypeResult {
 /// [`fields`](Self::fields) describing their own structure (e.g. a
 /// `CustomField` value type field on `CustomObject` itself has a
 /// nested schema). Use [`Self::fields`] to walk the tree.
+//
+// Wire-shape provenance (api_meta doc page IDs):
+// - `meta_describeValueTypeResult` types `foreignKeyDomain` as a
+//   singular `string` in its property table, but
+//   `meta_describeValueType` contradicts it twice over: the Java
+//   sample iterates `field.getForeignKeyDomain()` as a collection, and
+//   its printed output for `CustomObject` prints two domains
+//   (`ApexPage`, `Scontrol`) for the one `customHelp` field. The
+//   repeating form is modelled here because binding a repeated
+//   element to a scalar fails the whole response, not just the field.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueTypeField {
@@ -734,10 +798,14 @@ pub struct ValueTypeField {
     /// Whether this field is a foreign key to another component.
     #[serde(default)]
     pub is_foreign_key: bool,
-    /// Target object type when [`is_foreign_key`](Self::is_foreign_key)
-    /// is true (e.g. `"Account"`, `"Opportunity"`).
-    #[serde(default, deserialize_with = "deserialize_nil_string")]
-    pub foreign_key_domain: Option<String>,
+    /// Target object types when [`is_foreign_key`](Self::is_foreign_key)
+    /// is true (e.g. `"Account"`, `"Opportunity"`). A single field can
+    /// point at more than one type — `CustomObject.customHelp` names
+    /// both `ApexPage` and `Scontrol` — so the wire emits one
+    /// `<foreignKeyDomain>` element per target. Empty for fields that
+    /// aren't foreign keys.
+    #[serde(default)]
+    pub foreign_key_domain: Vec<String>,
     /// Picklist options when this field is a picklist. Empty for
     /// non-picklist fields.
     #[serde(default)]
@@ -887,6 +955,7 @@ mod tests {
             retrieve: RetrieveStatus,
             state: AsyncRequestState,
             manageable: ManageableState,
+            problem: DeployProblemType,
         }
         let parsed: Wire = quick_xml::de::from_str(
             "<Wire>\
@@ -894,6 +963,7 @@ mod tests {
                <retrieve>BrandNewPhase</retrieve>\
                <state>BrandNewPhase</state>\
                <manageable>brandNewState</manageable>\
+               <problem>Info</problem>\
              </Wire>",
         )
         .unwrap();
@@ -903,6 +973,73 @@ mod tests {
         assert!(!parsed.retrieve.is_terminal());
         assert_eq!(parsed.state, AsyncRequestState::Unknown);
         assert_eq!(parsed.manageable, ManageableState::Unknown);
+        assert_eq!(parsed.problem, DeployProblemType::Unknown);
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    /// DeployResult.status is a "DeployStatus (enumeration of type
+    /// string)" whose valid values are Pending, InProgress,
+    /// FinalizingDeploy, FinalizingDeployFailed, Succeeded,
+    /// SucceededPartial, Failed, Canceling, and Canceled. With
+    /// `#[serde(other)]` in place a misspelled variant identifier
+    /// would deserialize to `Unknown` instead of failing, so every
+    /// documented literal is pinned here.
+    #[test]
+    fn deploy_status_literals_match_the_documented_set() {
+        #[derive(Deserialize)]
+        struct Wire {
+            status: DeployStatus,
+        }
+        fn parse(literal: &str) -> DeployStatus {
+            let wire: Wire =
+                quick_xml::de::from_str(&format!("<Wire><status>{literal}</status></Wire>"))
+                    .unwrap();
+            wire.status
+        }
+
+        for (literal, expected) in [
+            ("Pending", DeployStatus::Pending),
+            ("InProgress", DeployStatus::InProgress),
+            ("FinalizingDeploy", DeployStatus::FinalizingDeploy),
+            (
+                "FinalizingDeployFailed",
+                DeployStatus::FinalizingDeployFailed,
+            ),
+            ("Succeeded", DeployStatus::Succeeded),
+            ("SucceededPartial", DeployStatus::SucceededPartial),
+            ("Failed", DeployStatus::Failed),
+            ("Canceling", DeployStatus::Canceling),
+            ("Canceled", DeployStatus::Canceled),
+        ] {
+            assert_eq!(parse(literal), expected, "literal {literal}");
+        }
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+    /// RetrieveResult.status is a "RetrieveStatus (enumeration of type
+    /// string)" whose valid values are Pending, InProgress, Succeeded,
+    /// and Failed.
+    #[test]
+    fn retrieve_status_literals_match_the_documented_set() {
+        #[derive(Deserialize)]
+        struct Wire {
+            status: RetrieveStatus,
+        }
+        fn parse(literal: &str) -> RetrieveStatus {
+            let wire: Wire =
+                quick_xml::de::from_str(&format!("<Wire><status>{literal}</status></Wire>"))
+                    .unwrap();
+            wire.status
+        }
+
+        for (literal, expected) in [
+            ("Pending", RetrieveStatus::Pending),
+            ("InProgress", RetrieveStatus::InProgress),
+            ("Succeeded", RetrieveStatus::Succeeded),
+            ("Failed", RetrieveStatus::Failed),
+        ] {
+            assert_eq!(parse(literal), expected, "literal {literal}");
+        }
     }
 
     #[test]

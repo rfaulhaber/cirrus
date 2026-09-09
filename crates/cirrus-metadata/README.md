@@ -40,7 +40,10 @@ you need anything beyond `deployRequest`.
 - **CRUD-based calls** — `create_metadata`, `read_metadata`,
   `update_metadata`, `upsert_metadata`, `delete_metadata`,
   `rename_metadata`. Up to 10 components per call, per the Metadata API
-  contract — 200 for `CustomMetadata` and `CustomApplication`.
+  contract; `create_metadata`, `update_metadata`, `read_metadata` and
+  `delete_metadata` raise that to 200 for `CustomMetadata` and
+  `CustomApplication`, while `upsert_metadata` is a flat 10 for every
+  type.
 - **Utility** — `list_metadata`, `describe_metadata`, `describe_value_type`.
 - **Typed `package.xml`** — `PackageManifest` builder with round-trippable
   XML serialization. `MetadataType` carries constants for the common
@@ -52,6 +55,16 @@ you need anything beyond `deployRequest`.
 - **Cross-cutting** — retry/backoff via `RetryPolicy`, automatic
   `INVALID_SESSION_ID` refresh against the configured `AuthSession`, SOAP
   fault parsing into a typed `MetadataError::Soap`.
+- **Transport defaults** — the HTTP client the builder creates applies a 30 s
+  connect timeout and a 120 s read timeout
+  (`MetadataClientBuilder::connect_timeout` / `read_timeout` override either),
+  and doesn't follow redirects — a 3xx surfaces as an error rather than
+  re-POSTing the envelope, session token included, to the `Location` host.
+  The read timeout runs until the response head arrives, so it also bounds
+  the upload of a deploy's base64 zip, and only then becomes a per-chunk
+  deadline; widen it for a large deploy or retrieve over a slow link.
+  Supplying your own client via `MetadataClientBuilder::http_client` replaces
+  all of it.
 
 ## Design principles
 
@@ -123,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `zip_file` holds the base64 payload Salesforce returns;
     // `zip_bytes()` decodes it into the actual archive.
     if let Some(zip) = result.zip_bytes()? {
-        std::fs::write("retrieved.zip", zip)?;
+        fs_err::write("retrieved.zip", zip)?;
     }
 
     Ok(())
@@ -156,7 +169,7 @@ workspace's `.env` and the same URL safety guard as `cirrus` and
 
 ```bash
 cargo nextest run -p cirrus-metadata --test integration \
-    --run-ignored only -- --test-threads=1
+    --run-ignored only -j 1
 ```
 
 ## License

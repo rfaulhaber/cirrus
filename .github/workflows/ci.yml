@@ -65,12 +65,14 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
-    # The `rust-version` in [workspace.package], as the single source for both
-    # the toolchain this job installs and the one it runs under. Installing the
-    # release is not enough on its own: rustup resolves `rust-toolchain.toml`
-    # ahead of the default toolchain, so the repo's `channel = "stable"` would
-    # otherwise silently win and the job would check the declared floor against
-    # stable. RUSTUP_TOOLCHAIN outranks the toolchain file.
+    # RUSTUP_TOOLCHAIN below duplicates `[workspace.package] rust-version` in
+    # Cargo.toml — nothing reads the manifest here, so the two are coupled by
+    # hand and have to be bumped together or this job checks the old floor and
+    # still reports green. Setting it is not optional: rustup resolves
+    # `rust-toolchain.toml` ahead of the default toolchain, so the repo's
+    # `channel = "stable"` would otherwise silently win and the job would check
+    # the declared floor against stable. RUSTUP_TOOLCHAIN outranks the
+    # toolchain file.
     env:
       RUSTUP_TOOLCHAIN: "1.88.0"
     steps:

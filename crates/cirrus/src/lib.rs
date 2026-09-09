@@ -104,13 +104,20 @@ pub const DEFAULT_API_VERSION: &str = "v66.0";
 /// creates. Override with [`CirrusBuilder::connect_timeout`].
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-read timeout applied to the HTTP client the builder creates:
-/// the maximum time the client waits for the *next chunk* of a
-/// response, not for the whole response. Bulk 2.0 result pages and
-/// event log files can be large enough that a whole-request deadline
-/// would cut a healthy transfer short, so none is set. Override with
-/// [`CirrusBuilder::read_timeout`].
-pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Read timeout applied to the HTTP client the builder creates.
+///
+/// It runs from the moment the request is dispatched until the response
+/// head arrives — covering the upload of the request body and the org's
+/// own processing time — and from then on bounds the gap between two
+/// chunks of the response body. Only that second phase resets, so this
+/// is a deadline on getting an answer at all, not merely a stall
+/// detector.
+///
+/// Widen it with [`CirrusBuilder::read_timeout`] for a large Bulk 2.0
+/// or blob upload, or for a synchronous call the org takes a long time
+/// to answer; no fixed default covers a 100 MB ingest upload over an
+/// arbitrary link.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default User-Agent header value sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -379,7 +386,7 @@ impl Cirrus {
     /// # let sf = Cirrus::builder().auth(auth).build()?;
     /// // Create a Lead without running the org's assignment rules.
     /// let created: Value = sf
-    ///     .send_with_headers_as(
+    ///     .send_with_headers(
     ///         cirrus::reqwest::Method::POST,
     ///         "sobjects/Lead",
     ///         None,
@@ -391,7 +398,7 @@ impl Cirrus {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_with_headers_as<R, B>(
+    pub async fn send_with_headers<R, B>(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -517,7 +524,7 @@ impl Cirrus {
     ///   stops advancing.
     ///
     /// To add Salesforce request headers and keep all of that, use
-    /// [`Self::send_with_headers_as`]; for a plain typed call, one of
+    /// [`Self::send_with_headers`]; for a plain typed call, one of
     /// the verb methods ([`Self::get`], [`Self::post`], …).
     pub async fn request_builder(
         &self,
@@ -921,47 +928,39 @@ impl Cirrus {
         .await
     }
 
-    /// Sends a GET with arbitrary extra headers, returning the
-    /// `(status, body_bytes)` tuple verbatim. Used for conditional
-    /// requests where the caller needs to dispatch on a specific
-    /// status (e.g., `304 Not Modified` for `If-Modified-Since`).
+    /// Sends a conditional GET carrying `If-Modified-Since`, returning
+    /// `None` when the org answers `304 Not Modified`.
     ///
-    /// Goes through the same retry policy, auth-refresh, and
-    /// `Sforce-Limit-Info` capture as the other send paths.
-    /// **Treats both 2xx and 304 as success** — they're returned as
-    /// `Ok((status, bytes))` for the caller to dispatch. Other non-2xx
-    /// statuses go through the normal error parsing.
-    pub(crate) async fn send_with_headers(
+    /// `since` is an already-formatted IMF-fixdate. Goes through the
+    /// same retry policy, auth-refresh, `Sforce-Limit-Info` capture and
+    /// body handling as the other send paths — a 2xx that doesn't fit
+    /// `R` surfaces as [`CirrusError::InvalidResponse`] with a scrubbed
+    /// excerpt, exactly as it does on the unconditional path.
+    pub(crate) async fn get_if_modified_since<R: DeserializeOwned>(
         &self,
-        method: reqwest::Method,
         path: &str,
-        query: Option<&[(&str, &str)]>,
-        extra_headers: &[(&str, &str)],
-    ) -> CirrusResult<(u16, bytes::Bytes)> {
+        since: &str,
+    ) -> CirrusResult<Option<R>> {
+        let method = reqwest::Method::GET;
         let url = self.resolve_url(path);
         self.dispatch(
             &method,
             &url,
             retry::Replay::ByMethod,
             |token: &str| {
-                let mut request = self.client.request(method.clone(), &url).bearer_auth(token);
-                for (name, value) in extra_headers {
-                    request = request.header(*name, *value);
-                }
-                if let Some(q) = query {
-                    request = request.query(q);
-                }
-                Ok(request)
+                Ok(self
+                    .client
+                    .request(method.clone(), &url)
+                    .bearer_auth(token)
+                    .header(reqwest::header::IF_MODIFIED_SINCE, since))
             },
             |status, _headers, bytes| {
-                // 304 is "use your cache" — not an error from
-                // the conditional-request perspective. 2xx is
-                // success. Other non-2xx → error.
-                if (200..300).contains(&status) || status == 304 {
-                    Ok((status, bytes))
-                } else {
-                    Err(response::parse_error_response(status, &bytes))
+                // 304 is "your cache is still good", not a failure —
+                // and it carries no body to deserialize.
+                if status == 304 {
+                    return Ok(None);
                 }
+                response::parse_response_bytes(status, &bytes).map(Some)
             },
         )
         .await
@@ -1034,13 +1033,16 @@ impl CirrusBuilder {
         self
     }
 
-    /// Sets the per-read timeout for the HTTP client this builder
-    /// creates — the maximum wait between two chunks of a response
-    /// body, not a deadline for the whole request. Defaults to
-    /// [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait indefinitely.
+    /// Sets the read timeout for the HTTP client this builder creates.
+    /// Defaults to [`DEFAULT_READ_TIMEOUT`]; pass `None` to wait
+    /// indefinitely.
     ///
-    /// Widen this when draining very large Bulk 2.0 result pages or
-    /// event log files over a slow link.
+    /// The deadline covers the whole in-flight request until the
+    /// response head arrives — request-body upload and org processing
+    /// included — and after that the gap between two response chunks.
+    /// Widen it for a large Bulk 2.0 or blob **upload**, for draining a
+    /// very large result page over a slow link, and for a call the org
+    /// takes a long time to answer.
     ///
     /// Ignored when [`http_client`](Self::http_client) supplies a client.
     pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
@@ -1523,7 +1525,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn send_with_headers_as_attaches_salesforce_request_headers() {
+        async fn send_with_headers_attaches_salesforce_request_headers() {
             // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_autoassign.htm
             // "Field name: Sforce-Auto-Assign ... If the header is not
             // provided in the request, the default value is TRUE."
@@ -1543,7 +1545,7 @@ mod tests {
 
             let sf = server_fixture(server.uri());
             let created: Value = sf
-                .send_with_headers_as(
+                .send_with_headers(
                     reqwest::Method::POST,
                     "sobjects/Lead",
                     None,
@@ -1556,7 +1558,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn send_with_headers_as_keeps_the_retry_policy() {
+        async fn send_with_headers_keeps_the_retry_policy() {
             // The point of the method over request_builder: a
             // header-carrying call still gets retry, 401 refresh and
             // Sforce-Limit-Info capture.
@@ -1590,7 +1592,7 @@ mod tests {
                 .build()
                 .unwrap();
             let result: Value = sf
-                .send_with_headers_as::<_, ()>(
+                .send_with_headers::<_, ()>(
                     reqwest::Method::GET,
                     "query",
                     Some(&[("q", "SELECT Id FROM Account")]),
@@ -1705,6 +1707,36 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn an_echoed_request_in_a_2xx_body_is_scrubbed() {
+            // A gateway can answer 200 with its own page. That body
+            // doesn't fit the requested type, so an excerpt lands in
+            // CirrusError::InvalidResponse and in the error's Display —
+            // the same exposure the error-array path has.
+            let token = "00D5f000000ABCD!AQcAQK_session_id";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    "<html>GET /services/data/v66.0/limits\nAuthorization: Bearer {token}</html>"
+                )))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+
+            assert!(!err.to_string().contains(token), "{err}");
+            match err {
+                CirrusError::InvalidResponse(message) => {
+                    assert!(!message.contains(token), "{message}");
+                    assert!(message.contains("[redacted]"), "{message}");
+                }
+                other => panic!("expected an InvalidResponse error, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
         async fn an_echoed_request_in_an_error_body_is_scrubbed() {
             // A gateway that answers with its own page — not the
             // Salesforce error array — lands in CirrusError::Api::raw
@@ -1744,7 +1776,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn read_timeout_aborts_a_stalled_response() {
+        async fn read_timeout_aborts_a_request_the_org_never_answers() {
+            // The deadline is armed at dispatch, so it fires while the
+            // response head is still outstanding — not just between two
+            // chunks of a body that has already started arriving.
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/services/data/v66.0/limits"))

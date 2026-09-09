@@ -7,7 +7,8 @@ edition = "2024"
 # Floor imposed by the dependency graph, not by this workspace's own
 # code: `jsonwebtoken` 11 and the `time` crate it pulls in through
 # `simple_asn1` both declare 1.88, and every member depends on
-# `cirrus-auth`. Raise it only alongside a CI msrv job bump.
+# `cirrus-auth`. Raise it only alongside RUSTUP_TOOLCHAIN in the msrv
+# job of .github/workflows/ci.yml, which duplicates this value.
 rust-version = "1.88"
 license = "MIT"
 authors = ["Ryan Faulhaber <ryf@sent.as>"]

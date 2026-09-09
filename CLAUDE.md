@@ -21,6 +21,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - Phase 2: composite/batch, composite/tree, composite/sobjects (incl. `retrieve_with_body`), generic `/composite`, Bulk 2.0 (ingest + query), Apex REST passthrough, Tooling API, Event Monitoring.
 - Phase 3: Metadata REST API (`Cirrus::metadata()` — the four `deployRequest` endpoints). The rest of the Metadata API surface is SOAP-only and lives in `cirrus-metadata`.
 - Cross-cutting: open-ended client escape hatch, pagination stream (`futures::Stream`), retry + backoff policy, `Sforce-Limit-Info` surfacing, auto-refresh on 401, multipart blob uploads.
+- Transport contract: session-token targets must be `https` (loopback excepted) or the request is refused with `CirrusError::InvalidInput` — `CirrusBuilder::allow_insecure_transport(true)` is the opt-out; the client the builder creates advertises gzip, sets a 10s connect and 120s read timeout (both overridable), and follows no redirects. `CirrusError` is `#[non_exhaustive]`.
 
 `cirrus-auth`:
 - All five priority OAuth flows: JWT Bearer (RFC 7523), Refresh Token (RFC 6749 §6), Client Credentials (RFC 6749 §4.4), Web Server with PKCE (RFC 6749 §4.1 + RFC 7636), Token Exchange (RFC 8693).
@@ -29,12 +30,12 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 
 `cirrus-metadata`:
 - File-based: `deploy`, `check_deploy_status`, `cancel_deploy`, `deploy_recent_validation`, `retrieve`, `check_retrieve_status`, plus `wait_for_deploy` / `wait_for_retrieve` polling helpers.
-- CRUD-based: `create_metadata`, `read_metadata`, `update_metadata`, `upsert_metadata`, `delete_metadata`, `rename_metadata` (up to 10 components per call, per Salesforce's contract).
+- CRUD-based: `create_metadata`, `read_metadata`, `update_metadata`, `upsert_metadata`, `delete_metadata`, `rename_metadata`. Per Salesforce's contract the cap is 10 components per call; `create`/`update`/`read`/`delete` raise it to 200 for `CustomMetadata` and `CustomApplication`, and `upsert` stays at 10 for every type.
 - Utility: `list_metadata`, `describe_metadata`, `describe_value_type`.
-- Typed `package.xml` via `PackageManifest` builder over the full `MetadataType` taxonomy.
+- Typed `package.xml` via `PackageManifest` builder; `MetadataType` ships constants for the common types and `MetadataType::new` names anything else.
 - Open-ended escape hatch (`MetadataClient::request_builder()`), retry policy, and `INVALID_SESSION_ID` auto-refresh against the configured `AuthSession`.
 
-Tests: ~400 unit + ~20 doctest workspace-wide, all wiremock-backed, fast (<10s wall). Integration tests against real orgs are `#[ignore]`-gated and live under each crate's `tests/integration/`.
+Tests: ~585 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s wall). Integration tests against real orgs are `#[ignore]`-gated and live under each crate's `tests/integration/`.
 
 ### Project-wide rules
 
@@ -46,7 +47,7 @@ Tests: ~400 unit + ~20 doctest workspace-wide, all wiremock-backed, fast (<10s w
 
 ### Open-ended client (escape hatch)
 
-Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
+Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` (the header-carrying verb — it stays inside the retry / 401-refresh / limit-info loop, unlike the two below), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
 
 - **Relative** (`limits`) → versioned: `{instance}/services/data/{version}/limits`
 - **Leading slash** (`/services/apexrest/foo`) → instance-rooted
@@ -90,7 +91,7 @@ The Metadata API has two surfaces: a small REST slice covering `deployRequest` (
 - **Transport core (`transport.rs`):** `SoapOperation` is the trait/dispatch path analogous to `Cirrus::send`. Every typed handler builds a `SoapOperation` and routes through `MetadataClient::call`. Retry + `INVALID_SESSION_ID` refresh wrap the call.
 - **Envelopes (`envelope.rs`):** wraps the operation body with SOAP namespaces, `<SessionHeader>` (the Metadata API expects the bearer token inside the envelope, not on the `Authorization` header — `request_builder()` deliberately does not inject auth), and the action header. Property-tested for XML round-trip safety.
 - **Handlers (`handlers/{file_based, crud, utility}.rs`):** add methods directly to `MetadataClient` via inherent `impl` blocks so callers see `md.deploy(...)`, `md.list_metadata(...)`, etc. at the top level — no `.utility()` / `.crud()` accessor pattern.
-- **Package manifests (`package_manifest.rs`):** typed builder for `package.xml` with the full `MetadataType` taxonomy; round-trips through `quick-xml`. Used as `RetrieveRequest::unpackaged`.
+- **Package manifests (`package_manifest.rs`):** typed builder for `package.xml`; `MetadataType` carries constants for the ~40 most-commonly-used types and `MetadataType::new` takes any other Salesforce-defined name. Round-trips through `quick-xml`. Used as `RetrieveRequest::unpackaged`.
 - **Caller-supplied metadata bodies:** the 200+ concrete metadata types (`CustomObject`, `ApexClass`, `Flow`, …) are **not** modeled. Callers pass XML strings or `serde`-generic bodies via the `_as::<T>` variants of the CRUD methods. Only platform envelopes are typed.
 
 ## Test conventions

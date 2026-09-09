@@ -335,6 +335,13 @@ pub enum BulkColumnDelimiter {
 pub struct BulkIngestJob {
     pub id: String,
     pub operation: BulkOperation,
+    /// Object type the job's data belongs to. Absent for jobs created
+    /// with the `consentImport` operation — consent ingest isn't
+    /// backed by an object type — and deserializes as an empty string
+    /// there rather than failing the envelope. See [Create a Job].
+    ///
+    /// [Create a Job]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+    #[serde(default)]
     pub object: String,
     pub state: BulkJobState,
     #[serde(rename = "externalIdFieldName", default)]
@@ -905,9 +912,10 @@ pub struct ExecuteAnonymousResult {
 ///
 /// On 2xx, the body is deserialized into `R` (use `serde_json::Value` for an
 /// untyped response); a body that doesn't fit `R` becomes a
-/// [`CirrusError::InvalidResponse`] carrying an excerpt of what arrived. On
-/// 4xx/5xx, the body is parsed as a Salesforce error array; if that fails
-/// the raw body is preserved in [`CirrusError::Api::raw`] for debugging.
+/// [`CirrusError::InvalidResponse`] carrying a short excerpt of what
+/// arrived. On 4xx/5xx, the body is parsed as a Salesforce error array; if
+/// that fails the raw body is preserved in [`CirrusError::Api::raw`] for
+/// debugging.
 pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
     status: u16,
     bytes: &[u8],
@@ -927,28 +935,36 @@ pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
         }
         // A 2xx that doesn't fit `R` is usually an off-contract body from an
         // interposed hop, or a truncated one — serde's message alone names
-        // neither, so keep an excerpt under the same cap the error path uses.
+        // neither, so lead the excerpt with enough to tell those apart.
         return serde_json::from_slice(bytes).map_err(|err| {
             CirrusError::InvalidResponse(format!(
                 "endpoint returned {status} but the body did not deserialize into the requested \
-                 type: {err}; body: {}",
-                capped_body(bytes)
+                 type: {err}; body starts: {}",
+                capped_body(bytes, SUCCESS_BODY_EXCERPT_CAP)
             ))
         });
     }
     Err(parse_error_response(status, bytes))
 }
 
-/// Ceiling on how much of an off-contract body is retained in an error —
-/// the unparseable error body in [`CirrusError::Api::raw`], and the body
-/// excerpt in the [`CirrusError::InvalidResponse`] raised for a 2xx that
-/// doesn't fit `R`. Bodies that don't match the Salesforce
-/// error shape come from proxies and gateways, which can echo request
+/// Ceiling on how much of an unparseable error body is retained in
+/// [`CirrusError::Api::raw`]. A body that doesn't match the Salesforce
+/// error shape comes from a proxy or gateway, which can echo request
 /// data — capping what we retain bounds what can end up in the
 /// caller's logs via `Display`/`Debug`, and keeps a pathological body
 /// from ballooning the error value. 2 KiB comfortably fits real proxy
 /// error pages' useful prefix.
 const RAW_ERROR_BODY_CAP: usize = 2048;
+
+/// Ceiling on the excerpt carried by the [`CirrusError::InvalidResponse`]
+/// raised when a 2xx body doesn't fit `R`.
+///
+/// Much tighter than [`RAW_ERROR_BODY_CAP`], because a successful body is
+/// normally the org's own record data rather than a gateway's page. Naming
+/// which field disagreed is serde's job and its message is kept in full;
+/// the excerpt only has to be wide enough to recognize an off-contract
+/// body — an HTML login page, a truncated stream — at a glance.
+const SUCCESS_BODY_EXCERPT_CAP: usize = 256;
 
 /// Parses a non-2xx response body into a [`CirrusError::Api`].
 ///
@@ -961,7 +977,7 @@ const RAW_ERROR_BODY_CAP: usize = 2048;
 pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
     let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes).unwrap_or_default();
     let raw = if errors.is_empty() {
-        Some(capped_body(bytes))
+        Some(capped_body(bytes, RAW_ERROR_BODY_CAP))
     } else {
         None
     };
@@ -972,19 +988,19 @@ pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
     }
 }
 
-/// Decodes a body for inclusion in an error, bounded by
-/// [`RAW_ERROR_BODY_CAP`] and marked when anything was dropped.
+/// Decodes a body for inclusion in an error, bounded by `cap` bytes and
+/// marked when anything was dropped.
 ///
 /// Only the capped byte prefix is decoded, so a multi-megabyte body never
 /// gets a full owned copy. Lossy decoding expands each invalid byte to a
 /// three-byte U+FFFD, which can push even that prefix past the cap, so the
 /// decoded string is trimmed again at a char boundary.
-fn capped_body(bytes: &[u8]) -> String {
-    let mut truncated = bytes.len() > RAW_ERROR_BODY_CAP;
-    let head = &bytes[..bytes.len().min(RAW_ERROR_BODY_CAP)];
+fn capped_body(bytes: &[u8], cap: usize) -> String {
+    let mut truncated = bytes.len() > cap;
+    let head = &bytes[..bytes.len().min(cap)];
     let mut body = String::from_utf8_lossy(head).into_owned();
-    if body.len() > RAW_ERROR_BODY_CAP {
-        let mut end = RAW_ERROR_BODY_CAP;
+    if body.len() > cap {
+        let mut end = cap;
         while !body.is_char_boundary(end) {
             end -= 1;
         }
@@ -1041,13 +1057,15 @@ mod tests {
 
     #[test]
     fn undeserializable_2xx_body_excerpt_is_capped() {
+        // A successful body is the org's own data, so the excerpt is
+        // held to a far tighter cap than an error page's.
         let body = format!("{{\"junk\": \"{}\"}}", "x".repeat(RAW_ERROR_BODY_CAP * 3));
         let err = parse_response_bytes::<QueryResult<Value>>(200, body.as_bytes()).unwrap_err();
         match err {
             CirrusError::InvalidResponse(msg) => {
                 assert!(msg.contains("… <truncated>"), "missing marker");
                 assert!(
-                    msg.len() < RAW_ERROR_BODY_CAP + 256,
+                    msg.len() < SUCCESS_BODY_EXCERPT_CAP + 256,
                     "excerpt not capped: {} bytes",
                     msg.len()
                 );
@@ -1481,6 +1499,32 @@ mod tests {
         .to_string();
         let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(job.operation, BulkOperation::ConsentImport);
+        assert_eq!(job.object, "");
+    }
+
+    #[test]
+    fn parses_bulk_ingest_job_with_object_absent() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // The response table treats `object` as conditional on the
+        // operation rather than always present; `#[serde(default)]`
+        // keeps a body that omits it from failing the whole envelope.
+        let body = json!({
+            "id": "7506g00000DhRA2AAN",
+            "operation": "consentImport",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA"
+        })
+        .to_string();
+        let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(job.object, "");
     }
 

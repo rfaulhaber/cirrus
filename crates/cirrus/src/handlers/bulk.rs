@@ -32,7 +32,7 @@
 //! interval that fits the workload.
 
 use crate::Cirrus;
-use crate::error::CirrusResult;
+use crate::error::{CirrusError, CirrusResult};
 use crate::response::{
     BulkIngestJob, BulkJobStateChange, BulkOperation, BulkQueryJob, BulkQueryResults,
 };
@@ -58,7 +58,7 @@ impl Cirrus {
     /// let bulk = sf.bulk();
     /// let ingest = bulk.ingest();
     /// let spec = BulkIngestSpec {
-    ///     object: "Account".into(),
+    ///     object: Some("Account".into()),
     ///     operation: BulkOperation::Insert,
     ///     external_id_field_name: None,
     ///     line_ending: None,
@@ -129,9 +129,29 @@ impl BulkIngestHandler<'_> {
     /// Creates a new ingest job. Salesforce returns the job in `Open`
     /// state with a `content_url` indicating where to upload data.
     ///
+    /// Rejects `spec` with [`CirrusError::InvalidInput`] before issuing
+    /// a request if `object` is set for a
+    /// [`ConsentImport`](BulkOperation::ConsentImport) operation, or
+    /// unset for any other — see [`BulkIngestSpec::object`].
+    ///
     /// Calls `POST /services/data/{api_version}/jobs/ingest`.
+    ///
+    /// [Create a Job](https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm)
     pub async fn create(&self, spec: &BulkIngestSpec) -> CirrusResult<BulkIngestJob> {
-        self.client.post("jobs/ingest", spec).await
+        match (spec.operation, spec.object.is_some()) {
+            (BulkOperation::ConsentImport, true) => Err(CirrusError::InvalidInput {
+                field: "object",
+                message: "must be omitted for consentImport: consent ingest isn't backed \
+                          by an object type, and Salesforce rejects a create-job request \
+                          that names one"
+                    .into(),
+            }),
+            (op, false) if op != BulkOperation::ConsentImport => Err(CirrusError::InvalidInput {
+                field: "object",
+                message: "required for every ingest operation except consentImport".into(),
+            }),
+            _ => self.client.post("jobs/ingest", spec).await,
+        }
     }
 
     /// Uploads CSV record data for a job. The job must be in `Open` state.
@@ -140,6 +160,10 @@ impl BulkIngestHandler<'_> {
     /// Keep `csv` under 100 MB: Salesforce converts the body to base64
     /// before applying its 150 MB ceiling, and that conversion inflates
     /// the data by roughly 50%. Split larger data across uploads.
+    ///
+    /// An upload that size needs a read timeout to match, because the
+    /// deadline covers pushing the body as well as waiting for the
+    /// answer — see [`CirrusBuilder::read_timeout`](crate::CirrusBuilder::read_timeout).
     ///
     /// A lost response is never retried automatically. Salesforce
     /// documents this `PUT` as uploading job data, not as replacing
@@ -382,14 +406,35 @@ impl BulkQueryHandler<'_> {
 /// to `Comma` and `line_ending` to `LF` when omitted.
 #[derive(Debug, Clone, Serialize)]
 pub struct BulkIngestSpec {
-    /// API name of the target sObject (e.g. `"Account"`).
-    pub object: String,
-    /// Operation kind — must be one of the ingest values: `Insert`,
-    /// `Update`, `Upsert`, `Delete`, `HardDelete`. Query/QueryAll on a
-    /// `BulkIngestSpec` will produce a server-side error.
+    /// API name of the object the data belongs to — for a marketing
+    /// object, its API name. Required for every operation except
+    /// [`ConsentImport`](BulkOperation::ConsentImport), and must be
+    /// `None` there — consent ingest isn't backed by an object type,
+    /// and Salesforce rejects a create-job request that names one.
+    /// [`BulkIngestHandler::create`](crate::handlers::bulk::BulkIngestHandler::create)
+    /// checks both directions before issuing a request.
+    ///
+    /// [Create a Job](https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    /// Processing operation for the job. The ingest endpoint takes
+    /// [`Insert`](BulkOperation::Insert),
+    /// [`Delete`](BulkOperation::Delete),
+    /// [`HardDelete`](BulkOperation::HardDelete),
+    /// [`Update`](BulkOperation::Update),
+    /// [`Upsert`](BulkOperation::Upsert),
+    /// [`Refresh`](BulkOperation::Refresh) and
+    /// [`ConsentImport`](BulkOperation::ConsentImport); which of them
+    /// applies depends on the target. Standard objects support
+    /// `insert`, `delete`, `hardDelete`, `update` and `upsert`;
+    /// marketing objects support `insert`, `upsert` and `refresh`;
+    /// consent ingest uses `consentImport`.
     pub operation: BulkOperation,
-    /// External ID field name. Required when `operation` is `Upsert`,
-    /// must be `None` for the other operations.
+    /// External ID field in the object being updated. Required for an
+    /// upsert, whose CSV job data must carry values for it too. Not
+    /// supported for a marketing-object upsert — that matches on the
+    /// record's primary key — nor for
+    /// [`ConsentImport`](BulkOperation::ConsentImport).
     #[serde(
         rename = "externalIdFieldName",
         skip_serializing_if = "Option::is_none"
@@ -401,7 +446,11 @@ pub struct BulkIngestSpec {
     /// CSV column delimiter. Defaults server-side to `Comma` when `None`.
     #[serde(rename = "columnDelimiter", skip_serializing_if = "Option::is_none")]
     pub column_delimiter: Option<crate::response::BulkColumnDelimiter>,
-    /// Optional assignment-rule ID (Lead/Case routing).
+    /// ID of an assignment rule to run for a Case or a Lead; the rule
+    /// may be active or inactive. Available in API version 49.0 and
+    /// later, and not supported for
+    /// [`Refresh`](BulkOperation::Refresh) or
+    /// [`ConsentImport`](BulkOperation::ConsentImport).
     #[serde(rename = "assignmentRuleId", skip_serializing_if = "Option::is_none")]
     pub assignment_rule_id: Option<String>,
 }
@@ -513,7 +562,7 @@ mod tests {
             .bulk()
             .ingest()
             .create(&BulkIngestSpec {
-                object: "Account".into(),
+                object: Some("Account".into()),
                 operation: BulkOperation::Insert,
                 external_id_field_name: None,
                 line_ending: None,
@@ -524,6 +573,119 @@ mod tests {
             .unwrap();
         assert_eq!(job.id, "750xx");
         assert_eq!(job.state, BulkJobState::Open);
+    }
+
+    #[tokio::test]
+    async fn ingest_create_omits_object_for_consent_import() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // Request body, `object`: "Omit this property for the
+        // consentImport operation. Consent ingest isn't backed by an
+        // object type. Including object with consentImport returns an
+        // error." Response body, `object`: "The object type for the
+        // data being processed. Empty for jobs created with the
+        // consentImport operation." Response body, `contentUrl`: "The
+        // URL to use for Upload Job Data requests for this job. Only
+        // valid if the job is in Open state."
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .and(body_json(json!({ "operation": "consentImport" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "750xx",
+                "operation": "consentImport",
+                "object": "",
+                "createdById": "005xx",
+                "createdDate": "2024-01-01T00:00:00.000+0000",
+                "systemModstamp": "2024-01-01T00:00:00.000+0000",
+                "state": "Open",
+                "concurrencyMode": "Parallel",
+                "contentType": "CSV",
+                "apiVersion": 60.0,
+                "jobType": "V2Ingest",
+                "contentUrl": "services/data/v66.0/jobs/ingest/750xx/batches",
+                "lineEnding": "LF",
+                "columnDelimiter": "COMMA"
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let job = sf
+            .bulk()
+            .ingest()
+            .create(&BulkIngestSpec {
+                object: None,
+                operation: BulkOperation::ConsentImport,
+                external_id_field_name: None,
+                line_ending: None,
+                column_delimiter: None,
+                assignment_rule_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(job.operation, BulkOperation::ConsentImport);
+        assert_eq!(job.object, "");
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/v66.0/jobs/ingest/750xx/batches")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_create_rejects_object_with_consent_import() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // "Omit this property for the consentImport operation... Including
+        // object with consentImport returns an error." Caught before the
+        // request goes out rather than round-tripped to the server.
+        let server = MockServer::start().await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .bulk()
+            .ingest()
+            .create(&BulkIngestSpec {
+                object: Some("Account".into()),
+                operation: BulkOperation::ConsentImport,
+                external_id_field_name: None,
+                line_ending: None,
+                column_delimiter: None,
+                assignment_rule_id: None,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "object"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_create_rejects_missing_object_outside_consent_import() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // `object` is "Required" for every operation except consentImport.
+        let server = MockServer::start().await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .bulk()
+            .ingest()
+            .create(&BulkIngestSpec {
+                object: None,
+                operation: BulkOperation::Insert,
+                external_id_field_name: None,
+                line_ending: None,
+                column_delimiter: None,
+                assignment_rule_id: None,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "object"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -549,7 +711,7 @@ mod tests {
         sf.bulk()
             .ingest()
             .create(&BulkIngestSpec {
-                object: "Account".into(),
+                object: Some("Account".into()),
                 operation: BulkOperation::Upsert,
                 external_id_field_name: Some("External_Id__c".into()),
                 line_ending: Some(BulkLineEnding::CRLF),
