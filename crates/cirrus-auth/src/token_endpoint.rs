@@ -29,18 +29,24 @@ pub(super) const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 /// (`instance_url`, `id`, `issued_at`, `signature`).
 ///
 /// Field availability depends on the flow + connected-app configuration:
-/// - `refresh_token` — only when the connected app's scope set includes
-///   `refresh_token` *and* the flow supports issuance (Web Server, Token
-///   Exchange). Never present on Client Credentials or JWT Bearer.
+/// - `refresh_token` — issued by the flows that support issuance (Web
+///   Server, Token Exchange) when the connected app's scope set includes
+///   `refresh_token`. A connected app with `isRefreshTokenRotationEnabled`
+///   *also* returns one on every invocation of the refresh-token grant,
+///   superseding the token that was just presented — which is why
+///   [`crate::refresh`] reads this field back out. Never present on
+///   Client Credentials or JWT Bearer.
+///   (`isRefreshTokenRotationEnabled`: <https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
 /// - `id_token` — only when the requested `scope` includes `openid`
 ///   (OIDC).
 /// - `scope` — present when the granted scope set differs from the
 ///   requested set, or always on some flows. Treat as best-effort.
 /// - `issued_at` — milliseconds since epoch as a *string*, not a number.
 /// - `expires_in` — token lifetime in seconds (RFC 6749 §5.1,
-///   RECOMMENDED). Salesforce omits it on most flows; when present we
-///   prefer it over the configured cache TTL. Modeled as `Option<u64>` +
-///   `default` so its absence never breaks parsing.
+///   RECOMMENDED). Salesforce omits it on most flows; when present,
+///   [`TokenResponse::cache_expiry`] caches for the shorter of it and the
+///   configured TTL. Modeled as `Option<u64>` + `default` so its absence
+///   never breaks parsing.
 /// - `signature` / `id` / `token_type` — present on every successful
 ///   flow except where Salesforce explicitly omits (e.g. some on-behalf-of
 ///   exchanges).
@@ -49,8 +55,9 @@ pub(super) struct TokenResponse {
     pub(super) access_token: String,
     pub(super) instance_url: String,
     /// Token lifetime in seconds, when the endpoint advertises one
-    /// (RFC 6749 §5.1). Preferred over the static cache TTL via
-    /// [`TokenResponse::cache_expiry`] when present.
+    /// (RFC 6749 §5.1). Combined with the configured cache TTL by
+    /// [`TokenResponse::cache_expiry`], which takes the shorter of the
+    /// two.
     #[serde(default)]
     pub(super) expires_in: Option<u64>,
     #[serde(default)]
@@ -67,11 +74,13 @@ pub(super) struct TokenResponse {
     /// want to know which user they authenticated as.
     #[serde(default)]
     pub(super) id: Option<String>,
-    /// Base64-encoded HMAC-SHA256 of `id + issued_at` using the
-    /// connected app's consumer secret as the key. Lets callers verify
-    /// the token came from Salesforce, mitigating token-injection
-    /// attacks. Absent on flows that don't have a consumer secret
-    /// (some public-client variants).
+    /// Base64-encoded HMAC-SHA256 of the concatenated `id` and
+    /// `issued_at` values, signed with the connected app's consumer
+    /// secret. Salesforce scopes it to one purpose: verifying that the
+    /// identity URL in `id` was not modified in transit. `access_token`
+    /// and `instance_url` are not inputs to the HMAC, so a valid
+    /// signature says nothing about them. Absent on flows that don't
+    /// have a consumer secret (some public-client variants).
     #[serde(default)]
     pub(super) signature: Option<String>,
     /// Always `"Bearer"` for the OAuth 2.0 flows Salesforce exposes.
@@ -85,15 +94,89 @@ pub(super) struct TokenResponse {
 impl TokenResponse {
     /// Computes the cache-expiry [`Instant`] for this freshly-issued token.
     ///
-    /// Prefers the server-advertised `expires_in` (RFC 6749 §5.1) when
-    /// present, falling back to the caller's configured `fallback_ttl`
-    /// otherwise. Shared by every caching flow so they stay consistent.
+    /// The effective lifetime is the *shorter* of the server-advertised
+    /// `expires_in` (RFC 6749 §5.1) and the caller's configured
+    /// `fallback_ttl`. The asymmetry is deliberate: caching for less time
+    /// than the token is actually valid costs one extra mint, while
+    /// caching for longer ships requests with a dead token. Shared by
+    /// every caching flow so they stay consistent.
     pub(super) fn cache_expiry(&self, fallback_ttl: Duration) -> Instant {
-        let ttl = self
-            .expires_in
-            .map(Duration::from_secs)
-            .unwrap_or(fallback_ttl);
-        Instant::now() + ttl
+        let ttl = match self.expires_in {
+            Some(secs) => Duration::from_secs(secs).min(fallback_ttl),
+            None => fallback_ttl,
+        };
+        // `Instant + Duration` panics on overflow and `expires_in` is
+        // server-controlled, so add fallibly: an unrepresentable expiry
+        // becomes "already expired", which re-mints rather than aborting
+        // the caller's task.
+        Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
+    }
+}
+
+/// Connect timeout applied to the token-endpoint client the builders
+/// construct when the caller supplies none.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total request timeout applied to that same client. Token responses are
+/// a few hundred bytes, so a bound this generous only ever fires on a
+/// stalled peer — and without it a silently dropped connection parks the
+/// mint (and, for [`crate::refresh`], the lock it holds) indefinitely.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Builds the `reqwest::Client` used for token exchanges when a flow
+/// builder is not given one.
+///
+/// Two properties matter beyond the timeouts above. Redirects are
+/// **not** followed: every grant in this crate carries its credential in
+/// the form body (`client_secret`, `refresh_token`, the JWT `assertion`,
+/// the RFC 8693 `subject_token`, the PKCE `code_verifier`), and reqwest
+/// replays the body on a 307/308 — so a redirect from the token endpoint
+/// would re-POST live credentials to whatever host the `Location` names.
+/// A flow that is handed a caller-supplied client inherits that client's
+/// policy instead, so callers sharing a connection pool should configure
+/// both there.
+pub(super) fn default_http_client() -> AuthResult<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+/// Normalizes a configured or server-returned Salesforce URL: surrounding
+/// whitespace and *all* trailing slashes are removed.
+///
+/// Every builder, [`crate::StaticTokenAuth`], and [`check_instance_url`]
+/// run values through this one function, so a URL that differs only in
+/// trailing separators compares equal and `{url}/services/...`
+/// concatenation never doubles one.
+pub(super) fn normalize_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// Rejects a login URL that would carry OAuth credentials in cleartext.
+///
+/// Salesforce serves every OAuth endpoint over HTTPS, and this crate puts
+/// the credential in the request body, so a plain-HTTP host leaks it to
+/// anyone on-path before any redirect to HTTPS could take effect. Loopback
+/// hosts (`localhost`, `127.0.0.0/8`, `::1`) are exempt so local mock
+/// servers and test harnesses can run without TLS.
+///
+/// Expects an already-[`normalize_url`]d value.
+pub(super) fn require_secure_login_url(url: &str) -> AuthResult<()> {
+    let parsed = url::Url::parse(url)?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() == "https" || loopback {
+        Ok(())
+    } else {
+        Err(AuthError::InsecureLoginUrl {
+            url: url.to_string(),
+        })
     }
 }
 
@@ -156,8 +239,10 @@ impl std::fmt::Debug for OAuthErrorResponse {
 ///
 /// The caller assembles the form body with the flow-specific fields
 /// (`grant_type`, `assertion`, `refresh_token`, etc.). On non-2xx, the body
-/// is parsed as the OAuth error shape if possible; otherwise the raw body
-/// is folded into a generic [`AuthError::Other`] message.
+/// is parsed as the OAuth error shape if possible; otherwise only the
+/// status is surfaced as [`AuthError::UnexpectedResponse`] — the body is
+/// logged at TRACE rather than carried, since non-standard error pages can
+/// echo credentials.
 pub(super) async fn exchange<B>(
     http: &reqwest::Client,
     login_url: &str,
@@ -190,25 +275,146 @@ where
             body = %String::from_utf8_lossy(&bytes),
             "token endpoint returned a non-2xx body that did not parse as an OAuth error",
         );
-        return Err(AuthError::Other(format!(
-            "token endpoint returned status {status} with an unrecognized error body"
-        )));
+        return Err(AuthError::UnexpectedResponse { status });
     }
 
-    serde_json::from_slice::<TokenResponse>(&bytes)
-        .map_err(|e| AuthError::Other(format!("malformed token response: {e}")))
+    serde_json::from_slice::<TokenResponse>(&bytes).map_err(AuthError::Serialization)
 }
 
 /// Validates that a token response's `instance_url` matches the value the
 /// caller configured. A mismatch usually signals a misconfigured Connected
 /// App (wrong org), which is more actionable when surfaced at auth time
 /// than as a downstream API error.
+///
+/// Both sides go through [`normalize_url`] and the comparison ignores
+/// ASCII case, so the mixed-case My Domain spelling Salesforce's own docs
+/// use and a stray trailing slash both still match. `expected` is the
+/// already-normalized builder value.
 pub(super) fn check_instance_url(expected: &str, response: &TokenResponse) -> AuthResult<()> {
-    let returned = response.instance_url.trim_end_matches('/');
-    if returned != expected {
-        return Err(AuthError::Other(format!(
-            "token response instance_url ({returned}) does not match configured instance_url ({expected})"
-        )));
+    let returned = normalize_url(&response.instance_url);
+    if !returned.eq_ignore_ascii_case(expected) {
+        return Err(AuthError::InstanceUrlMismatch {
+            configured: expected.to_string(),
+            returned,
+        });
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Builds a token response carrying just the two always-present
+    /// fields plus an optional `expires_in`.
+    fn response(instance_url: &str, expires_in: Option<u64>) -> TokenResponse {
+        TokenResponse {
+            access_token: "tok".to_string(),
+            instance_url: instance_url.to_string(),
+            expires_in,
+            refresh_token: None,
+            id_token: None,
+            scope: None,
+            issued_at: None,
+            id: None,
+            signature: None,
+            token_type: None,
+        }
+    }
+
+    #[test]
+    fn normalize_url_trims_whitespace_and_every_trailing_slash() {
+        assert_eq!(
+            normalize_url("  https://my-org.my.salesforce.com//  "),
+            "https://my-org.my.salesforce.com"
+        );
+        assert_eq!(
+            normalize_url("https://my-org.my.salesforce.com"),
+            "https://my-org.my.salesforce.com"
+        );
+    }
+
+    #[test]
+    fn instance_url_check_tolerates_documented_trailing_slash() {
+        // Salesforce's documented sample response carries a trailing
+        // slash on instance_url.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_understanding_web_server_oauth_flow.htm
+        // (doc_version 222.0) — `"instance_url":"https://yourInstance.salesforce.com/"`
+        let response = response("https://yourInstance.salesforce.com/", None);
+        check_instance_url("https://yourInstance.salesforce.com", &response).unwrap();
+    }
+
+    #[test]
+    fn instance_url_check_ignores_ascii_case() {
+        // Salesforce's docs spell My Domain hosts in mixed case
+        // (`MyDomainName.my.salesforce.com`) and a configured value can
+        // be typed in any case, so the host compare is case-insensitive.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_auth_jwt_flow.htm
+        let response = response("https://mydomainname.my.salesforce.com", None);
+        check_instance_url("https://MyDomainName.my.salesforce.com", &response).unwrap();
+    }
+
+    #[test]
+    fn instance_url_check_reports_both_sides_on_mismatch() {
+        let response = response("https://wrong-org.my.salesforce.com", None);
+        let err = check_instance_url("https://my-org.my.salesforce.com", &response).unwrap_err();
+        match err {
+            AuthError::InstanceUrlMismatch {
+                configured,
+                returned,
+            } => {
+                assert_eq!(configured, "https://my-org.my.salesforce.com");
+                assert_eq!(returned, "https://wrong-org.my.salesforce.com");
+            }
+            other => panic!("expected InstanceUrlMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn https_and_loopback_login_urls_are_accepted() {
+        require_secure_login_url("https://my-org.my.salesforce.com").unwrap();
+        require_secure_login_url("http://127.0.0.1:8080").unwrap();
+        require_secure_login_url("http://localhost:8080").unwrap();
+        require_secure_login_url("http://[::1]:8080").unwrap();
+    }
+
+    #[test]
+    fn cleartext_login_url_is_rejected() {
+        let err = require_secure_login_url("http://my-org.my.salesforce.com").unwrap_err();
+        match err {
+            AuthError::InsecureLoginUrl { url } => {
+                assert_eq!(url, "http://my-org.my.salesforce.com");
+            }
+            other => panic!("expected InsecureLoginUrl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn login_url_without_a_scheme_is_a_url_error() {
+        let err = require_secure_login_url("my-org.my.salesforce.com").unwrap_err();
+        assert!(matches!(err, AuthError::Url(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cache_expiry_takes_the_shorter_of_expires_in_and_configured_ttl() {
+        let ttl = Duration::from_secs(300);
+
+        // Server advertises longer than the caller configured: the
+        // caller's shorter window wins.
+        let long = response("https://x", Some(7200)).cache_expiry(ttl);
+        assert!(long <= Instant::now() + ttl);
+
+        // Server advertises shorter: the server's window wins.
+        let short = response("https://x", Some(30)).cache_expiry(ttl);
+        assert!(short <= Instant::now() + Duration::from_secs(30));
+    }
+
+    #[test]
+    fn cache_expiry_survives_an_absurd_expires_in() {
+        // A hostile or broken endpoint can return any u64; the resulting
+        // instant must not overflow the caller's task.
+        let expiry = response("https://x", Some(u64::MAX)).cache_expiry(Duration::from_secs(300));
+        assert!(expiry <= Instant::now() + Duration::from_secs(300));
+    }
 }

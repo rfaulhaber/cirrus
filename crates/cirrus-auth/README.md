@@ -58,12 +58,50 @@ default.
 `SharedAuth` is a convenience alias for `Arc<dyn AuthSession>` — the
 shape the Cirrus client stores.
 
+## Web Server flow
+
+`WebServerFlow` drives both halves of the interactive flow and holds the
+connected app's credentials throughout:
+
+```rust,ignore
+let flow = WebServerFlow::builder()
+    .consumer_key("3MVG9...")
+    .consumer_secret("28A2...")   // confidential clients only
+    .redirect_uri("https://app.example.com/oauth/callback")
+    .scope("api")
+    .scope("refresh_token")
+    .build()?;
+
+// Phase 1 — redirect the user to `url`, persist `pending`.
+let (url, pending) = flow.start()?;
+
+// Phase 2 — on callback, with `pending` restored from your store.
+let session = flow.complete(pending, &code, &state).await?;
+```
+
+`PendingExchange` carries only the per-attempt PKCE verifier and CSRF
+nonce — never the consumer key or secret. The verifier is still a secret:
+keep it in a server-side session or an encrypted cookie, not a merely
+signed one.
+
 ## Errors
 
 `AuthError` (re-exported by `cirrus` as `cirrus::AuthError`) covers OAuth
 token-endpoint errors, missing builder fields, transport failures, and
-malformed responses. It's `#[non_exhaustive]` so future variants don't
-break downstream `match` arms.
+malformed responses. Failures a caller usually wants to branch on have
+their own variants — `StateMismatch` (a forged or replayed callback),
+`InstanceUrlMismatch` (wrong org), `UnexpectedResponse` (a non-OAuth
+error body), `InsecureLoginUrl`, `Signing`, `Randomness` — so no one has
+to match on message text. It's `#[non_exhaustive]` so future variants
+don't break downstream `match` arms.
+
+## Transport defaults
+
+When a flow builder isn't given an `http_client`, the client it builds
+applies connect and request timeouts and refuses to follow redirects: the
+grants here carry their credential in the request body, which reqwest
+replays on a 307/308. Login URLs must be `https` (loopback hosts
+excepted, for local test servers).
 
 `cirrus` carries a `From<AuthError> for CirrusError` impl, so REST call
 sites that need an auth token can use `?` and surface the failure as

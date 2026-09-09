@@ -15,7 +15,7 @@
 //! - `grant_type` — always
 //!   `urn:ietf:params:oauth:grant-type:token-exchange` (the RFC 8693
 //!   URN; Salesforce's token-exchange docs define no other value).
-//! - `subject_token` — the IdP-issued token (max 10,000 chars per docs).
+//! - `subject_token` — the IdP-issued token.
 //! - `subject_token_type` — one of the five well-known URNs in
 //!   [`SubjectTokenType`].
 //! - `client_id` — connected app consumer key.
@@ -29,11 +29,17 @@
 //!
 //! ## My Domain URL is required
 //!
-//! Per the Salesforce help docs, examples use
-//! `MyDomainName.my.salesforce.com` (or the Experience Cloud
-//! `MyDomainName.my.site.com`) as the host. Like Client Credentials,
-//! `https://login.salesforce.com` is **not** a valid host for this flow,
-//! so the builder requires `login_url`.
+//! The builder requires `login_url`: Salesforce's token-exchange examples
+//! address the org directly as `MyDomainName.my.salesforce.com` (or the
+//! Experience Cloud `MyDomainName.my.site.com`), and there is no sensible
+//! default for an org-scoped host.
+//!
+//! No `subject_token` length limit and no restriction on the token
+//! endpoint host are enforced here: any `login_url` you configure is used
+//! as given. The request and response shapes follow RFC 8693, and the
+//! connected-app side of the flow (`isTokenExchangeEnabled`,
+//! `isSecretRequiredForTokenExchange`, and the `OauthTokenExchangeHandler`
+//! type) is documented in the Metadata API guide.
 //!
 //! ## What you get back
 //!
@@ -45,7 +51,9 @@
 //! pattern as Web Server PKCE.
 
 use crate::error::{AuthError, AuthResult};
-use crate::token_endpoint::exchange;
+use crate::token_endpoint::{
+    default_http_client, exchange, normalize_url, require_secure_login_url,
+};
 
 /// RFC 8693 grant-type URN — the only `grant_type` Salesforce's token
 /// exchange flow accepts.
@@ -91,6 +99,15 @@ impl SubjectTokenType {
 /// One-shot RFC 8693 token-exchange request.
 ///
 /// Construct via [`TokenExchangeFlow::builder`].
+//
+// Wire-shape provenance: the reference Salesforce pages for this flow —
+// including whether `https://login.salesforce.com` is rejected outright
+// and whether `subject_token` has a documented length ceiling — live on
+// help.salesforce.com and were not reachable, so neither is asserted nor
+// enforced. The reachable pages that do govern the flow are the Apex
+// `token_exchange_handler` guide and the Metadata API's
+// `meta_oauthtokenexchangehandler`, neither of which states a length
+// limit or a permitted host.
 pub struct TokenExchangeFlow {
     consumer_key: String,
     consumer_secret: Option<String>,
@@ -158,7 +175,7 @@ impl TokenExchangeFlow {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
             id_token: token.id_token,
-            instance_url: token.instance_url,
+            instance_url: normalize_url(&token.instance_url),
             issued_at: token.issued_at,
             scope: token.scope,
             id: token.id,
@@ -177,7 +194,10 @@ pub struct TokenExchangeSession {
     pub refresh_token: Option<String>,
     /// OpenID Connect ID token, if `openid` was in the requested scopes.
     pub id_token: Option<String>,
-    /// REST instance URL for subsequent API calls.
+    /// REST instance URL for subsequent API calls, normalized to carry no
+    /// trailing slash — Salesforce's documented sample response includes
+    /// one — so `{instance_url}/services/...` concatenation is always
+    /// well-formed.
     pub instance_url: String,
     /// `issued_at` timestamp from the response (milliseconds-since-epoch as
     /// a string per Salesforce's wire format).
@@ -188,9 +208,11 @@ pub struct TokenExchangeSession {
     /// `https://login.salesforce.com/id/{org_id}/{user_id}`). Distinct
     /// from `id_token` (which is OIDC-specific).
     pub id: Option<String>,
-    /// Base64-encoded HMAC-SHA256 of `id + issued_at` keyed on the
-    /// connected-app consumer secret. Lets the caller verify the token
-    /// came from Salesforce.
+    /// Base64-encoded HMAC-SHA256 of the concatenated `id` and
+    /// `issued_at` values, keyed on the connected-app consumer secret.
+    /// Salesforce defines it as an integrity check on the identity URL in
+    /// `id`; `access_token` and `instance_url` are not covered by it, so
+    /// a valid signature says nothing about their provenance.
     pub signature: Option<String>,
 }
 
@@ -257,17 +279,19 @@ impl TokenExchangeFlowBuilder {
         self
     }
 
-    /// Login URL — must be the org's My Domain URL (or Experience Cloud
-    /// site URL). Required. `login.salesforce.com` is not supported for
-    /// this flow.
+    /// Login URL — the org's My Domain URL (or Experience Cloud site
+    /// URL), which is what Salesforce's token-exchange examples address.
+    /// Required, and must be `https` (loopback hosts excepted, for local
+    /// test servers).
     pub fn login_url(mut self, url: impl Into<String>) -> Self {
         self.login_url = Some(url.into());
         self
     }
 
-    /// The IdP-issued token to exchange. Required. Salesforce documents a
-    /// 10,000-char ceiling; we don't enforce it client-side, but the
-    /// endpoint will reject anything larger.
+    /// The IdP-issued token to exchange. Required. Sent verbatim in the
+    /// form body; no client-side length or format validation is applied,
+    /// so a token the org rejects surfaces as an
+    /// [`AuthError::OAuth`] from the endpoint.
     pub fn subject_token(mut self, token: impl Into<String>) -> Self {
         self.subject_token = Some(token.into());
         self
@@ -305,6 +329,11 @@ impl TokenExchangeFlowBuilder {
     }
 
     /// Supplies a pre-configured `reqwest::Client` for the exchange.
+    ///
+    /// The client built by default applies connect and request timeouts
+    /// and refuses to follow redirects, so a redirect cannot replay the
+    /// IdP-issued `subject_token` to another host. A client supplied here
+    /// replaces those defaults wholesale — configure both on it.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -321,11 +350,12 @@ impl TokenExchangeFlowBuilder {
         let subject_token_type = self
             .subject_token_type
             .ok_or(AuthError::MissingField("subject_token_type"))?;
-        let mut login_url = self.login_url.ok_or(AuthError::MissingField("login_url"))?;
-        if login_url.ends_with('/') {
-            login_url.pop();
-        }
-        let http = self.http_client.unwrap_or_default();
+        let login_url = normalize_url(&self.login_url.ok_or(AuthError::MissingField("login_url"))?);
+        require_secure_login_url(&login_url)?;
+        let http = match self.http_client {
+            Some(client) => client,
+            None => default_http_client()?,
+        };
         Ok(TokenExchangeFlow {
             consumer_key,
             consumer_secret: self.consumer_secret,
@@ -346,6 +376,24 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Salesforce's documented token response shape for the grants that
+    /// share this endpoint.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_understanding_web_server_oauth_flow.htm
+    /// (doc_version 222.0) — field values copied from the guide's sample
+    /// JSON body, including the trailing slash it puts on `instance_url`.
+    fn documented_token_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "https://login.salesforce.com/id/00Dx0000000BV7z/005x00000012Q9P",
+            "issued_at": "1278448101416",
+            "refresh_token": "5Aep861KIwKdekr...refresh",
+            "instance_url": "https://yourInstance.salesforce.com/",
+            "signature": "CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=",
+            "access_token": "00Dx0000000BV7z!AR8AQP0jITN80ESEsj5EbaZTFG0RNBaT1cyWk7TrqoDjoNIWQ2ME_sTZzBjfmOE6zMHq6y8PIW4eWze9JksNEkWUl.Cju7m4",
+            "token_type": "Bearer",
+        })
+    }
 
     fn builder_with_required_fields() -> TokenExchangeFlowBuilder {
         TokenExchangeFlow::builder()
@@ -436,12 +484,21 @@ mod tests {
     }
 
     #[test]
-    fn builder_strips_trailing_slash_on_login_url() {
+    fn builder_strips_trailing_slashes_on_login_url() {
         let flow = builder_with_required_fields()
-            .login_url("https://my-org.my.salesforce.com/")
+            .login_url("https://my-org.my.salesforce.com//")
             .build()
             .unwrap();
         assert_eq!(flow.login_url, "https://my-org.my.salesforce.com");
+    }
+
+    #[test]
+    fn builder_rejects_cleartext_login_url() {
+        let err = builder_with_required_fields()
+            .login_url("http://my-org.my.salesforce.com")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -457,15 +514,7 @@ mod tests {
                 "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
             ))
             .and(body_string_contains("client_id=consumer-key-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "00DXX!ACCESS",
-                "instance_url": "https://my-org.my.salesforce.com",
-                "token_type": "Bearer",
-                "scope": "api refresh_token",
-                "issued_at": "1700000000000",
-                "id": "https://login.salesforce.com/id/00DXX/005XX",
-                "signature": "abcdef==",
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
             .mount(&server)
             .await;
 
@@ -476,17 +525,21 @@ mod tests {
             .exchange()
             .await
             .unwrap();
-        assert_eq!(session.access_token, "00DXX!ACCESS");
-        assert_eq!(session.instance_url, "https://my-org.my.salesforce.com");
-        assert_eq!(session.scope.as_deref(), Some("api refresh_token"));
-        assert_eq!(session.issued_at.as_deref(), Some("1700000000000"));
+        assert!(session.access_token.starts_with("00Dx0000000BV7z!"));
+        // The documented body carries a trailing slash on instance_url;
+        // the session exposes the normalized form.
+        assert_eq!(session.instance_url, "https://yourInstance.salesforce.com");
+        assert_eq!(session.issued_at.as_deref(), Some("1278448101416"));
         // Identity fields propagate through so federated-identity callers
         // can correlate the exchanged session with the original IdP user.
         assert_eq!(
             session.id.as_deref(),
-            Some("https://login.salesforce.com/id/00DXX/005XX")
+            Some("https://login.salesforce.com/id/00Dx0000000BV7z/005x00000012Q9P")
         );
-        assert_eq!(session.signature.as_deref(), Some("abcdef=="));
+        assert_eq!(
+            session.signature.as_deref(),
+            Some("CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=")
+        );
     }
 
     #[tokio::test]
@@ -497,12 +550,12 @@ mod tests {
             .and(body_string_contains("client_secret=hunter2"))
             .and(body_string_contains("scope=api+refresh_token"))
             .and(body_string_contains("token_handler=MyHandler"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "tok",
-                "instance_url": "https://my-org.my.salesforce.com",
-                "id_token": "eyJ...",
-                "refresh_token": "5Aep861...",
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut body = documented_token_response();
+                body["id_token"] = serde_json::Value::String("eyJ...".into());
+                body["scope"] = serde_json::Value::String("api refresh_token".into());
+                body
+            }))
             .mount(&server)
             .await;
 
@@ -518,7 +571,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.id_token.as_deref(), Some("eyJ..."));
-        assert_eq!(session.refresh_token.as_deref(), Some("5Aep861..."));
+        assert!(
+            session
+                .refresh_token
+                .as_deref()
+                .is_some_and(|t| t.starts_with("5Aep861"))
+        );
+        assert_eq!(session.scope.as_deref(), Some("api refresh_token"));
     }
 
     #[tokio::test]
@@ -531,10 +590,7 @@ mod tests {
             .and(path("/services/oauth2/token"))
             .respond_with(BodyCapturingResponder {
                 captured: captured_clone,
-                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "tok",
-                    "instance_url": "https://my-org.my.salesforce.com"
-                })),
+                response: ResponseTemplate::new(200).set_body_json(documented_token_response()),
             })
             .mount(&server)
             .await;
