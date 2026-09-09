@@ -102,39 +102,73 @@ pub type OrgLimits = HashMap<String, Limit>;
 
 /// Snapshot of the `Sforce-Limit-Info` response header, parsed.
 ///
-/// Salesforce includes this header on most REST API responses to
-/// surface the org's near-real-time API call usage:
+/// Salesforce returns this header on every REST API request except calls
+/// to the Versions URI, to surface the org's near-real-time API usage. The
+/// value is a list of `key=used/allowed` directives:
 ///
 /// ```text
-/// Sforce-Limit-Info: api-usage=10/15000
+/// Sforce-Limit-Info: api-usage=10018/100000; api-bursts=1/750
+/// Sforce-Limit-Info: api-usage=10018/100000
 /// ```
 ///
 /// Populated automatically on every successful round-trip; the most
 /// recent value is reachable via [`crate::Cirrus::last_limit_info`].
 ///
-/// Only the `api-usage` key is modelled here. See [REST API Headers —
-/// Sforce-Limit-Info] for the upstream documentation.
+/// See [REST API Headers — Limit Info Header] for the upstream
+/// documentation.
 ///
-/// [REST API Headers — Sforce-Limit-Info]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_limit_info.htm
+/// [REST API Headers — Limit Info Header]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_api_usage.htm
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitInfo {
     /// API calls used by this org in the current 24-hour rolling
-    /// window.
+    /// window (the first number of the `api-usage` directive).
     pub used: u32,
-    /// Daily API call allocation for this org.
+    /// Daily API call allocation for this org (the second number of
+    /// the `api-usage` directive).
     pub allowed: u32,
+    /// `(used, allowed)` from the `api-bursts` directive, which the
+    /// header reference shows in its example but does not describe.
+    /// `None` when the header carried no such directive.
+    pub bursts: Option<(u32, u32)>,
 }
 
 impl LimitInfo {
     /// Parses a raw `Sforce-Limit-Info` header value, e.g.
-    /// `"api-usage=10/15000"`. Returns `None` for any malformed shape
-    /// — typoed key, non-numeric counts, missing slash, etc.
+    /// `"api-usage=10018/100000; api-bursts=1/750"`.
+    ///
+    /// Directives are separated by `;` (or `,`, when an intermediary
+    /// folds repeated headers into one value) and unrecognized keys are
+    /// ignored, so a value carrying directives this SDK doesn't model
+    /// still yields the `api-usage` counts. Returns `None` when no
+    /// well-formed `api-usage` directive is present.
     pub fn parse(header_value: &str) -> Option<Self> {
-        let rest = header_value.trim().strip_prefix("api-usage=")?;
-        let (used, allowed) = rest.split_once('/')?;
-        let used = used.trim().parse::<u32>().ok()?;
-        let allowed = allowed.trim().parse::<u32>().ok()?;
-        Some(Self { used, allowed })
+        let mut usage = None;
+        let mut bursts = None;
+        for directive in header_value.split([';', ',']) {
+            let Some((key, value)) = directive.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "api-usage" => usage = Self::parse_pair(value),
+                "api-bursts" => bursts = Self::parse_pair(value),
+                _ => {}
+            }
+        }
+        let (used, allowed) = usage?;
+        Some(Self {
+            used,
+            allowed,
+            bursts,
+        })
+    }
+
+    /// Parses the `used/allowed` half of a single directive.
+    fn parse_pair(value: &str) -> Option<(u32, u32)> {
+        let (used, allowed) = value.split_once('/')?;
+        Some((
+            used.trim().parse::<u32>().ok()?,
+            allowed.trim().parse::<u32>().ok()?,
+        ))
     }
 
     /// Convenience: API calls remaining (`allowed - used`, saturating).
@@ -197,8 +231,14 @@ pub struct SObjectMetadata {
     pub urls: HashMap<String, String>,
 }
 
-/// Bulk API 2.0 operation kind. Shared between ingest jobs (insert /
-/// update / upsert / delete / hardDelete) and query jobs (query / queryAll).
+/// Bulk API 2.0 operation kind, shared between ingest and query jobs.
+///
+/// Ingest jobs (`/jobs/ingest`) take `insert`, `delete`, `hardDelete`,
+/// `update`, `upsert`, `refresh` or `consentImport`; which of those a job
+/// may use depends on its target — standard objects support everything but
+/// `refresh` and `consentImport`, Marketing objects support `insert`,
+/// `upsert` and `refresh`, and consent ingest uses `consentImport`. Query
+/// jobs (`/jobs/query`) take `query` or `queryAll`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BulkOperation {
     #[serde(rename = "insert")]
@@ -213,10 +253,24 @@ pub enum BulkOperation {
     /// Delete" permission, which is disabled by default.
     #[serde(rename = "hardDelete")]
     HardDelete,
+    /// Marketing Object ingest only.
+    #[serde(rename = "refresh")]
+    Refresh,
+    /// Consent ingest. Consent ingest isn't backed by an object type, so
+    /// Salesforce rejects a create-job request that also sends `object`.
+    #[serde(rename = "consentImport")]
+    ConsentImport,
     #[serde(rename = "query")]
     Query,
     #[serde(rename = "queryAll")]
     QueryAll,
+    /// An operation Salesforce returned that this SDK doesn't name, so a
+    /// job created out-of-band still deserializes and its `state` and
+    /// record counts stay readable. Serializing it sends the literal
+    /// string `"Unknown"`, which no endpoint accepts — never use it in a
+    /// request.
+    #[serde(other)]
+    Unknown,
 }
 
 /// State of a Bulk API 2.0 job.
@@ -241,8 +295,8 @@ pub enum BulkJobState {
     JobComplete,
     /// Job was aborted by the caller or an admin.
     Aborted,
-    /// Job failed at the platform level. For query jobs, see
-    /// [`BulkQueryJob::error_message`] for the reason.
+    /// Job failed at the platform level. For ingest jobs, see
+    /// [`BulkIngestJob::error_message`] for the reason.
     Failed,
 }
 
@@ -291,6 +345,16 @@ pub struct BulkIngestJob {
     pub column_delimiter: BulkColumnDelimiter,
     #[serde(rename = "contentType")]
     pub content_type: String,
+    /// Where to PUT the job's CSV, populated while the job is `Open`.
+    ///
+    /// Salesforce sends this instance-relative and **without** a leading
+    /// slash (`services/data/vXX.X/jobs/ingest/{id}/batches`), which the
+    /// verb methods on [`crate::Cirrus`] would resolve as a versioned
+    /// path and so double the `/services/data/{version}` prefix. Prefer
+    /// [`BulkIngestHandler::upload`], which builds the path itself; if
+    /// you must use this value directly, prefix it with `/`.
+    ///
+    /// [`BulkIngestHandler::upload`]: crate::handlers::bulk::BulkIngestHandler::upload
     #[serde(rename = "contentUrl", default)]
     pub content_url: Option<String>,
     /// The wire sends a JSON number (e.g. `60.0`), so this is a float
@@ -437,8 +501,15 @@ pub struct BulkQueryJob {
     /// Populated on GET responses only (not CREATE).
     #[serde(rename = "isPkChunkingSupported", default)]
     pub is_pk_chunking_supported: Option<bool>,
-    /// Error message for jobs in `Failed` state. `None` for healthy
-    /// jobs.
+    /// Error message accompanying a `Failed` job, when the response
+    /// carries one. `None` otherwise — including on healthy jobs.
+    //
+    // Wire-shape provenance (api_asynch doc page IDs): unlike the ingest
+    // side, `query_get_one_job` lists no `errorMessage` in its response
+    // parameters and neither of its example bodies contains one. The
+    // field is modelled as always-optional so a query job that does
+    // carry it stays readable; callers must not treat its absence as
+    // meaningful.
     #[serde(rename = "errorMessage", default)]
     pub error_message: Option<String>,
 }
@@ -449,7 +520,11 @@ pub struct BulkQueryJob {
 /// pagination. `locator` is `None` when the result set is fully drained;
 /// pass it back to [`crate::handlers::bulk::BulkQueryHandler::results`]
 /// in subsequent calls to fetch the next page.
-#[derive(Debug, Clone)]
+///
+/// The [`Debug`] rendering reports the CSV length in place of the body:
+/// one page holds up to tens of thousands of exported records, and the
+/// cursor fields are the reason to debug-format this type.
+#[derive(Clone)]
 pub struct BulkQueryResults {
     /// CSV body of this result page.
     pub csv: bytes::Bytes,
@@ -459,6 +534,16 @@ pub struct BulkQueryResults {
     /// Number of records included in this page (`Sforce-NumberOfRecords`
     /// response header).
     pub number_of_records: Option<i64>,
+}
+
+impl std::fmt::Debug for BulkQueryResults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkQueryResults")
+            .field("csv_len", &self.csv.len())
+            .field("locator", &self.locator)
+            .field("number_of_records", &self.number_of_records)
+            .finish()
+    }
 }
 
 /// One `EventLogFile` sObject record returned by querying
@@ -472,12 +557,11 @@ pub struct BulkQueryResults {
 ///
 /// - `Id`, `EventType`, `LogFile`, `LogDate`, `LogFileLength` are
 ///   present whenever you `SELECT` them.
-/// - `Interval` and `Sequence` are populated when an org has hourly
-///   event log files enabled. `Interval` is `"Hourly"` for hourly
-///   files, `"Daily"` (or absent on older orgs) for 24-hour files.
-///   `Sequence` is `0` for daily files and increments per hourly file
-///   in the same hour bucket. Filter on `Interval = 'Hourly'` (or
-///   `Sequence != 0`) to read only hourly files.
+/// - `Interval` is `"Hourly"` for hourly files and `"Daily"` for
+///   24-hour files. `Sequence` is `0` for daily files and starts at 1
+///   for hourly files, incrementing per file within the same hour.
+///   Filter on `Interval = 'Hourly'` (or `Sequence != 0`) to read only
+///   hourly files.
 /// - `CreatedDate` is the timestamp the log file became downloadable —
 ///   not the same as `LogDate` (when the events occurred). Use
 ///   `CreatedDate > <last-fetch>` to drive incremental ingestion (per
@@ -509,9 +593,9 @@ pub struct EventLogFileRecord {
     /// store as `f64` to absorb both.
     #[serde(rename = "LogFileLength", default)]
     pub log_file_length: Option<f64>,
-    /// `"Hourly"` for hourly logs (orgs with the feature enabled),
-    /// otherwise typically absent. Filter on this when you only want
-    /// the hourly stream.
+    /// `"Hourly"` for hourly log files, `"Daily"` for 24-hour log
+    /// files. `None` only when the SELECT clause didn't ask for the
+    /// field. Match on the value when you want just the hourly stream.
     #[serde(rename = "Interval", default)]
     pub interval: Option<String>,
     /// Increment ordinal per hour bucket — `0` for daily files; `>= 1`
@@ -549,12 +633,17 @@ impl ApiVersion {
     }
 
     /// Returns the highest-numbered [`ApiVersion`] in `versions`,
-    /// comparing by `(major, minor)` rather than lexically. Versions
-    /// that fail to parse compare as the smallest.
+    /// comparing by `(major, minor)` rather than lexically.
     ///
-    /// Returns `None` if the slice is empty.
+    /// Entries whose [`version`](Self::version) isn't a `major.minor`
+    /// pair are ignored, so the returned entry always carries a version
+    /// string usable as a `vXX.X` path segment. Returns `None` when the
+    /// slice is empty or holds nothing parseable.
     pub fn latest(versions: &[Self]) -> Option<&Self> {
-        versions.iter().max_by_key(|v| v.version_number())
+        versions
+            .iter()
+            .filter(|v| v.version_number().is_some())
+            .max_by_key(|v| v.version_number())
     }
 }
 
@@ -776,6 +865,17 @@ pub struct SObjectCollectionResult {
 /// `line` and `column` use `-1` as the "no error" sentinel. Callers
 /// should branch on [`success`](Self::success) rather than checking
 /// these for `>= 0`.
+//
+// Wire-shape provenance (api_tooling doc page IDs): `intro_rest_resources`
+// documents only the request for `/executeAnonymous` — no response body is
+// published for the REST resource. The field set below comes from
+// `tooling_api_objects_apexresult`, which enumerates the seven
+// `ExecuteAnonymousResult` fields (`column`, `compileProblem`, `compiled`,
+// `exceptionMessage`, `exceptionStackTrace`, `line`, `success`) for the
+// ApexExecutionOverlayResult surface. The JSON casing and the `-1` "no
+// error" sentinel on `line`/`column` are not published anywhere fetchable;
+// they come from live API observation, which is why those two fields are
+// non-`Option` `i32`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecuteAnonymousResult {
     /// `true` if the Apex source compiled. `false` indicates a syntax
@@ -804,9 +904,10 @@ pub struct ExecuteAnonymousResult {
 /// Parses a Salesforce response body, branching on the HTTP status.
 ///
 /// On 2xx, the body is deserialized into `R` (use `serde_json::Value` for an
-/// untyped response). On 4xx/5xx, the body is parsed as a Salesforce error
-/// array; if that fails the raw body is preserved in
-/// [`CirrusError::Api::raw`] for debugging.
+/// untyped response); a body that doesn't fit `R` becomes a
+/// [`CirrusError::InvalidResponse`] carrying an excerpt of what arrived. On
+/// 4xx/5xx, the body is parsed as a Salesforce error array; if that fails
+/// the raw body is preserved in [`CirrusError::Api::raw`] for debugging.
 pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
     status: u16,
     bytes: &[u8],
@@ -824,13 +925,24 @@ pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
                 ))
             });
         }
-        return serde_json::from_slice(bytes).map_err(CirrusError::Serialization);
+        // A 2xx that doesn't fit `R` is usually an off-contract body from an
+        // interposed hop, or a truncated one — serde's message alone names
+        // neither, so keep an excerpt under the same cap the error path uses.
+        return serde_json::from_slice(bytes).map_err(|err| {
+            CirrusError::InvalidResponse(format!(
+                "endpoint returned {status} but the body did not deserialize into the requested \
+                 type: {err}; body: {}",
+                capped_body(bytes)
+            ))
+        });
     }
     Err(parse_error_response(status, bytes))
 }
 
-/// Ceiling on how much of an unparseable error body is preserved in
-/// [`CirrusError::Api::raw`]. Bodies that don't match the Salesforce
+/// Ceiling on how much of an off-contract body is retained in an error —
+/// the unparseable error body in [`CirrusError::Api::raw`], and the body
+/// excerpt in the [`CirrusError::InvalidResponse`] raised for a 2xx that
+/// doesn't fit `R`. Bodies that don't match the Salesforce
 /// error shape come from proxies and gateways, which can echo request
 /// data — capping what we retain bounds what can end up in the
 /// caller's logs via `Display`/`Debug`, and keeps a pathological body
@@ -849,16 +961,7 @@ const RAW_ERROR_BODY_CAP: usize = 2048;
 pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
     let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes).unwrap_or_default();
     let raw = if errors.is_empty() {
-        let mut body = String::from_utf8_lossy(bytes).into_owned();
-        if body.len() > RAW_ERROR_BODY_CAP {
-            let mut end = RAW_ERROR_BODY_CAP;
-            while !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.truncate(end);
-            body.push_str("… <truncated>");
-        }
-        Some(body)
+        Some(capped_body(bytes))
     } else {
         None
     };
@@ -869,12 +972,100 @@ pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
     }
 }
 
+/// Decodes a body for inclusion in an error, bounded by
+/// [`RAW_ERROR_BODY_CAP`] and marked when anything was dropped.
+///
+/// Only the capped byte prefix is decoded, so a multi-megabyte body never
+/// gets a full owned copy. Lossy decoding expands each invalid byte to a
+/// three-byte U+FFFD, which can push even that prefix past the cap, so the
+/// decoded string is trimmed again at a char boundary.
+fn capped_body(bytes: &[u8]) -> String {
+    let mut truncated = bytes.len() > RAW_ERROR_BODY_CAP;
+    let head = &bytes[..bytes.len().min(RAW_ERROR_BODY_CAP)];
+    let mut body = String::from_utf8_lossy(head).into_owned();
+    if body.len() > RAW_ERROR_BODY_CAP {
+        let mut end = RAW_ERROR_BODY_CAP;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        truncated = true;
+    }
+    if truncated {
+        body.push_str("… <truncated>");
+    }
+    body
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::Value;
     use serde_json::json;
+
+    #[test]
+    fn non_utf8_error_body_is_capped_after_lossy_decoding() {
+        // Each invalid byte becomes a three-byte U+FFFD, so a byte-prefix
+        // cap alone would still leave ~3x the cap in the error value.
+        let body = vec![0xffu8; RAW_ERROR_BODY_CAP * 4];
+        let err = parse_error_response(502, &body);
+        match err {
+            CirrusError::Api { raw: Some(raw), .. } => {
+                assert!(raw.ends_with("… <truncated>"), "missing marker");
+                assert!(
+                    raw.len() < RAW_ERROR_BODY_CAP + 32,
+                    "raw not capped: {} bytes",
+                    raw.len()
+                );
+            }
+            other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undeserializable_2xx_body_keeps_an_excerpt() {
+        let err = parse_response_bytes::<QueryResult<Value>>(
+            200,
+            b"<html><body>Gateway timeout</body></html>",
+        )
+        .unwrap_err();
+        match err {
+            CirrusError::InvalidResponse(msg) => {
+                assert!(msg.contains("200"), "status missing: {msg}");
+                assert!(msg.contains("Gateway timeout"), "body missing: {msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undeserializable_2xx_body_excerpt_is_capped() {
+        let body = format!("{{\"junk\": \"{}\"}}", "x".repeat(RAW_ERROR_BODY_CAP * 3));
+        let err = parse_response_bytes::<QueryResult<Value>>(200, body.as_bytes()).unwrap_err();
+        match err {
+            CirrusError::InvalidResponse(msg) => {
+                assert!(msg.contains("… <truncated>"), "missing marker");
+                assert!(
+                    msg.len() < RAW_ERROR_BODY_CAP + 256,
+                    "excerpt not capped: {} bytes",
+                    msg.len()
+                );
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_error_body_is_preserved_verbatim() {
+        let err = parse_error_response(502, b"<html>bad gateway</html>");
+        match err {
+            CirrusError::Api { raw: Some(raw), .. } => {
+                assert_eq!(raw, "<html>bad gateway</html>");
+            }
+            other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
 
     #[test]
     fn unparseable_error_body_is_capped() {
@@ -1227,31 +1418,131 @@ mod tests {
 
     #[test]
     fn parses_bulk_ingest_job_response() {
-        // Mirrors the documented create-job response.
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
+        // Example response for an Open ingest job, verbatim — including the
+        // slash-less, instance-relative `contentUrl`.
         let body = json!({
-            "id": "750xx0000004C92AAE",
+            "id": "7506g00000DhRA2AAN",
             "operation": "insert",
             "object": "Account",
-            "createdById": "005xx000001IECDAA4",
-            "createdDate": "2018-12-10T17:50:19.000+0000",
-            "systemModstamp": "2018-12-10T17:51:27.000+0000",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
             "state": "Open",
             "concurrencyMode": "Parallel",
             "contentType": "CSV",
-            "apiVersion": 60.0,
-            "contentUrl": "/services/data/v66.0/jobs/ingest/750xx0000004C92AAE/batches",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
             "lineEnding": "LF",
             "columnDelimiter": "COMMA",
-            "jobType": "V2Ingest"
+            "retries": 0,
+            "totalProcessingTime": 0,
+            "apiActiveProcessingTime": 0,
+            "apexProcessingTime": 0
         })
         .to_string();
         let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
-        assert_eq!(job.id, "750xx0000004C92AAE");
+        assert_eq!(job.id, "7506g00000DhRA2AAN");
         assert_eq!(job.operation, BulkOperation::Insert);
         assert_eq!(job.state, BulkJobState::Open);
         assert_eq!(job.line_ending, BulkLineEnding::LF);
         assert_eq!(job.column_delimiter, BulkColumnDelimiter::Comma);
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches")
+        );
         assert!(job.number_records_processed.is_none());
+    }
+
+    #[test]
+    fn parses_bulk_ingest_job_with_consent_import_operation() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // operation/OperationEnum lists `consentImport` ("Consent ingest.
+        // Doesn't require the object property."), and the same page's
+        // `object` row says consent ingest isn't backed by an object type.
+        // Field set otherwise mirrors the Get Job Info example.
+        let body = json!({
+            "id": "7506g00000DhRA2AAN",
+            "operation": "consentImport",
+            "object": "",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA"
+        })
+        .to_string();
+        let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.operation, BulkOperation::ConsentImport);
+        assert_eq!(job.object, "");
+    }
+
+    #[test]
+    fn parses_bulk_job_state_change_with_refresh_operation() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        // operation/OperationEnum lists `refresh` ("Marketing Object ingest
+        // only."). Envelope mirrors the documented state-change shape.
+        let body = json!({
+            "id": "750R0000000zxwzIAA",
+            "operation": "refresh",
+            "object": "MarketingObject__dlm",
+            "createdById": "005R0000000GiwjIAC",
+            "createdDate": "2018-12-10T17:50:19.000+0000",
+            "systemModstamp": "2018-12-10T17:51:27.000+0000",
+            "state": "UploadComplete",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 46.0
+        })
+        .to_string();
+        let job: BulkJobStateChange = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.operation, BulkOperation::Refresh);
+        assert_eq!(job.state, BulkJobState::UploadComplete);
+    }
+
+    #[test]
+    fn unnamed_bulk_operation_deserializes_without_sinking_the_envelope() {
+        // An operation Salesforce adds later must not cost the caller the
+        // rest of the job envelope.
+        let body = json!({
+            "id": "750R0000000zxwzIAA",
+            "operation": "someFutureOperation",
+            "object": "Account",
+            "createdById": "005R0000000GiwjIAC",
+            "createdDate": "2018-12-10T17:50:19.000+0000",
+            "systemModstamp": "2018-12-10T17:51:27.000+0000",
+            "state": "JobComplete",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 46.0
+        })
+        .to_string();
+        let job: BulkJobStateChange = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.operation, BulkOperation::Unknown);
+        assert_eq!(job.state, BulkJobState::JobComplete);
+    }
+
+    #[test]
+    fn bulk_operation_serializes_to_the_documented_wire_names() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
+        for (op, wire) in [
+            (BulkOperation::Insert, "insert"),
+            (BulkOperation::Delete, "delete"),
+            (BulkOperation::HardDelete, "hardDelete"),
+            (BulkOperation::Update, "update"),
+            (BulkOperation::Upsert, "upsert"),
+            (BulkOperation::Refresh, "refresh"),
+            (BulkOperation::ConsentImport, "consentImport"),
+        ] {
+            assert_eq!(serde_json::to_value(op).unwrap(), json!(wire));
+        }
     }
 
     #[test]
@@ -1442,6 +1733,11 @@ mod tests {
 
     #[test]
     fn parses_bulk_query_job_failed_with_error_message() {
+        // Envelope fields mirror the GET-job example at
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_one_job.htm
+        // `errorMessage` is NOT in that page's response parameters or its
+        // examples — see the provenance note on the field. This pins the
+        // optionality, not a documented shape.
         let body = json!({
             "id": "750xx",
             "operation": "query",
@@ -1465,6 +1761,34 @@ mod tests {
             job.error_message.as_deref(),
             Some("MALFORMED_QUERY: unexpected token")
         );
+    }
+
+    #[test]
+    fn bulk_query_job_without_error_message_deserializes() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_one_job.htm
+        // The documented example response carries no `errorMessage`.
+        let body = json!({
+            "id": "750R0000000zxikIAA",
+            "operation": "query",
+            "object": "Account",
+            "createdById": "005R0000000GiwjIAC",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "JobComplete",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 46.0,
+            "jobType": "V2Query",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA",
+            "numberRecordsProcessed": 740003,
+            "retries": 0,
+            "totalProcessingTime": 21046,
+            "isPkChunkingSupported": true
+        })
+        .to_string();
+        let job: BulkQueryJob = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert!(job.error_message.is_none());
     }
 
     #[test]
@@ -1651,11 +1975,63 @@ mod tests {
     }
 
     #[test]
+    fn bulk_query_results_debug_elides_the_csv_body() {
+        let results = BulkQueryResults {
+            csv: bytes::Bytes::from_static(b"Id,Name\n001xx,Acme Corp\n"),
+            locator: Some("MTAwMDA".into()),
+            number_of_records: Some(1),
+        };
+        let rendered = format!("{results:?}");
+        assert!(!rendered.contains("Acme Corp"), "leaked body: {rendered}");
+        assert!(rendered.contains("csv_len: 24"), "got {rendered}");
+        assert!(rendered.contains("MTAwMDA"), "got {rendered}");
+    }
+
+    #[test]
     fn limit_info_parses_well_formed_header() {
         let info = LimitInfo::parse("api-usage=42/15000").unwrap();
         assert_eq!(info.used, 42);
         assert_eq!(info.allowed, 15000);
         assert_eq!(info.remaining(), 14958);
+        assert_eq!(info.bursts, None);
+    }
+
+    #[test]
+    fn limit_info_parses_documented_multi_directive_header() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/headers_api_usage.htm
+        // Example: Sforce-Limit-Info: api-usage=10018/100000; api-bursts=1/750
+        let info = LimitInfo::parse("api-usage=10018/100000; api-bursts=1/750").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.allowed, 100000);
+        assert_eq!(info.bursts, Some((1, 750)));
+
+        // The same page's second example carries only the api-usage
+        // directive.
+        let info = LimitInfo::parse("api-usage=10018/100000").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.allowed, 100000);
+        assert_eq!(info.bursts, None);
+    }
+
+    #[test]
+    fn limit_info_ignores_unknown_directives_and_directive_order() {
+        let info = LimitInfo::parse("api-bursts=1/750; api-usage=10018/100000").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.bursts, Some((1, 750)));
+
+        // A directive this SDK doesn't model must not sink the parse.
+        let info = LimitInfo::parse("some-future-key=1/2; api-usage=7/100").unwrap();
+        assert_eq!(info.used, 7);
+        assert_eq!(info.allowed, 100);
+        assert_eq!(info.bursts, None);
+    }
+
+    #[test]
+    fn limit_info_parses_comma_folded_directives() {
+        // Repeated headers folded into one value by an intermediary.
+        let info = LimitInfo::parse("api-usage=10018/100000, api-bursts=1/750").unwrap();
+        assert_eq!(info.used, 10018);
+        assert_eq!(info.bursts, Some((1, 750)));
     }
 
     #[test]
@@ -1677,6 +2053,8 @@ mod tests {
         assert_eq!(LimitInfo::parse(""), None);
         // Negative — not parseable as u32.
         assert_eq!(LimitInfo::parse("api-usage=-5/100"), None);
+        // A well-formed burst directive alone carries no usage counts.
+        assert_eq!(LimitInfo::parse("api-bursts=1/750"), None);
     }
 
     #[test]
@@ -1686,6 +2064,7 @@ mod tests {
         let info = LimitInfo {
             used: 100,
             allowed: 50,
+            bursts: None,
         };
         assert_eq!(info.remaining(), 0);
     }
