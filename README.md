@@ -16,7 +16,7 @@ Each crate ships and versions independently. They share a workspace so dependenc
 
 ## Development
 
-The repo is a Nix flake. With [direnv](https://direnv.net) installed, `cd`ing in loads the dev shell automatically; otherwise run `nix develop`. The shell provides stable `rustc`/`cargo`, `clippy`, `rust-analyzer`, `cargo-nextest`, and `cargo-release`.
+The repo is a Nix flake and ships an `.envrc`. With [direnv](https://direnv.net) installed, run `direnv allow` once and `cd`ing in loads the dev shell from then on; otherwise run `nix develop`. The shell provides stable `rustc`/`cargo`, `clippy`, `rust-analyzer`, `cargo-nextest`, and `cargo-release`.
 
 You do not need to use Nix to contribute to this repository. The Nix developer environment is provided for convenience.
 

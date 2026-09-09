@@ -10,7 +10,7 @@
 //! - Failed-cleanup leftovers are identifiable in case manual cleanup
 //!   becomes necessary.
 //!
-//! **Always run with `--test-threads=1`** — see top-level integration
+//! **Always run serially (`-j 1`)** — see top-level integration
 //! test docs. Even with unique markers, paralleling these saturates
 //! the API quota faster than it needs to.
 //!

@@ -15,12 +15,12 @@
 //!
 //! ```bash
 //! cargo nextest run -p cirrus-auth --run-ignored only \
-//!     -E 'binary(integration)' -- --test-threads=1
+//!     -E 'binary(integration)' -j 1
 //! # or, with cargo's built-in runner:
 //! cargo test -p cirrus-auth --test integration -- --ignored --test-threads=1
 //! ```
 //!
-//! Sequential (`--test-threads=1`) is unnecessary here — these tests
+//! Sequential (`-j 1`) is unnecessary here — these tests
 //! are read-only and don't mutate org state — but keeping it matches
 //! the workspace convention.
 //!

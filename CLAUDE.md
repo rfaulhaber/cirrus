@@ -109,20 +109,20 @@ Live tests against a real Salesforce sandbox / Developer Edition / scratch org l
 cp .env.example .env
 
 # Run a crate's integration suite (sequential — they share org state)
-cargo nextest run -p cirrus           --test integration --run-ignored only -- --test-threads=1
-cargo nextest run -p cirrus-auth      --test integration --run-ignored only -- --test-threads=1
-cargo nextest run -p cirrus-metadata  --test integration --run-ignored only -- --test-threads=1
+cargo nextest run -p cirrus           --test integration --run-ignored only -j 1
+cargo nextest run -p cirrus-auth      --test integration --run-ignored only -j 1
+cargo nextest run -p cirrus-metadata  --test integration --run-ignored only -j 1
 ```
 
 The harness (`tests/integration/common.rs` in each crate) refuses to run unless `INSTANCE_URL` matches a known sandbox / Developer Edition / scratch My Domain pattern: `.sandbox.`, `.develop.`, `.scratch.`, or `.trailblaze.` infix before `.my.salesforce.com`. The `.trailblaze.` partition is used by free Developer Edition orgs from developer.salesforce.com signup (subdomain typically ends `-dev-ed`). Override with `CIRRUS_INTEGRATION_FORCE=1` only after verifying the target org is safe for destructive writes — the safe-list catches Enhanced Domains URLs but not legacy pre-Spring-'23 sandbox URLs, and Salesforce occasionally introduces new partition infixes (audit when adding orgs in unfamiliar shapes).
 
-Auth supports two paths: paste a static token from `sf org display`, or configure JWT bearer flow with a connected app + private key. Static-token mode is the easy bootstrap; JWT exercises the full auth flow.
+Auth supports two paths: paste a static token from `sf org display`, or configure JWT bearer flow with a connected app + private key. Static-token mode is the easy bootstrap; JWT exercises the full auth flow. Once `CIRRUS_INTEGRATION=1` is set, an incomplete auth configuration fails the run instead of skipping, so an opted-in run can't come back green having made no calls. `INSTANCE_URL` and `LOGIN_URL` must both be `https`; `CIRRUS_INTEGRATION_FORCE=1` waives the org classification, never that.
 
 Don't add network-touching tests to the default (`cargo test`) suite — those should always be wiremock-backed and offline.
 
 ## Repository Layout
 
-This is a **Cargo workspace**. The repo root holds workspace-level config (`Cargo.toml` workspace manifest, `clippy.toml`, `deny.toml`, `flake.nix`, `rust-toolchain.toml`) plus the `scripts/` directory. Each member crate lives under `crates/<name>/` with the standard `src/lib.rs` layout.
+This is a **Cargo workspace**. The repo root holds workspace-level config (`Cargo.toml` workspace manifest, `clippy.toml`, `deny.toml`, `flake.nix`, `rust-toolchain.toml`). Each member crate lives under `crates/<name>/` with the standard `src/lib.rs` layout.
 
 ```
 cirrus/
@@ -130,7 +130,6 @@ cirrus/
 ├── clippy.toml, deny.toml      # apply to all workspace members
 ├── flake.nix, flake.lock       # Nix dev shell
 ├── rust-toolchain.toml         # toolchain pin
-├── scripts/                    # cross-crate utility scripts
 └── crates/
     ├── cirrus/                 # REST client
     │   ├── Cargo.toml          # depends on cirrus-auth (workspace dep)
@@ -168,9 +167,9 @@ Shared dependency versions are declared in `[workspace.dependencies]` (including
 
 ## Development Environment
 
-The project uses a Nix flake with `direnv` (`.envrc` is `use flake`). The dev shell provides `rustc`/`cargo` (stable), `clippy`, `rust-analyzer`, `cargo-nextest`, and `cargo-release`. Outside Nix, the `rust-toolchain.toml` pins channel `stable` with `clippy` and `rustfmt`.
+The project uses a Nix flake with `direnv`; the committed `.envrc` is `use flake` and needs one `direnv allow` per clone. The dev shell provides `rustc`/`cargo` (stable), `clippy`, `rust-analyzer`, `cargo-nextest`, and `cargo-release`. Outside Nix, the `rust-toolchain.toml` pins channel `stable` with `clippy` and `rustfmt`.
 
-Edition is **2024** — code may use features unavailable in older editions. The workspace resolver is `"3"` (requires Cargo ≥ 1.85).
+Edition is **2024** — code may use features unavailable in older editions. The workspace resolver is `"3"` (requires Cargo ≥ 1.85). The published MSRV is `rust-version = "1.88"` in `[workspace.package]`, inherited by every member; it is set by the dependency graph (`jsonwebtoken` 11 and `time`), and a dedicated CI job pins that exact toolchain so the declared floor stays honest.
 
 ## Common Commands
 

@@ -15,12 +15,12 @@
 //!
 //! ```bash
 //! cargo nextest run -p cirrus-metadata --run-ignored only \
-//!     -E 'binary(integration)' -- --test-threads=1
+//!     -E 'binary(integration)' -j 1
 //! # or, with cargo's built-in runner:
 //! cargo test -p cirrus-metadata --test integration -- --ignored --test-threads=1
 //! ```
 //!
-//! Sequential (`--test-threads=1`) keeps the CRUD and file-based tests
+//! Sequential (`-j 1`) keeps the CRUD and file-based tests
 //! from colliding on shared org state and saturating the Daily API
 //! Request quota. Read-only smoke tests would be fine in parallel but
 //! it's simpler to keep one rule for all of them.

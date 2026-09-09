@@ -54,9 +54,16 @@ async fn jwt_flow_caches_token_across_calls() {
     // The cache should return the same value — *not* a freshly-signed
     // assertion exchange on every call. If these differ, the cache
     // never populated (or the TTL is misconfigured).
-    assert_eq!(
-        first, second,
-        "JwtAuth should cache the access token across consecutive access_token() calls",
+    //
+    // Compared with `assert!` rather than `assert_eq!` so a failure
+    // can't Debug-format two live org session ids into the panic
+    // message; the crate redacts them everywhere else.
+    assert!(
+        first == second,
+        "JwtAuth should cache the access token across consecutive \
+         access_token() calls (got {} then {} chars)",
+        first.len(),
+        second.len(),
     );
 }
 

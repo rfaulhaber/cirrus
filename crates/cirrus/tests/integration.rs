@@ -14,12 +14,12 @@
 //! `cargo test`. Run with:
 //!
 //! ```bash
-//! cargo nextest run --run-ignored only -E 'binary(integration)' -- --test-threads=1
+//! cargo nextest run --run-ignored only -E 'binary(integration)' -j 1
 //! # or, with cargo's built-in runner:
 //! cargo test --test integration -- --ignored --test-threads=1
 //! ```
 //!
-//! Sequential (`--test-threads=1`) keeps tests from colliding on
+//! Sequential (`-j 1`) keeps tests from colliding on
 //! shared org state and Daily API Request quota. Parallel execution
 //! is fine for the read-only smoke tests but unsafe for the write
 //! suite (sObject CRUD, Bulk ingest, etc.) that share an Account
@@ -34,8 +34,16 @@
 //!   safety guards). Used by every test module.
 //! - `smoke` — read-only verifications: versions, limits,
 //!   version-negotiation, `Sforce-Limit-Info` capture.
-//! - (Future modules — sobjects CRUD, query pagination, Bulk 2.0,
-//!   composite, tooling — will land as their own files.)
+//! - `sobjects` — Account create → retrieve → update → delete, plus
+//!   global and per-object describe.
+//! - `query` — SOQL envelopes, typed deserialization, the pagination
+//!   stream, and `queryAll` over soft-deleted records.
+//! - `composite` — composite/sobjects, composite/batch, and typed
+//!   composite retrieve.
+//! - `tooling` — `executeAnonymous` result shapes, Tooling describe,
+//!   and Tooling query.
+//!
+//! Bulk 2.0 has no integration module yet.
 
 #[path = "integration/common.rs"]
 mod common;

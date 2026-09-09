@@ -14,9 +14,14 @@
 //! - Failed-cleanup leftovers are identifiable.
 //!
 //! Cleanup runs via an RAII guard so a panic mid-test still attempts
-//! a delete. The Metadata API tolerates deleting a non-existent
-//! component (returns `success: false` with an `INVALID_CROSS_REFERENCE_KEY`
-//! error rather than a fault), so re-running is idempotent.
+//! a delete. `deleteMetadata` returns one `DeleteResult` per component
+//! carrying `success` and `errors` — a refused delete is a non-fault
+//! response, not an error — so the guard has to inspect both. Deleting
+//! a non-existent component lands there too (`success: false` with an
+//! `INVALID_CROSS_REFERENCE_KEY` error), which is why re-running is
+//! idempotent.
+//!
+//! SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deleteMetadata.htm
 
 use crate::common::{try_init_client, unique_name};
 use cirrus_metadata::MetadataClient;
@@ -88,11 +93,20 @@ impl Drop for LabelCleanup<'_> {
             let md = self.md.clone();
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    if let Err(e) = md.delete_metadata(TYPE_NAME, &[name.as_str()]).await {
-                        eprintln!(
+                    match md.delete_metadata(TYPE_NAME, &[name.as_str()]).await {
+                        Err(e) => eprintln!(
                             "cleanup warning: failed to delete CustomLabel {name}: {e} \
                              (will need manual cleanup)",
-                        );
+                        ),
+                        Ok(results) => {
+                            for result in results.iter().filter(|r| !r.success) {
+                                eprintln!(
+                                    "cleanup warning: org refused the delete of CustomLabel \
+                                     {name}: {:?} (will need manual cleanup)",
+                                    result.errors,
+                                );
+                            }
+                        }
                     }
                 });
             });
@@ -294,7 +308,18 @@ async fn upsert_metadata_inserts_then_updates() {
 
     // Explicit cleanup so the test exits clean rather than relying
     // on the drop guard. Drop guards are for panic safety, not the
-    // happy path.
-    let _ = md.delete_metadata(TYPE_NAME, &[name.as_str()]).await;
+    // happy path. The guard stays armed until the delete is confirmed
+    // successful — deleteMetadata reports a refused delete as
+    // `success: false` rather than as an error.
+    let results = md
+        .delete_metadata(TYPE_NAME, &[name.as_str()])
+        .await
+        .expect("cleanup delete_metadata should succeed");
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].success,
+        "cleanup delete_metadata failed for {name}: {:?}",
+        results[0].errors,
+    );
     cleanup.disarm();
 }

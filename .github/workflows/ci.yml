@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# Every job only builds and tests the checked-out tree. Releases are
+# published from a maintainer's machine via `cargo release`, so no job
+# here needs a write-scoped GITHUB_TOKEN — and `actions/checkout`
+# persists whatever token it gets into the workspace's git config,
+# where third-party build scripts and proc macros can reach it.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -54,6 +62,26 @@ jobs:
         run: cargo nextest run --all-features --locked
       - name: cargo test --doc
         run: cargo test --doc --all-features --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    # The `rust-version` in [workspace.package], as the single source for both
+    # the toolchain this job installs and the one it runs under. Installing the
+    # release is not enough on its own: rustup resolves `rust-toolchain.toml`
+    # ahead of the default toolchain, so the repo's `channel = "stable"` would
+    # otherwise silently win and the job would check the declared floor against
+    # stable. RUSTUP_TOOLCHAIN outranks the toolchain file.
+    env:
+      RUSTUP_TOOLCHAIN: "1.88.0"
+    steps:
+      - uses: actions/checkout@v6
+      # The other jobs track stable, so nothing else notices when a dependency
+      # bump raises the real floor above the declared one.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features --locked
 
   docs:
     name: rustdoc
