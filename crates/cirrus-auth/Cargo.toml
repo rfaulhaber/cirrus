@@ -1,6 +1,6 @@
 [package]
 name = "cirrus-auth"
-version = "0.4.0"
+version = "0.4.1"
 description = "Salesforce OAuth 2.0 authentication flows for the Cirrus SDK."
 keywords = ["salesforce", "oauth", "auth", "jwt", "pkce"]
 categories = ["authentication", "api-bindings"]
