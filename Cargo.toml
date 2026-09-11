@@ -20,7 +20,7 @@ homepage = "https://github.com/cirrus-code/cirrus"
 # crates can be published to crates.io — Cargo uses `path` for local
 # workspace builds and `version` for the published manifest.
 cirrus-auth = { path = "crates/cirrus-auth", version = "0.4.1" }
-cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.2.0" }
+cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.3.0" }
 
 # Runtime / HTTP
 # `gzip` makes reqwest send `Accept-Encoding: gzip` and transparently

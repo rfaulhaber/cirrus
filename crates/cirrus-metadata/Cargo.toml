@@ -1,6 +1,6 @@
 [package]
 name = "cirrus-metadata"
-version = "0.2.0"
+version = "0.3.0"
 description = "Salesforce Metadata API (SOAP) client for the Cirrus SDK."
 keywords = ["salesforce", "metadata", "soap", "deploy", "retrieve"]
 categories = ["api-bindings"]
