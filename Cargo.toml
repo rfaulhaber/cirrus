@@ -19,7 +19,7 @@ homepage = "https://github.com/cirrus-code/cirrus"
 # Workspace members. The `version` field is required so dependent
 # crates can be published to crates.io — Cargo uses `path` for local
 # workspace builds and `version` for the published manifest.
-cirrus-auth = { path = "crates/cirrus-auth", version = "0.3.2" }
+cirrus-auth = { path = "crates/cirrus-auth", version = "0.4.0" }
 cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.2.0" }
 
 # Runtime / HTTP
