@@ -63,6 +63,8 @@
             cargo-nextest
             cargo-release
             cargo-deny
+            # for salesforce docs skill
+            nodejs
           ];
         };
       };
