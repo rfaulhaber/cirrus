@@ -97,6 +97,13 @@ use serde::de::DeserializeOwned;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+// The README's Rust code blocks are compiled as doctests, so the quick
+// start cannot drift from the API. The item exists only under
+// `cfg(doctest)` and never reaches the published docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 /// Default Salesforce REST API version when the caller doesn't override it.
 pub const DEFAULT_API_VERSION: &str = "v66.0";
 

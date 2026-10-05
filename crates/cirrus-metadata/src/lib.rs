@@ -119,6 +119,13 @@ pub use result::{
 pub use retry::RetryPolicy;
 pub use transport::SoapOperation;
 
+// The README's Rust code blocks are compiled as doctests, so the quick
+// start cannot drift from the API. The item exists only under
+// `cfg(doctest)` and never reaches the published docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 /// Default Metadata API version when the caller doesn't override it.
 ///
 /// SOAP endpoint paths use bare version numbers without the `v` prefix

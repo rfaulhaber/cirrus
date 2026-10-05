@@ -104,6 +104,7 @@ The Metadata API has two surfaces: a small REST slice covering `deployRequest` (
 - Mock JSON / XML fixtures must cite specific doc pages. A historical regression (`BulkQueryJob.query` modeled despite Salesforce never returning it) was caused by matching mocks to prior assumptions instead of docs. **Doc-driven > prior-knowledge.**
 - Each new handler ships with wiremock coverage of: happy path, error array / SOAP fault, edge cases documented in the wire shape (partial-success semantics, header cursors, etc.).
 - If you can't verify a wire-shape claim against docs, flag it explicitly in code — see `ExecuteAnonymousResult` in `crates/cirrus/src/response.rs` for the established "Wire-shape provenance" docstring pattern.
+- Each README is compiled as doctests through a `#[cfg(doctest)]` item in the crate's `lib.rs`. Fence a complete program `rust,no_run` so it compiles against the real API, and only a deliberate fragment `rust,ignore`; a bare fence would run as a test.
 
 ### Integration tests
 
@@ -189,7 +190,7 @@ cargo test --doc --workspace               # Run doctests
 cargo clippy --all-targets --workspace     # Lint (CI-equivalent — many rules are `deny`)
 cargo fmt --all                            # Format every crate
 cargo package -p <crate> --allow-dirty     # Pre-flight publish check (resolves against crates.io index)
-nix build                                  # Reproducible package build via the flake
+nix flake check                            # Build and run the whole test suite in the Nix sandbox
 cargo release -p <crate> <level>           # Release a specific crate; signs commits/tags, pushes to origin, only from main
 ```
 
@@ -235,7 +236,7 @@ Tag prefixes are set per-crate to avoid collisions:
 | `cirrus-auth` | `cirrus-auth-v` | `cirrus-auth-v0.2.2` |
 | `cirrus-metadata` | `cirrus-metadata-v` | `cirrus-metadata-v0.1.0` |
 
-Only `crates/cirrus/Cargo.toml` carries a `pre-release-replacements` entry — it rewrites the `cirrus = "x.y.z"` snippet in its README on release.
+`crates/cirrus/Cargo.toml` and `crates/cirrus-metadata/Cargo.toml` each carry a `pre-release-replacements` entry that rewrites the `<crate> = "x.y.z"` pin in the crate's README on release; the `cirrus-auth` README has no pin. Each crate directory holds `LICENSE` as a symlink to the workspace-root file, which `cargo package` dereferences, so the published `.crate` carries the MIT text.
 
 ### Publish ordering
 

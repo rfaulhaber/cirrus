@@ -106,10 +106,14 @@ applies a 10 s connect timeout and a 30 s request deadline
 (`DEFAULT_TOKEN_CONNECT_TIMEOUT` and `DEFAULT_TOKEN_REQUEST_TIMEOUT`; every
 builder has `connect_timeout` and `request_timeout` setters) and refuses to
 follow redirects: the grants here carry their credential in the request
-body, which reqwest replays on a 307/308. `token_client_builder()` returns
-a `reqwest::ClientBuilder` with the same settings, for adding a private
-root CA, a proxy or a shared connection pool without losing them. Login
-URLs must be `https`; exact `localhost` and the
+body, which reqwest replays on a 307/308. TLS is verified against the
+operating system's trust store, which the client loads when the flow is
+built: a `FROM scratch` or distroless image without `ca-certificates` fails
+at `build()` with `AuthError::HttpClient`, so install a CA bundle or add the
+roots yourself. `token_client_builder()` returns a `reqwest::ClientBuilder`
+with the same settings, for adding a private root CA, a proxy or a shared
+connection pool without losing them. Login URLs must be `https`; exact
+`localhost` and the
 loopback literals are excepted for local test servers, and `*.localhost`
 names are not. The same rule, `cirrus_auth::transport::is_secure_transport`,
 governs instance URLs in `cirrus` and `cirrus-metadata`.

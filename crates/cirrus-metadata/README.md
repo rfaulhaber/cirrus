@@ -70,6 +70,11 @@ you need anything beyond `deployRequest`.
   The read timeout runs until the response head arrives, so it also bounds
   the upload of a deploy's base64 zip, and only then becomes a per-chunk
   deadline; widen it for a large deploy or retrieve over a slow link.
+  TLS is verified against the operating system's trust store, which the
+  client loads when it is built: a `FROM scratch` or distroless image
+  without `ca-certificates` fails at `build()` with
+  `MetadataError::HttpClient`, so install a CA bundle or hand over a
+  `reqwest::Client` that carries its own roots (`add_root_certificate`).
   Supplying your own client via `MetadataClientBuilder::http_client` replaces
   all of it.
 
@@ -88,11 +93,11 @@ you need anything beyond `deployRequest`.
 
 ```toml
 [dependencies]
-cirrus-metadata = "0.2"
+cirrus-metadata = "0.3.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-```rust,ignore
+```rust,no_run
 use cirrus_metadata::auth::StaticTokenAuth;
 use cirrus_metadata::{
     ListMetadataQuery, MetadataClient, MetadataType, PackageManifest, RetrieveRequest,
@@ -143,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `zip_file` holds the base64 payload Salesforce returns;
     // `zip_bytes()` decodes it into the actual archive.
     if let Some(zip) = result.zip_bytes()? {
-        fs_err::write("retrieved.zip", zip)?;
+        std::fs::write("retrieved.zip", zip)?;
     }
 
     Ok(())
