@@ -169,9 +169,7 @@ impl CompositeHandler<'_> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self
-            .client
-            .versioned_segments(&["composite", "tree", sobject])?;
+        let url = self.client.versioned_url(&["composite", "tree", sobject])?;
         self.client
             .send_at_parsed(
                 reqwest::Method::POST,
@@ -416,12 +414,9 @@ impl CompositeSObjectsHandler<'_> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self.client.versioned_segments(&[
-            "composite",
-            "sobjects",
-            sobject,
-            external_id_field,
-        ])?;
+        let url =
+            self.client
+                .versioned_url(&["composite", "sobjects", sobject, external_id_field])?;
         self.client
             .send_at(reqwest::Method::PATCH, &url, None::<&()>, Some(body))
             .await
@@ -440,7 +435,7 @@ impl CompositeSObjectsHandler<'_> {
     ) -> CirrusResult<Vec<SObjectCollectionResult>> {
         let joined = ids.join(",");
         let all = if all_or_none { "true" } else { "false" };
-        let url = self.client.versioned_segments(&["composite", "sobjects"])?;
+        let url = self.client.versioned_url(&["composite", "sobjects"])?;
         self.client
             .send_at::<_, _, ()>(
                 reqwest::Method::DELETE,
@@ -482,11 +477,12 @@ impl CompositeSObjectsHandler<'_> {
         ids: &[&str],
         fields: &[&str],
     ) -> CirrusResult<Vec<R>> {
-        let mut url = url::Url::parse(&self.client.versioned_segments(&[
-            "composite",
-            "sobjects",
-            sobject,
-        ])?)?;
+        let mut url =
+            url::Url::parse(
+                &self
+                    .client
+                    .versioned_url(&["composite", "sobjects", sobject])?,
+            )?;
         // The query string is assembled here rather than handed to
         // reqwest's form encoder, which would emit each separator as
         // `%2C`. A comma is a legal sub-delim in a query, and the
@@ -547,7 +543,7 @@ impl CompositeSObjectsHandler<'_> {
     ) -> CirrusResult<Vec<R>> {
         let url = self
             .client
-            .versioned_segments(&["composite", "sobjects", sobject])?;
+            .versioned_url(&["composite", "sobjects", sobject])?;
         let body = serde_json::json!({
             "ids": ids,
             "fields": fields,

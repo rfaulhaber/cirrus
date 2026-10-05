@@ -189,7 +189,7 @@ impl BulkIngestHandler<'_> {
     pub async fn upload(&self, job_id: &str, csv: bytes::Bytes) -> CirrusResult<()> {
         let path = self
             .client
-            .versioned_segments(&["jobs", "ingest", job_id, "batches"])?;
+            .versioned_url(&["jobs", "ingest", job_id, "batches"])?;
         self.client
             .send_with_body(
                 reqwest::Method::PUT,
@@ -225,9 +225,7 @@ impl BulkIngestHandler<'_> {
     ///
     /// Calls `GET /services/data/{api_version}/jobs/ingest/{job_id}`.
     pub async fn get(&self, job_id: &str) -> CirrusResult<BulkIngestJob> {
-        let path = self
-            .client
-            .versioned_segments(&["jobs", "ingest", job_id])?;
+        let path = self.client.versioned_url(&["jobs", "ingest", job_id])?;
         self.client
             .send_at::<_, (), ()>(reqwest::Method::GET, &path, None, None)
             .await
@@ -240,9 +238,7 @@ impl BulkIngestHandler<'_> {
     ///
     /// Calls `DELETE /services/data/{api_version}/jobs/ingest/{job_id}`.
     pub async fn delete(&self, job_id: &str) -> CirrusResult<()> {
-        let path = self
-            .client
-            .versioned_segments(&["jobs", "ingest", job_id])?;
+        let path = self.client.versioned_url(&["jobs", "ingest", job_id])?;
         self.client
             .send_at::<(), (), ()>(reqwest::Method::DELETE, &path, None, None)
             .await
@@ -279,9 +275,7 @@ impl BulkIngestHandler<'_> {
     }
 
     async fn patch_state(&self, job_id: &str, new_state: &str) -> CirrusResult<BulkJobStateChange> {
-        let path = self
-            .client
-            .versioned_segments(&["jobs", "ingest", job_id])?;
+        let path = self.client.versioned_url(&["jobs", "ingest", job_id])?;
         let body = StatePatch { state: new_state };
         self.client
             .send_at::<_, (), _>(reqwest::Method::PATCH, &path, None, Some(&body))
@@ -291,7 +285,7 @@ impl BulkIngestHandler<'_> {
     async fn fetch_csv_results(&self, job_id: &str, kind: &str) -> CirrusResult<bytes::Bytes> {
         let path = self
             .client
-            .versioned_segments(&["jobs", "ingest", job_id, kind])?;
+            .versioned_url(&["jobs", "ingest", job_id, kind])?;
         let (_, bytes) = self
             .client
             .fetch_raw(reqwest::Method::GET, &path, CSV_ACCEPT, None)
@@ -332,7 +326,7 @@ impl BulkQueryHandler<'_> {
     ///
     /// Calls `GET /services/data/{api_version}/jobs/query/{job_id}`.
     pub async fn get(&self, job_id: &str) -> CirrusResult<BulkQueryJob> {
-        let path = self.client.versioned_segments(&["jobs", "query", job_id])?;
+        let path = self.client.versioned_url(&["jobs", "query", job_id])?;
         self.client
             .send_at::<_, (), ()>(reqwest::Method::GET, &path, None, None)
             .await
@@ -345,7 +339,7 @@ impl BulkQueryHandler<'_> {
     /// Calls `PATCH /services/data/{api_version}/jobs/query/{job_id}`
     /// with `{"state": "Aborted"}`.
     pub async fn abort(&self, job_id: &str) -> CirrusResult<BulkJobStateChange> {
-        let path = self.client.versioned_segments(&["jobs", "query", job_id])?;
+        let path = self.client.versioned_url(&["jobs", "query", job_id])?;
         let body = StatePatch { state: "Aborted" };
         self.client
             .send_at::<_, (), _>(reqwest::Method::PATCH, &path, None, Some(&body))
@@ -383,7 +377,7 @@ impl BulkQueryHandler<'_> {
     ) -> CirrusResult<BulkQueryResults> {
         let path = self
             .client
-            .versioned_segments(&["jobs", "query", job_id, "results"])?;
+            .versioned_url(&["jobs", "query", job_id, "results"])?;
         let max_records_str = max_records.map(|n| n.to_string());
         let mut query: Vec<(&str, &str)> = Vec::with_capacity(2);
         if let Some(loc) = locator {
@@ -414,7 +408,7 @@ impl BulkQueryHandler<'_> {
     ///
     /// Calls `DELETE /services/data/{api_version}/jobs/query/{job_id}`.
     pub async fn delete(&self, job_id: &str) -> CirrusResult<()> {
-        let path = self.client.versioned_segments(&["jobs", "query", job_id])?;
+        let path = self.client.versioned_url(&["jobs", "query", job_id])?;
         self.client
             .send_at::<(), (), ()>(reqwest::Method::DELETE, &path, None, None)
             .await

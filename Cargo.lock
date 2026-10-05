@@ -193,6 +193,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http-serde",
  "httpdate",
+ "percent-encoding",
  "proptest",
  "reqwest",
  "serde",

@@ -275,7 +275,7 @@ impl<'a> ToolingSObjectHandler<'a> {
         // name can't alter the path — mirrors the regular SObjectHandler.
         let url = self
             .client
-            .versioned_segments(&["tooling", "sobjects", self.name, "describe"])?;
+            .versioned_url(&["tooling", "sobjects", self.name, "describe"])?;
         self.client
             .send_at(reqwest::Method::GET, &url, None::<&()>, None::<&()>)
             .await
@@ -293,7 +293,7 @@ impl<'a> ToolingSObjectHandler<'a> {
     pub async fn retrieve_as<R: DeserializeOwned>(&self, id: &str) -> CirrusResult<R> {
         let url = self
             .client
-            .versioned_segments(&["tooling", "sobjects", self.name, id])?;
+            .versioned_url(&["tooling", "sobjects", self.name, id])?;
         self.client
             .send_at(reqwest::Method::GET, &url, None::<&()>, None::<&()>)
             .await
@@ -316,7 +316,7 @@ impl<'a> ToolingSObjectHandler<'a> {
     ) -> CirrusResult<R> {
         let url = self
             .client
-            .versioned_segments(&["tooling", "sobjects", self.name, id])?;
+            .versioned_url(&["tooling", "sobjects", self.name, id])?;
         let joined = fields.join(",");
         let query = [("fields", joined.as_str())];
         self.client
@@ -335,7 +335,7 @@ impl<'a> ToolingSObjectHandler<'a> {
     {
         let url = self
             .client
-            .versioned_segments(&["tooling", "sobjects", self.name])?;
+            .versioned_url(&["tooling", "sobjects", self.name])?;
         self.client
             .send_at(reqwest::Method::POST, &url, None::<&()>, Some(body))
             .await
@@ -352,7 +352,7 @@ impl<'a> ToolingSObjectHandler<'a> {
     {
         let url = self
             .client
-            .versioned_segments(&["tooling", "sobjects", self.name, id])?;
+            .versioned_url(&["tooling", "sobjects", self.name, id])?;
         self.client
             .send_at(reqwest::Method::PATCH, &url, None::<&()>, Some(body))
             .await
@@ -366,7 +366,7 @@ impl<'a> ToolingSObjectHandler<'a> {
     pub async fn delete(&self, id: &str) -> CirrusResult<()> {
         let url = self
             .client
-            .versioned_segments(&["tooling", "sobjects", self.name, id])?;
+            .versioned_url(&["tooling", "sobjects", self.name, id])?;
         self.client
             .send_at(reqwest::Method::DELETE, &url, None::<&()>, None::<&()>)
             .await
@@ -628,9 +628,15 @@ mod tests {
         // path structure — same contract as the regular SObjectHandler.
         let server = MockServer::start().await;
 
+        // wiremock matches on `Url::path()`, which is percent-encoded, so
+        // the exact path pins the encoding and the `[^/]+` anchor fails if
+        // the id is ever split into two segments.
         Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/tooling/sobjects/ApexClass/a%2Fb=c%20d",
+            ))
             .and(path_regex(
-                r"^/services/data/v66\.0/tooling/sobjects/ApexClass/.+$",
+                r"^/services/data/v66\.0/tooling/sobjects/ApexClass/[^/]+$",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Id": "ok"})))
             .mount(&server)

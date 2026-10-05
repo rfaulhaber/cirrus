@@ -78,7 +78,7 @@ pub use handlers::metadata::{
     DeployMessage, DeployOptions, DeployRequest, DeployResultDetails, DeployResultInnerDetails,
     DeployStatus, MetadataHandler, RunTestResults, TestLevel,
 };
-pub use handlers::sobjects::BlobUploadSpec;
+pub use handlers::sobjects::{BlobUploadSpec, UpsertOptions};
 pub use pagination::Records;
 pub use response::LimitInfo;
 pub use response::{
@@ -91,9 +91,11 @@ pub use response::{
 };
 pub use retry::{Replay, RetryPolicy};
 
+use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -134,6 +136,55 @@ pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
     " (Rust SDK for Salesforce)"
 );
 
+/// Characters a path segment carries percent-encoded: the WHATWG path
+/// percent-encode set (the C0 controls, space, `"`, `#`, `<`, `>`, `?`,
+/// `` ` ``, `{` and `}`) plus the three bytes a URL reads structurally
+/// inside a segment — `/` splits it, `%` starts an escape, and `\` is a
+/// path separator for the https scheme. Tab, line feed and carriage return
+/// are in the C0 range, which matters: URL parsing removes them instead of
+/// encoding them, so a segment that reached the parser raw would be
+/// rewritten. `=`, `+`, `&`, `@` and the other sub-delimiters an
+/// external-ID value commonly holds travel as written.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%')
+    .add(b'\\');
+
+/// Percent-encodes `segment` so it occupies exactly one URL path segment.
+///
+/// Every verb on [`Cirrus`] sends the `path` it is given as written, so a
+/// value interpolated into one has to be encoded first: a raw `#` starts
+/// a fragment that never reaches Salesforce, `?` starts the query string,
+/// and `/` or `%` change the path. [`Cirrus::versioned_url`] does this
+/// for a versioned resource; this function is for the instance-rooted and
+/// fully-qualified forms, such as an Apex REST path.
+///
+/// Tab, line feed and carriage return are encoded as `%09`, `%0A` and
+/// `%0D`, where URL parsing would otherwise remove them and rewrite the
+/// identifier. `.` and `..` come back unchanged: no encoding makes a
+/// relative reference addressable, and the verbs that take segments
+/// refuse them.
+///
+/// # Example
+///
+/// ```
+/// let tag = "C#";
+/// let path = format!("Tags/{}", cirrus::encode_path_segment(tag));
+/// assert_eq!(path, "Tags/C%23");
+/// ```
+pub fn encode_path_segment(segment: &str) -> Cow<'_, str> {
+    percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT).into()
+}
+
 /// The main Salesforce client.
 ///
 /// Holds the underlying HTTP client, an [`AuthSession`] for credentials, and
@@ -150,6 +201,15 @@ pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
 ///   e.g. `/services/data` → `{instance}/services/data`.
 /// - **Versioned** (anything else): prefixed with `/services/data/{version}/`,
 ///   e.g. `limits` → `{instance}/services/data/{version}/limits`.
+///
+/// In every mode the path is sent as written: nothing is percent-encoded,
+/// so a value interpolated into it has to be encoded first. A raw `#`
+/// starts a fragment that never reaches Salesforce, `?` starts the query
+/// string, and `/` or `%` change the path — each of them silently
+/// addresses a different resource. [`Self::versioned_url`] builds a
+/// versioned URL from separate segments and encodes each one;
+/// [`encode_path_segment`] encodes a single value for the other two
+/// modes.
 ///
 /// Whichever mode applies, the resolved target has to be `https` (or a
 /// loopback host) before the session token is attached — see
@@ -321,23 +381,54 @@ impl Cirrus {
         check_transport_security("request URL", url, self.allow_insecure_transport)
     }
 
-    /// Builds a versioned URL by appending percent-encoded path segments.
+    /// Builds the fully-qualified URL of a versioned resource from its path
+    /// segments, percent-encoding each one.
     ///
-    /// Use this when any segment may contain reserved characters (slash,
-    /// equals, percent, etc.) — e.g. an upsert external-ID value. Each
-    /// element of `segments` is encoded as a single path segment.
+    /// Each element of `segments` becomes exactly one segment under
+    /// `/services/data/{version}/`, whatever characters it contains — see
+    /// [`encode_path_segment`] for the encoding. Pass the result to any
+    /// verb; a fully-qualified URL goes through as-is. Reach for this when a
+    /// segment comes from data rather than from the API's fixed resource
+    /// names: an external-ID value, a record id read from a file, a name a
+    /// user typed.
     ///
-    /// A segment of `.` or `..` is rejected: URL path resolution drops
-    /// those rather than encoding them, so the request would quietly
-    /// land one segment short — on a different Salesforce resource —
-    /// instead of failing.
-    pub(crate) fn versioned_segments(&self, segments: &[&str]) -> CirrusResult<String> {
-        if let Some(dotted) = segments.iter().find(|s| matches!(**s, "." | "..")) {
+    /// An empty segment and the relative references `.` and `..` are refused
+    /// with [`CirrusError::InvalidInput`]. URL resolution drops them rather
+    /// than encoding them, so the request would quietly land on a different
+    /// Salesforce resource instead of failing: an empty record id would turn
+    /// `sobjects/Account/{id}` into the sObject Basic Information resource,
+    /// and `..` would address the parent.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // A resource with no typed handler, addressed by a value that
+    /// // holds a `#`. The verb receives `.../Pricebook2/Code__c/PB%231`.
+    /// let url = sf.versioned_url(&["sobjects", "Pricebook2", "Code__c", "PB#1"])?;
+    /// let record: serde_json::Value = sf.get(&url).await?;
+    /// # let _ = record;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn versioned_url(&self, segments: &[&str]) -> CirrusResult<String> {
+        for segment in segments {
+            let message = match *segment {
+                "" => "an empty segment would end the path with a slash and address the \
+                       parent resource"
+                    .to_owned(),
+                "." | ".." => format!(
+                    "`{segment}` is a relative path reference, so it cannot address a resource",
+                ),
+                _ => continue,
+            };
             return Err(CirrusError::InvalidInput {
                 field: "path segment",
-                message: format!(
-                    "`{dotted}` is a relative path reference, so it cannot address a resource",
-                ),
+                message,
             });
         }
         let base = format!(
@@ -346,13 +437,22 @@ impl Cirrus {
             self.api_version
         );
         let mut url = url::Url::parse(&base)?;
-        // The trailing '/' on `base` leaves an empty path segment; without
-        // popping it, `extend` produces `.../v66.0//sobjects/...`.
-        url.path_segments_mut()
-            .map_err(|()| CirrusError::InvalidResponse("instance URL is not hierarchical".into()))?
-            .pop_if_empty()
-            .extend(segments);
-        Ok(url.to_string())
+        if url.cannot_be_a_base() {
+            return Err(CirrusError::InvalidResponse(
+                "instance URL is not hierarchical".into(),
+            ));
+        }
+        // The segments are encoded here, not by the URL parser. `set_path`
+        // leaves an existing escape alone, and `PATH_SEGMENT` covers
+        // everything the parser would read structurally or strip, so the
+        // path assembled below is the path that goes on the wire.
+        let mut path = url.path().trim_end_matches('/').to_owned();
+        for segment in segments {
+            path.push('/');
+            path.push_str(&encode_path_segment(segment));
+        }
+        url.set_path(&path);
+        Ok(url.into())
     }
 
     /// GET an arbitrary Salesforce path, deserializing the response into `R`.
@@ -583,7 +683,7 @@ impl Cirrus {
     /// Internal: send a request to a fully-built absolute URL. Used by
     /// handlers that need percent-encoded path segments (sObject upsert by
     /// external ID, for example) — they construct the URL via
-    /// [`Self::versioned_segments`] and dispatch through this method.
+    /// [`Self::versioned_url`] and dispatch through this method.
     pub(crate) async fn send_at<R, Q, B>(
         &self,
         method: reqwest::Method,
@@ -2838,12 +2938,25 @@ mod property_tests {
         })
     }
 
-    /// Unreserved-only segment for `versioned_segments` round-trip
+    /// Unreserved-only segment for `versioned_url` round-trip
     /// properties — keeps the raw segment comparison free of percent-
     /// encoding noise. A separate non-property test pins the encoding
     /// behavior for reserved chars.
     fn nonempty_segment() -> impl Strategy<Value = String> {
         "[A-Za-z0-9_-]{1,32}"
+    }
+
+    /// Any short string, weighted toward the characters URL parsing
+    /// treats specially: the delimiters, the whitespace it strips, dot
+    /// segments and the empty string.
+    fn any_segment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => "[A-Za-z0-9_-]{0,8}",
+            4 => "[A-Za-z0-9 ./%?#\\\\\\t\\n\\r=&+-]{0,8}",
+            1 => "\\.{1,3}",
+            1 => "[ \\t\\n\\r]{0,2}\\.{1,2}[ \\t\\n\\r]{0,2}",
+            1 => "\\PC{1,4}",
+        ]
     }
 
     /// Segment strategy that reaches the dot-segment forms URL path
@@ -2901,17 +3014,17 @@ mod property_tests {
             prop_assert_eq!(url, format!("https://my.salesforce.com/{rest}"));
         }
 
-        /// `versioned_segments` produces a URL where each segment is
+        /// `versioned_url` produces a URL where each segment is
         /// recoverable via the parsed `Url::path_segments`. This is the
         /// percent-encoding round-trip property used by upsert-by-
         /// external-ID with reserved characters in the value.
         #[test]
-        fn versioned_segments_round_trip(
+        fn versioned_url_round_trip(
             seg1 in nonempty_segment(),
             seg2 in nonempty_segment(),
         ) {
             let sf = fixture("https://my.salesforce.com");
-            let url_str = sf.versioned_segments(&[&seg1, &seg2]).unwrap();
+            let url_str = sf.versioned_url(&[&seg1, &seg2]).unwrap();
             let parsed = url::Url::parse(&url_str).unwrap();
             let segments: Vec<&str> = parsed
                 .path_segments()
@@ -2928,17 +3041,17 @@ mod property_tests {
             prop_assert_eq!(segments[4], seg2);
         }
 
-        /// `versioned_segments` either keeps every segment it was given
+        /// `versioned_url` either keeps every segment it was given
         /// or refuses the call — it never returns a URL that is a
         /// segment short. Dot segments are the way that happens:
         /// URL path resolution drops them instead of encoding them.
         #[test]
-        fn versioned_segments_never_silently_drops_a_segment(
+        fn versioned_url_never_silently_drops_a_segment(
             segs in proptest::collection::vec(maybe_dotted_segment(), 1..5),
         ) {
             let sf = fixture("https://my.salesforce.com");
             let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
-            match sf.versioned_segments(&refs) {
+            match sf.versioned_url(&refs) {
                 Ok(url_str) => {
                     let parsed = url::Url::parse(&url_str).unwrap();
                     let segments: Vec<&str> = parsed
@@ -2961,16 +3074,55 @@ mod property_tests {
             }
         }
 
-        /// `versioned_segments` never emits double slashes between
+        /// Every segment reaches the URL intact, whatever it contains:
+        /// decoding each emitted path segment gives back exactly the
+        /// string that was passed, and nothing is dropped or split. The
+        /// only inputs refused are the ones no URL can address — an
+        /// empty segment and the relative references `.` and `..`.
+        #[test]
+        fn versioned_url_round_trips_any_segment(
+            segs in proptest::collection::vec(any_segment(), 1..5),
+        ) {
+            let sf = fixture("https://my.salesforce.com");
+            let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
+            let unaddressable = segs.iter().any(|s| s.is_empty() || s == "." || s == "..");
+            match sf.versioned_url(&refs) {
+                Ok(url_str) => {
+                    prop_assert!(!unaddressable, "{segs:?} should have been refused");
+                    let parsed = url::Url::parse(&url_str).unwrap();
+                    let decoded: Vec<String> = parsed
+                        .path_segments()
+                        .unwrap()
+                        .skip(3)
+                        .map(|s| {
+                            percent_encoding::percent_decode_str(s)
+                                .decode_utf8()
+                                .unwrap()
+                                .into_owned()
+                        })
+                        .collect();
+                    prop_assert_eq!(&decoded, &segs, "url was {}", url_str);
+                }
+                Err(e) => {
+                    prop_assert!(unaddressable, "{:?} refused: {e:?}", segs);
+                    prop_assert!(
+                        matches!(e, CirrusError::InvalidInput { .. }),
+                        "unexpected error {e:?}",
+                    );
+                }
+            }
+        }
+
+        /// `versioned_url` never emits double slashes between
         /// segments. The pop_if_empty trick guards against that; this
         /// property pins it.
         #[test]
-        fn versioned_segments_never_emits_double_slash(
+        fn versioned_url_never_emits_double_slash(
             segs in proptest::collection::vec(nonempty_segment(), 1..6),
         ) {
             let sf = fixture("https://my.salesforce.com");
             let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
-            let url = sf.versioned_segments(&refs).unwrap();
+            let url = sf.versioned_url(&refs).unwrap();
             let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(&url);
             prop_assert!(
                 !after_scheme.contains("//"),
@@ -2984,11 +3136,11 @@ mod property_tests {
     /// would otherwise resolve to the sObject Rows resource with
     /// `Ext__c` read as the record ID.
     #[test]
-    fn versioned_segments_rejects_relative_path_references() {
+    fn versioned_url_rejects_relative_path_references() {
         let sf = fixture("https://my.salesforce.com");
         for value in [".", ".."] {
             let err = sf
-                .versioned_segments(&["sobjects", "Account", "Ext_Id__c", value])
+                .versioned_url(&["sobjects", "Account", "Ext_Id__c", value])
                 .unwrap_err();
             match err {
                 CirrusError::InvalidInput { field, message } => {
@@ -3004,11 +3156,11 @@ mod property_tests {
     /// be percent-encoded so the segment boundary survives. The upsert-
     /// by-external-ID case with a `/` in the value depends on this.
     #[test]
-    fn versioned_segments_percent_encodes_reserved_slash() {
+    fn versioned_url_percent_encodes_reserved_slash() {
         let sf = fixture("https://my.salesforce.com");
         // Pretend an external-ID value contains a slash.
         let url = sf
-            .versioned_segments(&["sobjects", "Account", "Ext_Id__c", "abc/def"])
+            .versioned_url(&["sobjects", "Account", "Ext_Id__c", "abc/def"])
             .unwrap();
         // Must NOT split into an extra path segment.
         let parsed = url::Url::parse(&url).unwrap();
@@ -3023,5 +3175,81 @@ mod property_tests {
             "slash in external-ID value must be percent-encoded; got {:?}",
             segs[6],
         );
+    }
+
+    /// An empty segment is not addressable: it would serialize as a
+    /// trailing slash, and `GET .../sobjects/Account/` is the sObject
+    /// Basic Information resource, not a record.
+    #[test]
+    fn versioned_url_rejects_an_empty_segment() {
+        let sf = fixture("https://my.salesforce.com");
+        let err = sf.versioned_url(&["sobjects", "Account", ""]).unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, message } => {
+                assert_eq!(field, "path segment");
+                assert!(message.contains("empty"), "got {message:?}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// URL parsing removes tab, line feed and carriage return instead of
+    /// encoding them, which rewrites an identifier that contains one.
+    /// Each has to reach the wire percent-encoded so the value the
+    /// caller passed is the value Salesforce sees.
+    #[test]
+    fn versioned_url_percent_encodes_tab_cr_and_lf() {
+        let sf = fixture("https://my.salesforce.com");
+        for (raw, encoded) in [("A\tB", "A%09B"), ("A\nB", "A%0AB"), ("A\rB", "A%0DB")] {
+            let url = sf
+                .versioned_url(&["sobjects", "Product2", "SKU__c", raw])
+                .unwrap();
+            assert!(
+                url.ends_with(&format!("/sobjects/Product2/SKU__c/{encoded}")),
+                "{raw:?} should reach the wire as {encoded}; got {url}",
+            );
+        }
+    }
+
+    /// `#`, `?`, `%` and `\` each change how a URL is read when they
+    /// appear raw: fragment, query string, an escape, and (for https) a
+    /// path separator. A segment that contains one has to carry it
+    /// encoded.
+    #[test]
+    fn versioned_url_percent_encodes_url_delimiters() {
+        let sf = fixture("https://my.salesforce.com");
+        for (raw, encoded) in [
+            ("SKU#1", "SKU%231"),
+            ("SKU?1", "SKU%3F1"),
+            ("SKU%1", "SKU%251"),
+            ("SKU\\1", "SKU%5C1"),
+        ] {
+            let url = sf
+                .versioned_url(&["sobjects", "Product2", "SKU__c", raw])
+                .unwrap();
+            assert!(
+                url.ends_with(&format!("/sobjects/Product2/SKU__c/{encoded}")),
+                "{raw:?} should reach the wire as {encoded}; got {url}",
+            );
+        }
+    }
+
+    /// A dot segment split by a character URL parsing strips would pass a
+    /// check on the literal text and then resolve away a segment. Encoded,
+    /// it is an ordinary (if odd) identifier and stays put.
+    #[test]
+    fn versioned_url_keeps_a_whitespace_split_dot_segment_in_place() {
+        let sf = fixture("https://my.salesforce.com");
+        for raw in [".\t.", ".\n.", ".\r.", ". ."] {
+            let url = sf.versioned_url(&["sobjects", raw]).unwrap();
+            let parsed = url::Url::parse(&url).unwrap();
+            let segs: Vec<&str> = parsed.path_segments().unwrap().collect();
+            assert_eq!(
+                segs.len(),
+                5,
+                "{raw:?} must stay a segment of its own; got {segs:?}",
+            );
+            assert_eq!(segs[3], "sobjects");
+        }
     }
 }

@@ -13,12 +13,15 @@
 //!
 //! # Path encoding
 //!
-//! The handler does **not** percent-encode path segments. For paths
-//! containing reserved characters (spaces, `&`), pre-encode the
-//! segments yourself before calling. `?` and `#` end the path when the
-//! URL is parsed — everything after the first of them becomes the query
-//! string or the fragment — so percent-encode those (`%3F`, `%23`) to
-//! address a segment that really contains one.
+//! The handler does **not** percent-encode path segments: the path is
+//! sent as written, so a value interpolated into it has to be encoded
+//! first — [`encode_path_segment`](crate::encode_path_segment) does
+//! that for one segment. A `?` ends the path and starts an inline query
+//! string; write `%3F` to address a segment that really contains one.
+//! A literal `#` is refused with [`CirrusError::InvalidInput`]:
+//! everything after it would be a fragment, which is never sent, so the
+//! org would receive a shorter path and act on a different resource.
+//! Write `%23` instead.
 //!
 //! Relative segments (`.` and `..`, in either literal or percent-encoded
 //! spelling) are rejected with [`CirrusError::InvalidInput`], because URL
@@ -77,11 +80,12 @@ impl Cirrus {
 /// Body and response types are caller-defined since Apex REST endpoints
 /// have no platform-defined wire shape.
 ///
-/// Every method returns [`CirrusError::InvalidInput`] without issuing a
-/// request when the supplied path contains an empty or relative
-/// (`.` / `..`) segment, a backslash, or any character up to and
-/// including `U+0020` — the C0 controls and the space — see the
-/// [module docs](self#path-encoding).
+/// Every method sends `path` as written, and returns
+/// [`CirrusError::InvalidInput`] without issuing a request when it
+/// contains an empty or relative (`.` / `..`) segment, a `#`, a
+/// backslash, or any character up to and including `U+0020` — the C0
+/// controls and the space. The [module docs](self#path-encoding) say
+/// what to pre-encode, and how.
 ///
 /// No method here is replayed once the request has reached the org,
 /// whatever its HTTP verb. The status codes come from developer code:
@@ -103,6 +107,9 @@ pub struct ApexHandler<'a> {
 
 impl ApexHandler<'_> {
     /// `GET /services/apexrest/{path}`.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode.
     pub async fn get<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
         self.client
             .send_with_replay::<R, ()>(
@@ -119,6 +126,9 @@ impl ApexHandler<'_> {
     /// `GET /services/apexrest/{path}` with a query string. `query` is
     /// any [`Serialize`] value — typically `&[("key", "value")]` or a
     /// struct.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode.
     pub async fn get_with_query<R, Q>(&self, path: &str, query: &Q) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -130,6 +140,9 @@ impl ApexHandler<'_> {
     }
 
     /// `POST /services/apexrest/{path}` with a JSON body.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode.
     pub async fn post<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -148,6 +161,9 @@ impl ApexHandler<'_> {
     }
 
     /// `PUT /services/apexrest/{path}` with a JSON body.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode.
     pub async fn put<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -166,6 +182,9 @@ impl ApexHandler<'_> {
     }
 
     /// `PATCH /services/apexrest/{path}` with a JSON body.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode.
     pub async fn patch<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -184,6 +203,9 @@ impl ApexHandler<'_> {
     }
 
     /// `DELETE /services/apexrest/{path}`.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode.
     pub async fn delete<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
         self.client
             .send_with_replay::<R, ()>(
@@ -210,9 +232,10 @@ impl ApexHandler<'_> {
 /// Errors when any content-bearing segment of the addressed path is
 /// empty or relative, or when the path contains a backslash or any
 /// character up to and including `U+0020`, so that a path built from
-/// untrusted input cannot resolve outside the Apex REST root. A single
-/// trailing slash is kept: Apex `urlMapping` values are documented with
-/// one.
+/// untrusted input cannot resolve outside the Apex REST root; and when it
+/// contains a `#`, which would silently shorten the path the org
+/// receives. A single trailing slash is kept: Apex `urlMapping` values
+/// are documented with one.
 fn apex_path(path: &str) -> CirrusResult<String> {
     // For a special scheme, WHATWG URL parsing treats `\` as a path
     // separator, removes tab, LF and CR from anywhere in the input, and
@@ -234,14 +257,23 @@ fn apex_path(path: &str) -> CirrusResult<String> {
         });
     }
     let trimmed = path.trim_start_matches('/');
-    // The first `?` or `#` ends the path; what follows is the query
-    // string or the fragment and can't move the request off the Apex
-    // REST root. Only the part before it is worth checking — and it
-    // has to be checked, because a terminator closes the segment it
-    // follows, so `..?` is still a dot segment.
-    let addressed = trimmed
-        .find(['?', '#'])
-        .map_or(trimmed, |end| &trimmed[..end]);
+    // A fragment is never sent, so a raw `#` would shorten the path the
+    // org receives without any error; a segment that really contains
+    // one is addressed as `%23`.
+    if trimmed.contains('#') {
+        return Err(CirrusError::InvalidInput {
+            field: "Apex REST path",
+            message: "`#` starts a URL fragment, which is never sent to the server; \
+                      percent-encode it as `%23` to address a segment that contains one"
+                .into(),
+        });
+    }
+    // The first `?` ends the path; what follows is the query string and
+    // can't move the request off the Apex REST root. Only the part
+    // before it is worth checking — and it has to be checked, because
+    // the terminator closes the segment it follows, so `..?` is still a
+    // dot segment.
+    let addressed = trimmed.split_once('?').map_or(trimmed, |(path, _)| path);
     let body = addressed.strip_suffix('/').unwrap_or(addressed);
     for segment in body.split('/') {
         if segment.is_empty() || is_relative_segment(segment) {
@@ -369,12 +401,10 @@ mod tests {
             ".. ",
             "%2e%2e ",
             "Cases/..\u{0}",
-            // `?` and `#` end the path, which closes the segment in
-            // front of them — so the dot segment still resolves.
+            // `?` ends the path, which closes the segment in front of
+            // it — so the dot segment still resolves.
             "..?",
-            "..#",
             "%2e%2e?x=1",
-            "Cases/..#fragment",
         ] {
             let err = apex_path(candidate).unwrap_err();
             assert!(
@@ -395,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn apex_path_keeps_a_query_string_or_fragment() {
+    fn apex_path_keeps_a_query_string() {
         // Only `get_with_query` takes a separate query value, so an
         // inline one is the only way to put a query on the other verbs.
         assert_eq!(
@@ -406,9 +436,27 @@ mod tests {
             apex_path("Cases/12345/?foo=bar").unwrap(),
             "/services/apexrest/Cases/12345/?foo=bar"
         );
+    }
+
+    #[test]
+    fn apex_path_refuses_a_fragment() {
+        // A fragment is never sent to the server, so `Tags/C#` would
+        // reach the org as `Tags/C` and act on a different resource.
+        // Refusing it costs nothing: a segment that really contains `#`
+        // is addressed as `%23`.
+        for candidate in ["MyEndpoint#anchor", "Tags/C#", "Tags/C#?x=1"] {
+            let err = apex_path(candidate).unwrap_err();
+            match err {
+                CirrusError::InvalidInput { field, message } => {
+                    assert_eq!(field, "Apex REST path");
+                    assert!(message.contains("%23"), "{candidate:?}: {message}");
+                }
+                other => panic!("{candidate:?}: expected InvalidInput, got {other:?}"),
+            }
+        }
         assert_eq!(
-            apex_path("MyEndpoint#anchor").unwrap(),
-            "/services/apexrest/MyEndpoint#anchor"
+            apex_path("Tags/C%23").unwrap(),
+            "/services/apexrest/Tags/C%23"
         );
     }
 
@@ -424,7 +472,6 @@ mod tests {
             "Cases/12345/comments",
             "Cases/%252e%252e/comments",
             "MyEndpoint?foo=bar",
-            "MyEndpoint#anchor",
             "Cases/..%2f..%2fadmin",
         ] {
             let resolved = apex_path(candidate).unwrap();
