@@ -36,7 +36,12 @@ you need anything beyond `deployRequest`.
 - **File-based deploy/retrieve** — `deploy`, `check_deploy_status`,
   `cancel_deploy`, `deploy_recent_validation`, `retrieve`,
   `check_retrieve_status`, plus `wait_for_deploy` / `wait_for_retrieve`
-  polling helpers with configurable timeout and backoff.
+  polling helpers with configurable timeout and backoff. The helpers
+  return every terminal state as `Ok`, a failed job included;
+  `DeployResult::into_result` / `RetrieveResult::into_result` turn one
+  into `MetadataError::DeployFailed` / `RetrieveFailed` for `?`.
+  `wait_for_retrieve_done` polls without the one-shot zip fetch, for a
+  wait that has to stay cancellable.
 - **CRUD-based calls** — `create_metadata`, `read_metadata`,
   `update_metadata`, `upsert_metadata`, `delete_metadata`,
   `rename_metadata`. Up to 10 components per call, per the Metadata API
@@ -138,7 +143,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let result = md.wait_for_retrieve(&async_result.id).await?;
+    // A retrieve that ended `Failed` still comes back as `Ok`;
+    // `into_result` turns it into `MetadataError::RetrieveFailed`, whose
+    // message names the status, error code and per-file problems and
+    // which carries the full result.
+    let result = md
+        .wait_for_retrieve(&async_result.id)
+        .await?
+        .into_result()?;
 
     // `zip_file` holds the base64 payload Salesforce returns;
     // `zip_bytes()` decodes it into the actual archive.
@@ -158,7 +170,9 @@ returns the faultcode with its `sf:` prefix stripped), non-SOAP error
 bodies from proxies and gateways (`MetadataError::Http4xx5xx`),
 envelope and response-shape problems (`MetadataError::Xml`,
 `MetadataError::InvalidResponse`), client-side argument validation
-(`MetadataError::InvalidArgument`), exhausted polling budgets
+(`MetadataError::InvalidArgument`), jobs that finished without
+succeeding (`MetadataError::DeployFailed` / `RetrieveFailed`, produced by
+`into_result` and carrying the full result), exhausted polling budgets
 (`MetadataError::PollTimeout`), and auth errors
 (`MetadataError::Auth`, which is `#[from] AuthError`). Use `?` to
 propagate from any `AuthSession::access_token` call alongside SOAP

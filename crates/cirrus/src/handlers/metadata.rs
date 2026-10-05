@@ -21,16 +21,26 @@
 //! - `meta_rest_deploy_cancel` — PATCH to cancel.
 //! - `meta_rest_deploy_recentvalidation` — POST quick deploy.
 //!
-//! The SOAP and REST shapes diverge in a few names: e.g., SOAP's
-//! `DeployDetails.runTestResult` is `runTestResults` (plural) on
-//! REST. We model the REST shape here, not the SOAP one.
+//! The REST pages do not agree on two names inside `details`. The
+//! `deployResult` parameters table on `meta_rest_deploy` types the
+//! member as `DeployDetails`, whose own tables (`meta_deployresult`)
+//! name the test block `runTestResult` with a `numTestsRun` count,
+//! while the hand-written JSON examples on the check-status and cancel
+//! pages show `runTestResults` and `numRun`. No live run in this
+//! repository has settled which the wire carries, so
+//! [`DeployResultInnerDetails`] and [`RunTestResults`] accept both
+//! spellings; the Rust field names follow the examples.
 //!
 //! The `deployResult` object is not uniform across the four pages:
 //! `meta_rest_deploy` shows an inner `id`, `success` and `done`, while
 //! `meta_rest_deploy_checkstatus` and `meta_rest_deploy_cancel` show
-//! neither an inner `id` nor those flags. Every field on
-//! [`DeployResultDetails`] is therefore optional or defaulted, and the
-//! deploy id is read from [`DeployRequest::id`], which all pages show.
+//! neither an inner `id` nor those flags, although the parameters table
+//! lists both. Every field on [`DeployResultDetails`] is therefore
+//! optional or defaulted. The two flags are `Option<bool>`, and
+//! [`DeployResultDetails::is_done`] and
+//! [`DeployResultDetails::is_success`] fall back to `status` when they
+//! are absent; the deploy id is read from [`DeployRequest::id`], which
+//! all pages show.
 
 use crate::Cirrus;
 use crate::error::CirrusResult;
@@ -350,26 +360,34 @@ pub struct DeployResultDetails {
     #[serde(default)]
     pub id: Option<String>,
 
-    /// `true` once Salesforce has finished processing.
+    /// `true` once Salesforce has finished processing; `None` when the
+    /// response omits the flag, as the check-status and cancel examples
+    /// do. [`is_done`](Self::is_done) folds the two cases together.
     #[serde(default)]
-    pub done: bool,
+    pub done: Option<bool>,
 
-    /// `true` when the deployment finished successfully. Only
-    /// meaningful when `done == true`.
+    /// `true` when the deployment finished successfully; only
+    /// meaningful once done, and `None` when the response omits the
+    /// flag. [`is_success`](Self::is_success) folds the two cases
+    /// together.
     #[serde(default)]
-    pub success: bool,
+    pub success: Option<bool>,
 
     #[serde(default)]
     pub status: Option<DeployStatus>,
 
+    /// Documented default `false`, so an absent key reads as `false`.
     #[serde(default)]
     pub check_only: bool,
 
+    /// Documented default `false`, so an absent key reads as `false`.
     #[serde(default)]
     pub ignore_warnings: bool,
 
+    /// `None` when the response omits it: the documented default is
+    /// `true`, so reading an absent key as `false` would invert it.
     #[serde(default)]
-    pub rollback_on_error: bool,
+    pub rollback_on_error: Option<bool>,
 
     /// Whether Apex tests were exercised. The doc has inconsistent
     /// casing across pages — the kickoff response uses
@@ -440,14 +458,40 @@ pub struct DeployResultDetails {
     pub details: Option<DeployResultInnerDetails>,
 }
 
+impl DeployResultDetails {
+    /// Whether Salesforce has finished processing the deployment.
+    ///
+    /// Returns [`done`](Self::done) when the response carried it, and
+    /// otherwise [`DeployStatus::is_terminal`] on
+    /// [`status`](Self::status), so a finished deploy reported in the
+    /// documented status-check shape, which omits the flag, is not read
+    /// as still running. With neither present this is `false`.
+    pub fn is_done(&self) -> bool {
+        self.done
+            .unwrap_or_else(|| self.status.is_some_and(DeployStatus::is_terminal))
+    }
+
+    /// Whether the deployment finished successfully.
+    ///
+    /// Returns [`success`](Self::success) when the response carried it,
+    /// and otherwise whether [`status`](Self::status) is
+    /// [`DeployStatus::Succeeded`]; a `SucceededPartial` deploy without
+    /// the flag reports `false`. Only meaningful once
+    /// [`is_done`](Self::is_done) is `true`.
+    pub fn is_success(&self) -> bool {
+        self.success
+            .unwrap_or(self.status == Some(DeployStatus::Succeeded))
+    }
+}
+
 /// Per-component success/failure and test results inside a
 /// [`DeployResultDetails`].
 ///
 /// The component list is split into `component_failures` and
-/// `component_successes`; runs of the deployment's Apex test suite
-/// appear under `run_test_results`. Note the field name: the REST
-/// surface uses `runTestResults` (plural), while the SOAP surface
-/// uses `runTestResult` (singular).
+/// `component_successes`; the deployment's Apex test run appears under
+/// `run_test_results`. The REST pages disagree on that key: the JSON
+/// examples spell it `runTestResults`, the `DeployDetails` table they
+/// refer to spells it `runTestResult`, and both are accepted.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployResultInnerDetails {
@@ -464,7 +508,7 @@ pub struct DeployResultInnerDetails {
     #[serde(default)]
     pub retrieve_result: Option<serde_json::Value>,
 
-    #[serde(default)]
+    #[serde(default, alias = "runTestResult")]
     pub run_test_results: Option<RunTestResults>,
 }
 
@@ -522,28 +566,64 @@ pub struct DeployMessage {
 
 /// Apex test results bundled into [`DeployResultInnerDetails`].
 ///
-/// Individual `successes` / `failures` entries are left as
-/// `serde_json::Value` — the per-test schema isn't fully pinned in
-/// the REST docs, and the SOAP-side modeling in `cirrus-metadata`
-/// diverges from what the REST endpoint actually returns. Callers
-/// that need typed access can deserialize the value themselves.
+/// The per-test and coverage entries are left as `serde_json::Value`:
+/// the REST pages publish no JSON for them, so their key casing is not
+/// pinned. Callers that need typed access can deserialize the values
+/// themselves.
+//
+// Wire-shape provenance (api_meta doc page IDs): `meta_rest_deploy`
+// types `details` as DeployDetails, whose RunTestsResult table on
+// `meta_deployresult` lists `numTestsRun`, `numFailures`, `totalTime`,
+// `apexLogId`, `successes`, `failures`, `codeCoverage`,
+// `codeCoverageWarnings`, `flowCoverage` and `flowCoverageWarnings`.
+// The JSON examples on `meta_rest_deploy_checkstatus` and
+// `meta_rest_deploy_cancel` show only `numRun`, `successes` and
+// `failures`. Both count names are accepted and the Rust name follows
+// the examples; no live run in this repository has settled which one
+// the wire carries.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestResults {
-    #[serde(default)]
+    /// Number of tests run. Read from the examples' `numRun` or the
+    /// RunTestsResult table's `numTestsRun`.
+    #[serde(default, alias = "numTestsRun")]
     pub num_run: i32,
 
     #[serde(default)]
     pub num_failures: i32,
 
+    /// Cumulative test time in milliseconds.
     #[serde(default)]
     pub total_time: f64,
+
+    /// Id of the ApexLog written for the run, when a trace flag was
+    /// active on the running user or an executed class.
+    #[serde(default)]
+    pub apex_log_id: Option<String>,
 
     #[serde(default)]
     pub successes: Vec<serde_json::Value>,
 
     #[serde(default)]
     pub failures: Vec<serde_json::Value>,
+
+    /// Per-class coverage (`CodeCoverageResult[]`).
+    #[serde(default)]
+    pub code_coverage: Vec<serde_json::Value>,
+
+    /// Coverage warnings (`CodeCoverageWarning[]`), including the
+    /// org-wide threshold warning that fails a deploy with no
+    /// component or test errors.
+    #[serde(default)]
+    pub code_coverage_warnings: Vec<serde_json::Value>,
+
+    /// Flow coverage results (`FlowCoverageResult[]`, API 44.0+).
+    #[serde(default)]
+    pub flow_coverage: Vec<serde_json::Value>,
+
+    /// Flow coverage warnings (`FlowCoverageWarning[]`, API 44.0+).
+    #[serde(default)]
+    pub flow_coverage_warnings: Vec<serde_json::Value>,
 }
 
 /// Lifecycle state of a deployment.
@@ -599,7 +679,9 @@ mod tests {
     use crate::auth::StaticTokenAuth;
     use serde_json::json;
     use std::sync::Arc;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fixture(uri: String) -> Cirrus {
@@ -670,7 +752,13 @@ mod tests {
         // deployResult.
         assert_eq!(result.id.as_deref(), Some("0Afxx00000001VPCAY"));
         assert_eq!(result.status, Some(DeployStatus::Pending));
-        assert!(!result.done);
+        // The kickoff page is also the one example that carries the
+        // flags; they are reported as present, not inferred.
+        assert_eq!(result.done, Some(false));
+        assert!(!result.is_done());
+        assert_eq!(result.success, Some(false));
+        assert!(!result.is_success());
+        assert_eq!(result.rollback_on_error, Some(true));
         // runAllTests field in deploy_options is informational; ensure
         // it's preserved untyped.
         let opts = req.deploy_options.expect("echoed options");
@@ -785,10 +873,21 @@ mod tests {
         assert!(details.component_failures.is_empty());
         let tests = details.run_test_results.unwrap();
         assert_eq!(tests.num_run, 0);
+        assert!(tests.code_coverage.is_empty());
+        assert!(tests.code_coverage_warnings.is_empty());
+        assert!(tests.flow_coverage.is_empty());
+        assert!(tests.flow_coverage_warnings.is_empty());
+        assert!(tests.apex_log_id.is_none());
     }
 
     /// Without `include_details`, the query string is omitted so
-    /// Salesforce returns the lean envelope.
+    /// Salesforce returns the lean envelope. The body is the
+    /// `meta_rest_deploy_checkstatus` example with its `details` member
+    /// removed and `status` set to `Succeeded`; like the example it
+    /// carries neither `done` nor `success`, so the accessors have to
+    /// read the outcome off `status`.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy_checkstatus.htm
     #[tokio::test]
     async fn check_deploy_status_without_details_omits_query() {
         let server = MockServer::start().await;
@@ -796,14 +895,36 @@ mod tests {
             .and(path(
                 "/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ",
             ))
+            .and(query_param_is_missing("includeDetails"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "0Afxx00000000lWCAQ",
+                "url": "https://host/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ",
                 "deployResult": {
+                    "checkOnly": false,
+                    "ignoreWarnings": false,
+                    "rollbackOnError": false,
                     "status": "Succeeded",
-                    "done": true,
-                    "success": true
+                    "numberComponentsDeployed": 10,
+                    "numberComponentsTotal": 1032,
+                    "numberComponentErrors": 0,
+                    "numberTestsCompleted": 45,
+                    "numberTestsTotal": 135,
+                    "numberTestErrors": 0,
+                    "createdDate": "2017-10-10T08:22Z",
+                    "startDate": "2017-10-10T08:22Z",
+                    "lastModifiedDate": "2017-10-10T08:44Z",
+                    "completedDate": "2017-10-10T08:44Z",
+                    "errorStatusCode": null,
+                    "errorMessage": null,
+                    "stateDetail": "Processing Type: Apex Component",
+                    "createdBy": "005xx0000001Sv1m",
+                    "createdByName": "stephanie stevens",
+                    "canceledBy": null,
+                    "canceledByName": null,
+                    "isRunTestsEnabled": false
                 }
             })))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -816,9 +937,137 @@ mod tests {
         let r = req.deploy_result.unwrap();
         assert!(r.id.is_none());
         assert_eq!(r.status, Some(DeployStatus::Succeeded));
-        assert!(r.done);
-        assert!(r.success);
+        assert_eq!(r.done, None);
+        assert!(r.is_done());
+        assert_eq!(r.success, None);
+        assert!(r.is_success());
+        assert_eq!(r.rollback_on_error, Some(false));
         assert!(r.details.is_none());
+    }
+
+    /// The check-status and cancel examples omit `done` and `success`
+    /// while the `deployResult` parameters table lists both, so an
+    /// absent flag is read off `status` rather than as `false`.
+    #[test]
+    fn absent_done_and_success_fall_back_to_status() {
+        for (status, done, success) in [
+            ("Pending", false, false),
+            ("InProgress", false, false),
+            ("FinalizingDeploy", false, false),
+            ("Canceling", false, false),
+            ("Succeeded", true, true),
+            ("SucceededPartial", true, false),
+            ("Failed", true, false),
+            ("Canceled", true, false),
+            ("FinalizingDeployFailed", true, false),
+            ("BrandNewPhase", false, false),
+        ] {
+            let r: DeployResultDetails =
+                serde_json::from_value(json!({ "status": status })).unwrap();
+            assert_eq!(r.done, None, "{status}");
+            assert_eq!(r.success, None, "{status}");
+            assert_eq!(r.is_done(), done, "{status}");
+            assert_eq!(r.is_success(), success, "{status}");
+        }
+        // Neither flag nor status: nothing says the deploy finished.
+        let r: DeployResultDetails = serde_json::from_value(json!({})).unwrap();
+        assert!(!r.is_done());
+        assert!(!r.is_success());
+    }
+
+    #[test]
+    fn present_done_and_success_flags_win_over_status() {
+        let r: DeployResultDetails = serde_json::from_value(json!({
+            "status": "SucceededPartial",
+            "done": true,
+            "success": true
+        }))
+        .unwrap();
+        assert_eq!(r.done, Some(true));
+        assert!(r.is_done());
+        assert_eq!(r.success, Some(true));
+        assert!(r.is_success());
+
+        let r: DeployResultDetails = serde_json::from_value(json!({
+            "status": "Succeeded",
+            "done": false,
+            "success": false
+        }))
+        .unwrap();
+        assert!(!r.is_done());
+        assert!(!r.is_success());
+    }
+
+    /// The `deployResult` parameters table on `meta_rest_deploy`
+    /// documents `rollbackOnError` as "Defaults to true", so an omitted
+    /// key must not read as `false`.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy.htm
+    #[test]
+    fn absent_rollback_on_error_is_none_not_false() {
+        let r: DeployResultDetails =
+            serde_json::from_value(json!({ "status": "Pending" })).unwrap();
+        assert_eq!(r.rollback_on_error, None);
+        let r: DeployResultDetails =
+            serde_json::from_value(json!({ "rollbackOnError": true })).unwrap();
+        assert_eq!(r.rollback_on_error, Some(true));
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    /// `meta_rest_deploy` types `details` as DeployDetails, whose table
+    /// names the test block "runTestResult | RunTestsResult"; the
+    /// RunTestsResult table counts "numTestsRun" and lists `apexLogId`,
+    /// `codeCoverage`, `codeCoverageWarnings`, `flowCoverage` and
+    /// `flowCoverageWarnings` alongside `successes` and `failures`.
+    #[test]
+    fn details_accept_the_deploy_details_names_and_keep_coverage() {
+        let details: DeployResultInnerDetails = serde_json::from_value(json!({
+            "componentFailures": [],
+            "componentSuccesses": [],
+            "runTestResult": {
+                "numTestsRun": 12,
+                "numFailures": 1,
+                "totalTime": 4321.0,
+                "apexLogId": "07Lxx0000000001",
+                "successes": [
+                    { "name": "AccountServiceTest", "methodName": "createsAccount" }
+                ],
+                "failures": [
+                    {
+                        "name": "AccountServiceTest",
+                        "methodName": "rejectsDuplicate",
+                        "message": "System.AssertException: Assertion Failed"
+                    }
+                ],
+                "codeCoverage": [
+                    { "name": "AccountService", "numLocations": 40, "numLocationsNotCovered": 4 }
+                ],
+                "codeCoverageWarnings": [
+                    { "message": "Average test coverage across all Apex Classes and Triggers is 61%, at least 75% test coverage is required." }
+                ],
+                "flowCoverage": [],
+                "flowCoverageWarnings": []
+            }
+        }))
+        .unwrap();
+        let tests = details
+            .run_test_results
+            .expect("the DeployDetails spelling is accepted");
+        assert_eq!(tests.num_run, 12);
+        assert_eq!(tests.num_failures, 1);
+        assert_eq!(tests.total_time, 4321.0);
+        assert_eq!(tests.apex_log_id.as_deref(), Some("07Lxx0000000001"));
+        assert_eq!(tests.successes.len(), 1);
+        assert_eq!(tests.failures.len(), 1);
+        assert_eq!(tests.code_coverage[0]["numLocationsNotCovered"], json!(4));
+        assert!(
+            tests.code_coverage_warnings[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("61%")
+        );
+        assert!(tests.flow_coverage.is_empty());
+        assert!(tests.flow_coverage_warnings.is_empty());
     }
 
     /// Wire shape per the `meta_rest_deploy_cancel` example. PATCH body
