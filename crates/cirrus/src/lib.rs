@@ -173,6 +173,15 @@ impl std::fmt::Debug for Cirrus {
     }
 }
 
+/// What a JSON request to an already-resolved URL carries besides its
+/// method: the optional query, extra request headers and the optional
+/// JSON body. Bundled so the send paths pass one value around.
+struct JsonRequest<'a, Q: ?Sized, B: ?Sized> {
+    query: Option<&'a Q>,
+    headers: &'a [(&'a str, &'a str)],
+    body: Option<&'a B>,
+}
+
 /// Outcome of the shared 401 auth-refresh decision run at the tail of
 /// every send path.
 enum AuthRetry {
@@ -603,6 +612,31 @@ impl Cirrus {
             .await
     }
 
+    /// [`Self::send_at_with_replay`] with a caller-supplied response
+    /// parser, for a handler whose endpoint documents a typed non-2xx body.
+    pub(crate) async fn send_at_parsed<R, Q, B, P>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        query: Option<&Q>,
+        body: Option<&B>,
+        replay: Replay,
+        parse: P,
+    ) -> CirrusResult<R>
+    where
+        Q: Serialize + ?Sized,
+        B: Serialize + ?Sized,
+        P: Fn(u16, &[u8]) -> CirrusResult<R> + Send + Sync,
+    {
+        let parts = JsonRequest {
+            query,
+            headers: &[],
+            body,
+        };
+        self.send_resolved_with(method, url, parts, replay, parse)
+            .await
+    }
+
     /// Returns a pre-authenticated [`reqwest::RequestBuilder`] targeting
     /// the resolved URL. Path resolution follows
     /// [`Cirrus`]'s three-mode semantics; the bearer
@@ -861,24 +895,54 @@ impl Cirrus {
         Q: Serialize + ?Sized,
         B: Serialize + ?Sized,
     {
+        let parts = JsonRequest {
+            query,
+            headers,
+            body,
+        };
+        self.send_resolved_with(method, url, parts, replay, |status, bytes| {
+            response::parse_response_bytes(status, bytes)
+        })
+        .await
+    }
+
+    /// [`Self::send_resolved`] with a caller-supplied parser for the
+    /// terminal response, for an endpoint whose non-2xx body is a
+    /// documented typed shape rather than the standard error array (the
+    /// sObject Tree rollback, which arrives as HTTP 400). The parser sees
+    /// every response the retry loop lets through; retry, the 401 refresh
+    /// and limit-info capture are unchanged.
+    async fn send_resolved_with<R, Q, B, P>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        parts: JsonRequest<'_, Q, B>,
+        replay: retry::Replay,
+        parse: P,
+    ) -> CirrusResult<R>
+    where
+        Q: Serialize + ?Sized,
+        B: Serialize + ?Sized,
+        P: Fn(u16, &[u8]) -> CirrusResult<R> + Send + Sync,
+    {
         self.dispatch(
             &method,
             url,
             replay,
             |token: &str| {
                 let mut request = self.client.request(method.clone(), url).bearer_auth(token);
-                for (name, value) in headers {
+                for (name, value) in parts.headers {
                     request = request.header(*name, *value);
                 }
-                if let Some(q) = query {
+                if let Some(q) = parts.query {
                     request = request.query(q);
                 }
-                if let Some(b) = body {
+                if let Some(b) = parts.body {
                     request = request.json(b);
                 }
                 Ok(request)
             },
-            |status, _headers, bytes| response::parse_response_bytes(status, &bytes),
+            |status, _headers, bytes| parse(status, &bytes),
         )
         .await
     }

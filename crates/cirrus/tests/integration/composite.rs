@@ -4,8 +4,10 @@
 //! Covers:
 //! - `composite/sobjects` create + delete (Salesforce's "SObject
 //!   Collections" — bulk-create up to 200 records per call).
-//! - `composite/batch` — heterogeneous subrequests with shared
-//!   transaction semantics.
+//! - `composite/batch` — heterogeneous subrequests that run in order and
+//!   commit independently; a later failure never rolls back an earlier
+//!   subrequest. All-or-nothing behaviour is `/composite` with
+//!   `allOrNone: true`.
 //!
 //! Doesn't cover (deferred):
 //! - `composite/tree` — requires constructing a referenced-record graph

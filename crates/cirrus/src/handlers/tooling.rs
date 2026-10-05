@@ -60,10 +60,6 @@
 //!
 //! # What this handler doesn't expose
 //!
-//! - `tooling/composite` — chained Tooling subrequests. Reach for the
-//!   regular [`Cirrus::composite`] handler with
-//!   `tooling/sobjects/...` paths in subrequest URLs, or use the
-//!   open-ended client escape hatch.
 //! - Upsert by external ID on Tooling-API metadata.
 //! - `runTests` / `runTestsAsync`. Test runs go through
 //!   `/services/data/{version}/tooling/runTestsAsynchronous/` and friends,
@@ -72,7 +68,8 @@
 use crate::Cirrus;
 use crate::error::CirrusResult;
 use crate::response::{
-    DescribeGlobal, ExecuteAnonymousResult, QueryResult, SObjectCreateResult, SearchResult,
+    CompositeResponse, DescribeGlobal, ExecuteAnonymousResult, QueryResult, SObjectCreateResult,
+    SearchResult,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -117,6 +114,27 @@ impl<'a> ToolingHandler<'a> {
     /// data sObjects (`Account`, `Contact`, …).
     pub async fn describe_global(&self) -> CirrusResult<DescribeGlobal> {
         self.client.get("tooling/sobjects").await
+    }
+
+    /// Executes up to 25 chained Tooling subrequests in one call via
+    /// `POST /services/data/{api_version}/tooling/composite`.
+    ///
+    /// Subrequest URLs must start with `/services/data/vXX.X/tooling`, and
+    /// at most five of them may be query operations. The body is a
+    /// [`CompositeRequest`](crate::CompositeRequest) or any `Serialize`
+    /// value of the same shape; the response is the same
+    /// [`CompositeResponse`] envelope the data-tier `/composite` returns.
+    ///
+    /// The data-tier endpoint documents only the sObject, Query, QueryAll
+    /// and sObject Collections resources as subrequest targets, so a
+    /// Tooling chain — `MetadataContainer`, `ApexClassMember`,
+    /// `ContainerAsyncRequest` — belongs here, not in
+    /// [`Cirrus::composite`].
+    pub async fn composite<B>(&self, body: &B) -> CirrusResult<CompositeResponse>
+    where
+        B: Serialize + ?Sized,
+    {
+        self.client.post("tooling/composite", body).await
     }
 
     /// Returns a handler scoped to a single Tooling-API sObject by API
@@ -368,6 +386,52 @@ mod tests {
     fn fixture(uri: String) -> Cirrus {
         let auth = Arc::new(StaticTokenAuth::new("tok", uri));
         Cirrus::builder().auth(auth).build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn composite_posts_to_the_tooling_composite_resource() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_responses_composite_composite.htm
+        // "Composite Subrequest Result" JSON example, verbatim, as the
+        // only entry of the documented `compositeResponse` envelope.
+        let server = MockServer::start().await;
+        let request = json!({
+            "allOrNone": true,
+            "compositeRequest": [{
+                "method": "POST",
+                "url": "/services/data/v66.0/tooling/sobjects/apexclassmember/",
+                "referenceId": "apexclassmember_reference_id",
+                "body": {
+                    "MetadataContainerId": "1dcxx",
+                    "ContentEntityId": "01pxx",
+                    "Body": "public class Foo {}"
+                }
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/tooling/composite"))
+            .and(body_json(request.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "compositeResponse": [{
+                    "body": {"id": "001R00000033I6AIAU", "success": true, "errors": []},
+                    "httpHeaders": {
+                        "Location": "/services/data/v40.0/tooling/sobjects/apexclassmember/001R00000033I6AIAU"
+                    },
+                    "httpStatusCode": 201,
+                    "referenceId": "apexclassmember_reference_id"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let resp = sf.tooling().composite(&request).await.unwrap();
+        assert_eq!(resp.composite_response.len(), 1);
+        let created = &resp.composite_response[0];
+        assert_eq!(created.http_status_code, 201);
+        assert!(created.is_success());
+        assert_eq!(created.reference_id, "apexclassmember_reference_id");
+        assert_eq!(created.body["id"], "001R00000033I6AIAU");
     }
 
     #[tokio::test]

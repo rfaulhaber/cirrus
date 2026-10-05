@@ -796,8 +796,10 @@ pub struct CompositeError {
 /// Unlike [`BatchResponse`] / [`CompositeTreeResponse`], there is *no*
 /// top-level `hasErrors` flag — callers iterate
 /// [`composite_response`](Self::composite_response) and check each
-/// subresponse's [`http_status_code`](CompositeSubresponse::http_status_code)
-/// (or use [`CompositeSubresponse::is_success`]). The transactional
+/// subresponse's [`http_status_code`](CompositeSubresponse::http_status_code),
+/// or use [`CompositeSubresponse::is_success`] and
+/// [`CompositeSubresponse::is_error`]. A conditional request's 304 is a
+/// success and a 300 is neither; see those methods. The transactional
 /// rollback flag is on the *request* side (`allOrNone`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompositeResponse {
@@ -836,37 +838,58 @@ pub struct CompositeSubresponse {
 }
 
 impl CompositeSubresponse {
-    /// `true` if this sub-request succeeded (`http_status_code` in 200..300).
+    /// `true` when the sub-request did what it was asked: a 2xx, or a 304
+    /// Not Modified answering a conditional request. Salesforce's own
+    /// composite example sends `If-Modified-Since` on a describe and lists
+    /// the resulting 304 in a response it calls successful. A 300 Multiple
+    /// Choices — several records matched an external ID — is neither a
+    /// success nor an [`error`](Self::is_error); inspect `body`.
     pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.http_status_code)
+        (200..300).contains(&self.http_status_code) || self.http_status_code == 304
+    }
+
+    /// `true` when the sub-request failed: a 4xx or 5xx, which is how
+    /// Salesforce defines an erroring subrequest ("an HTTP status code in
+    /// the 400 or 500 range").
+    pub fn is_error(&self) -> bool {
+        (400..600).contains(&self.http_status_code)
     }
 }
 
 /// One per-record entry in the array returned by `/composite/sobjects`
 /// (create / update / upsert / delete).
 ///
-/// Unlike [`CompositeTreeResponse`], this endpoint does *not* roll back
-/// on partial failure when `allOrNone: false` (the default). Each record
-/// gets its own success/error result and a successful record's `id` is
-/// populated even when sibling records in the same call failed.
+/// `success` is the only signal that a write happened. With `allOrNone:
+/// false` (the default) each record stands alone: a successful record's
+/// `id` is populated even when siblings in the same call failed. With
+/// `allOrNone: true` one failure rolls every record back, and the
+/// rolled-back entries carry `success: false` with an
+/// `ALL_OR_NONE_OPERATION_ROLLED_BACK` error — and, on update, upsert and
+/// delete, still carry their `id`.
 ///
-/// `created` is populated only by the upsert endpoint — `Some(true)`
-/// when an upsert inserted a new record, `Some(false)` when it updated
-/// an existing one. Absent on plain create/update/delete.
+/// `created` is reported only by the upsert endpoint, and not on every
+/// entry: `Some(true)` when the upsert inserted a record, `Some(false)`
+/// when it updated one, and absent on some successful entries in the
+/// documented responses as well as on failures and on create, update and
+/// delete.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SObjectCollectionResult {
-    /// Salesforce ID of the affected record. `None` when this entry
-    /// represents a failure (no record was created/updated).
+    /// Salesforce ID of the record. Absent when no record could be
+    /// identified — a failed create, a malformed ID — but present on a
+    /// rolled-back update, upsert or delete even though `success` is
+    /// `false`, so it does not by itself mean a write stuck.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// `true` when the per-record operation succeeded.
+    /// `true` when the per-record operation succeeded and was not rolled
+    /// back.
     pub success: bool,
     /// Errors for this record. Populated only when `success` is `false`;
     /// uses the diverged composite error shape ([`CompositeError`]).
     #[serde(default)]
     pub errors: Vec<CompositeError>,
     /// `true` if an upsert inserted a new record, `false` if it updated
-    /// an existing one. Always `None` for non-upsert calls.
+    /// an existing one. `None` on every non-upsert call and on some
+    /// successful upsert entries, so `None` means unknown, not "updated".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<bool>,
 }
@@ -1888,46 +1911,154 @@ mod tests {
     }
 
     #[test]
-    fn parses_composite_response_with_per_subrequest_results() {
-        // Documented chain: POST account, then GET it back, then PATCH a
-        // related record using @{ref.id} binding. Each subresponse echoes
-        // its referenceId and carries headers/status from the inner call.
+    fn parses_the_documented_composite_response_including_its_304_entry() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_composite_record_manipulation.htm
+        // "Response body after successfully executing the composite
+        // request", verbatim apart from the prose placeholder the page
+        // uses for the account body. The last subrequest sent
+        // If-Modified-Since and came back 304 Not Modified with a null
+        // body: on a request the page calls successful, that entry is not
+        // a failure.
         let body = json!({
-            "compositeResponse": [
-                {
-                    "body": {"id": "001RM000003oCprYAE", "success": true, "errors": []},
-                    "httpHeaders": {"Location": "/services/data/v66.0/sobjects/Account/001RM000003oCprYAE"},
-                    "httpStatusCode": 201,
-                    "referenceId": "NewAccount"
+            "compositeResponse": [{
+                "body": {"id": "001R00000033JNuIAM", "success": true, "errors": []},
+                "httpHeaders": {"Location": "/services/data/v67.0/sobjects/Account/001R00000033JNuIAM"},
+                "httpStatusCode": 201,
+                "referenceId": "NewAccount"
+            }, {
+                "body": {"attributes": {"type": "Account"}, "Id": "001R00000033JNuIAM", "Name": "Acme"},
+                "httpHeaders": {
+                    "ETag": "\"Jbjuzw7dbhaEG3fd90kJbx6A0ow=\"",
+                    "Last-Modified": "Fri, 22 Jul 2016 20:19:37 GMT"
                 },
-                {
-                    "body": {"attributes": {"type": "Account"}, "Id": "001RM000003oCprYAE", "Name": "Acme"},
-                    "httpHeaders": {},
-                    "httpStatusCode": 200,
-                    "referenceId": "AccountInfo"
+                "httpStatusCode": 200,
+                "referenceId": "NewAccountInfo"
+            }, {
+                "body": {"id": "003R00000025REHIA2", "success": true, "errors": []},
+                "httpHeaders": {"Location": "/services/data/v67.0/sobjects/Contact/003R00000025REHIA2"},
+                "httpStatusCode": 201,
+                "referenceId": "NewContact"
+            }, {
+                "body": {
+                    "attributes": {"type": "User", "url": "/services/data/v67.0/sobjects/User/005R0000000I90CIAS"},
+                    "Name": "Jane Doe",
+                    "CompanyName": "Salesforce",
+                    "Title": "Director",
+                    "City": "San Francisco",
+                    "State": "CA",
+                    "Id": "005R0000000I90CIAS"
                 },
-                {
-                    "body": null,
-                    "httpHeaders": {},
-                    "httpStatusCode": 204,
-                    "referenceId": "ContactPatch"
-                }
-            ]
+                "httpHeaders": {},
+                "httpStatusCode": 200,
+                "referenceId": "NewAccountOwner"
+            }, {
+                "body": null,
+                "httpHeaders": {
+                    "ETag": "\"f2293620\"",
+                    "Last-Modified": "Fri, 22 Jul 2016 18:45:56 GMT"
+                },
+                "httpStatusCode": 304,
+                "referenceId": "AccountMetadata"
+            }]
         })
         .to_string();
         let resp: CompositeResponse = parse_response_bytes(200, body.as_bytes()).unwrap();
-        assert_eq!(resp.composite_response.len(), 3);
-        assert!(resp.composite_response.iter().all(|r| r.is_success()));
+        assert_eq!(resp.composite_response.len(), 5);
         assert_eq!(resp.composite_response[0].reference_id, "NewAccount");
         assert_eq!(
             resp.composite_response[0]
                 .http_headers
                 .get("Location")
                 .and_then(|v| v.to_str().ok()),
-            Some("/services/data/v66.0/sobjects/Account/001RM000003oCprYAE")
+            Some("/services/data/v67.0/sobjects/Account/001R00000033JNuIAM")
         );
         assert_eq!(resp.composite_response[1].body["Name"], "Acme");
-        assert!(resp.composite_response[2].body.is_null());
+        let cached = &resp.composite_response[4];
+        assert_eq!(cached.http_status_code, 304);
+        assert!(cached.body.is_null());
+        assert!(
+            resp.composite_response.iter().all(|r| r.is_success()),
+            "a 304 on a conditional subrequest is not a failure"
+        );
+    }
+
+    #[test]
+    fn composite_subresponse_classifies_304_as_success_and_300_as_neither() {
+        fn sub(code: u16) -> CompositeSubresponse {
+            CompositeSubresponse {
+                body: serde_json::Value::Null,
+                http_headers: HeaderMap::new(),
+                http_status_code: code,
+                reference_id: "r".into(),
+            }
+        }
+        assert!(sub(201).is_success() && !sub(201).is_error());
+        assert!(sub(304).is_success() && !sub(304).is_error());
+        assert!(!sub(300).is_success() && !sub(300).is_error());
+        assert!(!sub(400).is_success() && sub(400).is_error());
+        assert!(!sub(500).is_success() && sub(500).is_error());
+    }
+
+    #[test]
+    fn parses_collections_rollback_entries_that_keep_their_ids() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_update.htm
+        // "Example Response Body (Some Items Failed and allOrNone is true)",
+        // verbatim. The delete and upsert pages show the same shape: the
+        // rolled-back record keeps its id, so only `success` says whether
+        // the write stuck.
+        let body = json!([{
+            "id": "001RM000003oCprYAE",
+            "success": false,
+            "errors": [{
+                "statusCode": "ALL_OR_NONE_OPERATION_ROLLED_BACK",
+                "message": "Record rolled back because not all records were valid and the request was using AllOrNone header",
+                "fields": []
+            }]
+        }, {
+            "success": false,
+            "errors": [{
+                "statusCode": "MALFORMED_ID",
+                "message": "Contact ID: id value of incorrect type: 001xx000003DGb2999",
+                "fields": ["Id"]
+            }]
+        }])
+        .to_string();
+        let results: Vec<SObjectCollectionResult> =
+            parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(results[0].id.as_deref(), Some("001RM000003oCprYAE"));
+        assert!(!results[0].success);
+        assert_eq!(
+            results[0].errors[0].status_code,
+            "ALL_OR_NONE_OPERATION_ROLLED_BACK"
+        );
+        assert!(results[1].id.is_none());
+        assert!(!results[1].success);
+        assert_eq!(results[1].errors[0].fields, vec!["Id".to_string()]);
+    }
+
+    #[test]
+    fn parses_an_upsert_success_without_a_created_flag() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_upsert.htm
+        // "Example Response Body (Some Items Failed and allOrNone is false)",
+        // verbatim: the successful entry carries no `created`.
+        let body = json!([{
+            "id": "001xx0000004GxDAAU",
+            "success": true,
+            "errors": []
+        }, {
+            "success": false,
+            "errors": [{
+                "statusCode": "MALFORMED_ID",
+                "message": "Contact ID: id value of incorrect type: 001xx0000004GxEAAU",
+                "fields": ["Id"]
+            }]
+        }])
+        .to_string();
+        let results: Vec<SObjectCollectionResult> =
+            parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert!(results[0].success);
+        assert_eq!(results[0].id.as_deref(), Some("001xx0000004GxDAAU"));
+        assert!(results[0].created.is_none());
     }
 
     #[test]
