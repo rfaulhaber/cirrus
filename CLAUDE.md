@@ -27,6 +27,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - All five priority OAuth flows: JWT Bearer (RFC 7523), Refresh Token (RFC 6749 §6), Client Credentials (RFC 6749 §4.4), Web Server with PKCE (RFC 6749 §4.1 + RFC 7636), Token Exchange (RFC 8693).
 - `StaticTokenAuth` for paste-from-`sf-org-display` workflows and tests.
 - Shared `AuthSession` trait, `SharedAuth = Arc<dyn AuthSession>` alias, automatic compare-and-swap on `invalidate`.
+- Caching flows share one mint outcome among callers queued behind it (`src/mint.rs`), fall back to a still-valid cached token when a refresh inside the 60 s margin fails transiently, and retry the token request (connect failures for every grant; 429/5xx and lost responses too for JWT and client credentials, never for refresh, authorization code or token exchange). JWT signing binds to jsonwebtoken's aws-lc-rs provider directly, not the process-global one.
 
 `cirrus-metadata`:
 - File-based: `deploy`, `check_deploy_status`, `cancel_deploy`, `deploy_recent_validation`, `retrieve`, `check_retrieve_status`, plus `wait_for_deploy` / `wait_for_retrieve` polling helpers.

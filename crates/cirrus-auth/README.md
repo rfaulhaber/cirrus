@@ -105,6 +105,34 @@ loopback literals are excepted for local test servers, and `*.localhost`
 names are not. The same rule, `cirrus_auth::transport::is_secure_transport`,
 governs instance URLs in `cirrus` and `cirrus-metadata`.
 
+Token requests are retried a bounded number of times (two retries, 250 ms
+then 500 ms apart). A connect failure retries for every grant. A 429, a 5xx
+and a lost response retry only for the JWT bearer and client-credentials
+grants, which have no side effect to duplicate; the refresh, authorization
+code and token-exchange grants are never re-sent once the request has left
+the client, because the answer that was lost may have rotated or consumed
+the credential.
+
+## Token caching
+
+`JwtAuth`, `ClientCredentialsAuth` and `RefreshTokenAuth` cache the access
+token and mint single-flight: callers that arrive while a mint is in flight
+share its outcome, success or failure, so one slow or failing token
+endpoint costs one grant per window rather than one per caller. When a
+proactive refresh inside the 60 s expiry margin fails transiently, the
+still-valid cached token is returned with a warning; an OAuth error such as
+`invalid_grant` is never masked. `AuthError::is_transient` is the same
+classification, exposed for callers.
+
+## Crypto backend
+
+JWT assertions are signed through jsonwebtoken's aws-lc-rs backend directly
+rather than its process-global crypto provider. A build that also enables
+jsonwebtoken's `rust_crypto` feature for its own purposes therefore does not
+affect token minting here, although jsonwebtoken itself requires exactly one
+backend or an explicitly installed provider for its own `encode` and
+`decode`.
+
 `cirrus` carries a `From<AuthError> for CirrusError` impl, so REST call
 sites that need an auth token can use `?` and surface the failure as
 `CirrusError::Auth(AuthError)` without extra plumbing.

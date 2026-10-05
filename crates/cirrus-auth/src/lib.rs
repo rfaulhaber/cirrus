@@ -48,6 +48,7 @@ use std::sync::Arc;
 pub mod client_credentials;
 mod error;
 pub mod jwt;
+mod mint;
 pub mod refresh;
 pub mod static_token;
 mod token_endpoint;

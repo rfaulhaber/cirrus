@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 /// treated as already expired and re-minted proactively, so an in-flight
 /// request never lands at Salesforce with a token that expired in transit.
 /// This trades a slightly earlier refresh for eliminating a class of
-/// avoidable 401 round-trips at every TTL boundary.
+/// avoidable 401 round-trips at every TTL boundary. The margin is not a
+/// hard cut-off: when the proactive refresh fails transiently, the flows
+/// keep using the cached token until its estimated expiry
+/// (see [`crate::mint`]).
 pub(super) const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
 /// Successful token-endpoint response.
@@ -228,27 +231,124 @@ impl std::fmt::Debug for OAuthErrorResponse {
     }
 }
 
+/// Whether a grant may be presented again after an attempt whose outcome
+/// is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GrantReplay {
+    /// Presenting the grant again has no side effect: a JWT bearer
+    /// assertion stays valid for its whole window and Salesforce does not
+    /// bind it to one use, and client credentials are not consumed. A 429,
+    /// a 5xx and an ambiguous transport failure all retry.
+    Safe,
+    /// Presenting the grant again could consume or revoke something: an
+    /// authorization code is single-use, a refresh token may have been
+    /// rotated away by the attempt whose answer was lost, and a token
+    /// exchange may issue tokens on every call. Only a failure where the
+    /// request never left the client retries.
+    Never,
+}
+
+/// Retries after the first token request, and the pause before each.
+///
+/// A mint therefore takes at most three request timeouts plus 750 ms. The
+/// budget is deliberately small: the consumers' own retry policies do not
+/// cover the mint, which runs before their request loop starts, and a
+/// token endpoint that is down for longer than this should fail the call
+/// rather than hold every request on the session.
+const TOKEN_REQUEST_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(500)];
+
+/// Whether a failed send or a body that died mid-stream may be retried.
+///
+/// A request that could not be built fails the same way every time. A
+/// connect-phase failure means nothing reached the server, so it retries
+/// for every grant. Anything else is ambiguous and retries only for a
+/// grant that is safe to replay.
+fn transport_failure_is_retryable(error: &reqwest::Error, replay: GrantReplay) -> bool {
+    if error.is_builder() {
+        return false;
+    }
+    if error.is_connect() {
+        return true;
+    }
+    replay == GrantReplay::Safe
+}
+
 /// POSTs a token-exchange form body to `{login_url}/services/oauth2/token`
 /// and parses the response.
 ///
 /// The caller assembles the form body with the flow-specific fields
-/// (`grant_type`, `assertion`, `refresh_token`, etc.). On non-2xx, the body
-/// is parsed as the OAuth error shape if possible; otherwise only the
-/// status is surfaced as [`AuthError::UnexpectedResponse`] — the body is
-/// logged at TRACE rather than carried, since non-standard error pages can
-/// echo credentials.
+/// (`grant_type`, `assertion`, `refresh_token`, etc.) and says whether the
+/// grant is safe to replay. A connect failure is retried for every grant;
+/// a 429, a 5xx and an ambiguous transport failure are retried only for a
+/// [`GrantReplay::Safe`] grant, up to [`TOKEN_REQUEST_BACKOFF`]'s budget.
+/// On a terminal non-2xx, the body is parsed as the OAuth error shape if
+/// possible; otherwise only the status is surfaced as
+/// [`AuthError::UnexpectedResponse`] — the body is logged at TRACE rather
+/// than carried, since non-standard error pages can echo credentials.
 pub(super) async fn exchange<B>(
     http: &reqwest::Client,
     login_url: &str,
     body: &B,
+    replay: GrantReplay,
 ) -> AuthResult<TokenResponse>
 where
     B: Serialize + ?Sized,
 {
     let url = format!("{login_url}/services/oauth2/token");
-    let response = http.post(&url).form(body).send().await?;
-    let status = response.status().as_u16();
-    let bytes = response.bytes().await?;
+    let mut attempt = 0usize;
+    let (status, bytes) = loop {
+        // `None` once the budget is spent: the attempt below is the last.
+        let backoff = TOKEN_REQUEST_BACKOFF.get(attempt).copied();
+        let response = match (http.post(&url).form(body).send().await, backoff) {
+            (Ok(response), _) => response,
+            (Err(e), Some(delay)) if transport_failure_is_retryable(&e, replay) => {
+                tracing::warn!(
+                    target: "cirrus::auth",
+                    attempt = attempt + 1,
+                    error = %e,
+                    "token request failed in transport; retrying",
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+            (Err(e), _) => return Err(e.into()),
+        };
+        let status = response.status().as_u16();
+        let bytes = match (response.bytes().await, backoff) {
+            (Ok(bytes), _) => bytes,
+            // A body that dies mid-stream is as ambiguous as a lost
+            // response: the server may already have acted on the grant.
+            (Err(e), Some(delay)) if replay == GrantReplay::Safe => {
+                tracing::warn!(
+                    target: "cirrus::auth",
+                    attempt = attempt + 1,
+                    error = %e,
+                    "token response body failed mid-stream; retrying",
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+            (Err(e), _) => return Err(e.into()),
+        };
+        if let Some(delay) = backoff
+            && replay == GrantReplay::Safe
+            && (status == 429 || (500..600).contains(&status))
+        {
+            tracing::warn!(
+                target: "cirrus::auth",
+                attempt = attempt + 1,
+                status,
+                "token endpoint answered a retryable status; retrying",
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            continue;
+        }
+        break (status, bytes);
+    };
 
     if !(200..300).contains(&status) {
         if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
@@ -363,6 +463,119 @@ mod tests {
             }
             other => panic!("expected InstanceUrlMismatch, got {other:?}"),
         }
+    }
+
+    async fn mount_then_succeed(server: &wiremock::MockServer, first: u16, failures: u64) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(first))
+            .up_to_n_times(failures)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!ACCESS",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_replay_safe_grant_retries_429_and_5xx_within_the_budget() {
+        let server = wiremock::MockServer::start().await;
+        mount_then_succeed(&server, 503, 2).await;
+        let http = default_http_client().unwrap();
+        let token = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.access_token, "00DXX!ACCESS");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+        let server = wiremock::MockServer::start().await;
+        mount_then_succeed(&server, 429, 1).await;
+        exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_retry_budget_is_exhausted_after_three_attempts() {
+        let server = wiremock::MockServer::start().await;
+        mount_then_succeed(&server, 503, 3).await;
+        let http = default_http_client().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnexpectedResponse { status: 503 }),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_grant_marked_never_is_not_replayed_after_a_5xx() {
+        let server = wiremock::MockServer::start().await;
+        mount_then_succeed(&server, 503, 1).await;
+        let http = default_http_client().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "refresh_token")],
+            GrantReplay::Never,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnexpectedResponse { status: 503 }),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oauth_error_is_never_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant"
+            })))
+            .mount(&server)
+            .await;
+        let http = default_http_client().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::OAuth { ref error, .. } if error == "invalid_grant"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
