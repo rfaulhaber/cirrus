@@ -18,7 +18,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 
 `cirrus`:
 - Phase 1: versions, limits, describe (global + per-object), sObject CRUD, query/queryAll/queryMore, search/parameterizedSearch.
-- Phase 2: composite/batch, composite/tree, composite/sobjects (incl. `retrieve_with_body`), generic `/composite`, Bulk 2.0 (ingest + query), Apex REST passthrough, Tooling API, Event Monitoring.
+- Phase 2: composite/batch, composite/tree, composite/sobjects (incl. `retrieve_with_body`), generic `/composite`, Bulk 2.0 (ingest + query), Apex REST passthrough, Tooling API (incl. `tooling/composite`), Event Monitoring.
 - Phase 3: Metadata REST API (`Cirrus::metadata()` — the four `deployRequest` endpoints). The rest of the Metadata API surface is SOAP-only and lives in `cirrus-metadata`.
 - Cross-cutting: open-ended client escape hatch, pagination stream (`futures::Stream`), retry + backoff policy, `Sforce-Limit-Info` surfacing, auto-refresh on an `INVALID_SESSION_ID` 401 only, multipart blob uploads.
 - Transport contract: session-token targets must be `https` (exact `localhost` and loopback literals excepted; the rule lives in `cirrus_auth::transport`) or the request is refused with `CirrusError::InvalidInput` — `CirrusBuilder::allow_insecure_transport(true)` is the opt-out; the client the builder creates advertises gzip, sets a 10s connect and 120s read timeout (both overridable), and follows no redirects. `Retry-After` is honored up to `RetryPolicy::max_delay` and a longer hint surfaces the response; read timeouts are not replayed unless `RetryPolicy::retry_read_timeouts` is set. Both rules are mirrored in `cirrus-metadata`. `CirrusError` is `#[non_exhaustive]`.

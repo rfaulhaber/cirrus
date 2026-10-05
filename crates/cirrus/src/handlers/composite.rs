@@ -25,11 +25,12 @@ use crate::Cirrus;
 use crate::error::CirrusResult;
 use crate::response::{
     BatchResponse, CompositeResponse, CompositeTreeResponse, SObjectCollectionResult,
+    parse_error_response, parse_response_bytes,
 };
-use reqwest::header::HeaderMap;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 impl Cirrus {
     /// Returns a handler for the composite REST resources.
@@ -159,6 +160,11 @@ impl CompositeHandler<'_> {
     /// request rolls back and [`CompositeTreeResponse::has_errors`] is
     /// `true`. The `results` collection in that case lists only the
     /// failing records' `referenceId`s — *no* records were committed.
+    /// Salesforce delivers that rollback body with HTTP 400, and it is
+    /// still returned here as `Ok` with the typed response, so the
+    /// `has_errors` check above is the one place to look. A 400 carrying
+    /// the standard error array (a malformed request) is a
+    /// [`CirrusError::Api`](crate::CirrusError::Api) as everywhere else.
     pub async fn tree<B>(&self, sobject: &str, body: &B) -> CirrusResult<CompositeTreeResponse>
     where
         B: Serialize + ?Sized,
@@ -167,7 +173,14 @@ impl CompositeHandler<'_> {
             .client
             .versioned_segments(&["composite", "tree", sobject])?;
         self.client
-            .send_at(reqwest::Method::POST, &url, None::<&()>, Some(body))
+            .send_at_parsed(
+                reqwest::Method::POST,
+                &url,
+                None::<&()>,
+                Some(body),
+                crate::Replay::ByMethod,
+                parse_tree_response,
+            )
             .await
     }
 
@@ -241,6 +254,29 @@ impl CompositeHandler<'_> {
     }
 }
 
+/// Parses a `/composite/tree` response, accepting the documented rollback
+/// body on HTTP 400.
+//
+// Wire-shape provenance: the sObject Tree response page
+// (`responses_composite_sobject_tree`) prints the `{hasErrors, results}`
+// failure body without a status line. The 400 comes from Salesforce's own
+// CLI, which handles this endpoint by parsing `hasErrors` and `results`
+// out of an HTTP 400 (`importApi.ts` in salesforcecli/plugin-data). Not
+// confirmed against a live org. A 400 that does not carry `hasErrors` is
+// the standard error array and goes through the shared error parser.
+fn parse_tree_response(status: u16, bytes: &[u8]) -> CirrusResult<CompositeTreeResponse> {
+    if (200..300).contains(&status) {
+        return parse_response_bytes(status, bytes);
+    }
+    if status == 400
+        && let Ok(tree) = serde_json::from_slice::<CompositeTreeResponse>(bytes)
+        && tree.has_errors
+    {
+        return Ok(tree);
+    }
+    Err(parse_error_response(status, bytes))
+}
+
 /// Request body for [`CompositeHandler::execute`].
 ///
 /// Equivalent to a `serde_json::json!({...})` literal of the documented
@@ -288,17 +324,14 @@ pub struct CompositeSubrequest {
     /// carry a body (GET, DELETE).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
-    /// Per-sub-request HTTP headers. Salesforce rejects `Accept`,
-    /// `Authorization`, and `Content-Type` here — they're inherited from
-    /// the top-level request. Also: setting any header opts a sub-request
-    /// out of collation.
-    #[serde(
-        rename = "httpHeaders",
-        with = "http_serde::option::header_map",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
-    pub http_headers: Option<HeaderMap>,
+    /// Per-sub-request HTTP headers, as the documented `Map<String,
+    /// String>`: header names keep the caller's casing and each name
+    /// carries one value. Salesforce rejects `Accept`, `Authorization`,
+    /// and `Content-Type` here — they're inherited from the top-level
+    /// request, and naming one fails the whole request with HTTP 400.
+    /// Setting any header also opts the sub-request out of collation.
+    #[serde(rename = "httpHeaders", skip_serializing_if = "Option::is_none")]
+    pub http_headers: Option<BTreeMap<String, String>>,
 }
 
 /// Handler for `/composite/sobjects` — the SObject Collections endpoints.
@@ -370,9 +403,10 @@ impl CompositeSObjectsHandler<'_> {
     /// `PATCH /composite/sobjects/{sobject}/{externalIdField}`.
     ///
     /// Each record must carry the external ID field's value as a top-level
-    /// property. [`SObjectCollectionResult::created`] indicates whether
-    /// each record was newly inserted (`Some(true)`) or matched an
-    /// existing record (`Some(false)`).
+    /// property. [`SObjectCollectionResult::created`] reports `Some(true)`
+    /// for a record the upsert inserted and `Some(false)` for one it
+    /// updated; Salesforce omits the flag on some successful entries, so
+    /// treat `None` as unknown rather than as an update.
     pub async fn upsert<B>(
         &self,
         sobject: &str,
@@ -557,9 +591,13 @@ pub struct BatchRequest {
 /// (e.g. `"v66.0/sobjects/Account/001…"`); sub-request URLs do *not* go
 /// through the SDK's normal path resolution.
 ///
-/// `binaryPartName` / `binaryPartNameAlias` (used for multipart blob
-/// uploads) are not exposed here. To use them, drop down to a
-/// `serde_json::json!({...})` body.
+/// `binaryPartName` / `binaryPartNameAlias` are not exposed here, and a
+/// `serde_json::json!` body that names them does not help: those fields
+/// refer to a part of a *multipart* batch request, and
+/// [`CompositeHandler::batch`] sends a single JSON body. A blob subrequest
+/// needs a hand-built multipart form sent through
+/// [`Cirrus::request_builder`](crate::Cirrus::request_builder), which
+/// gives up retry, the 401 refresh and limit-info capture.
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchSubrequest {
     /// HTTP method, e.g. `"GET"`, `"POST"`, `"PATCH"`, `"DELETE"`.
@@ -862,28 +900,19 @@ mod tests {
         assert!(resp.results.iter().all(|r| r.is_success()));
     }
 
-    /// Wire shape per the `responses_composite_sobject_tree` "JSON
-    /// example upon failure" body.
-    ///
-    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/responses_composite_sobject_tree.htm
-    ///
-    /// Wire-shape provenance: that page prints the rollback response
-    /// body but no HTTP status line, and
-    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
-    /// assigns 201 to "POST requests and some PATCH requests" without
-    /// singling out sObject Tree. The 201 below is therefore assumed,
-    /// not doc-verified — it has not been pinned against a live org.
-    /// What the test does prove is the handler contract that matters:
-    /// a 2xx rollback response is surfaced as
-    /// [`CompositeTreeResponse`] rather than an error, so callers reach
-    /// the per-record `referenceId`/`errors` payload.
     #[tokio::test]
     async fn tree_surfaces_per_record_failure() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/responses_composite_sobject_tree.htm
+        // "JSON example upon failure", verbatim. The page prints no status
+        // line; the 400 comes from how Salesforce's own CLI handles this
+        // endpoint (`importApi.ts` in salesforcecli/plugin-data parses
+        // `hasErrors` and `results` out of an HTTP 400). Not confirmed
+        // against a live org.
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
             .and(path("/services/data/v66.0/composite/tree/Account"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                 "hasErrors": true,
                 "results": [{
                     "referenceId": "ref2",
@@ -936,6 +965,66 @@ mod tests {
             .await
             .unwrap();
         assert!(!resp.has_errors);
+    }
+
+    #[tokio::test]
+    async fn tree_400_with_a_non_tree_body_is_an_api_error() {
+        // A gateway page on a 400 is neither the rollback body nor the
+        // error array: it stays an Api error with the capped raw body.
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/tree/Account"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("<html>blocked</html>"))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .composite()
+            .tree("Account", &json!({"records": []}))
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::Api {
+                status,
+                errors,
+                raw,
+            } => {
+                assert_eq!(status, 400);
+                assert!(errors.is_empty());
+                assert!(raw.unwrap().contains("blocked"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_subrequest_serializes_headers_as_the_documented_string_map() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/requests_composite.htm
+        // "httpHeaders | Map<String, String>", with the page's own example
+        // `"httpHeaders" : { "If-Modified-Since" : "Tue, 31 May 2016 18:00:00 GMT" }`.
+        let sub = CompositeSubrequest {
+            method: "GET".into(),
+            url: "/services/data/v66.0/sobjects/Account/describe".into(),
+            reference_id: "AccountMetadata".into(),
+            body: None,
+            http_headers: Some(BTreeMap::from([
+                (
+                    "If-Modified-Since".to_string(),
+                    "Tue, 31 May 2016 18:00:00 GMT".to_string(),
+                ),
+                ("Sforce-Auto-Assign".to_string(), "FALSE".to_string()),
+            ])),
+        };
+        let v = serde_json::to_value(&sub).unwrap();
+        assert_eq!(
+            v["httpHeaders"],
+            json!({
+                "If-Modified-Since": "Tue, 31 May 2016 18:00:00 GMT",
+                "Sforce-Auto-Assign": "FALSE"
+            })
+        );
     }
 
     #[tokio::test]
