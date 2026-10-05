@@ -21,7 +21,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - Phase 2: composite/batch, composite/tree, composite/sobjects (incl. `retrieve_with_body`), generic `/composite`, Bulk 2.0 (ingest + query), Apex REST passthrough, Tooling API, Event Monitoring.
 - Phase 3: Metadata REST API (`Cirrus::metadata()` — the four `deployRequest` endpoints). The rest of the Metadata API surface is SOAP-only and lives in `cirrus-metadata`.
 - Cross-cutting: open-ended client escape hatch, pagination stream (`futures::Stream`), retry + backoff policy, `Sforce-Limit-Info` surfacing, auto-refresh on an `INVALID_SESSION_ID` 401 only, multipart blob uploads.
-- Transport contract: session-token targets must be `https` (loopback excepted) or the request is refused with `CirrusError::InvalidInput` — `CirrusBuilder::allow_insecure_transport(true)` is the opt-out; the client the builder creates advertises gzip, sets a 10s connect and 120s read timeout (both overridable), and follows no redirects. `CirrusError` is `#[non_exhaustive]`.
+- Transport contract: session-token targets must be `https` (exact `localhost` and loopback literals excepted; the rule lives in `cirrus_auth::transport`) or the request is refused with `CirrusError::InvalidInput` — `CirrusBuilder::allow_insecure_transport(true)` is the opt-out; the client the builder creates advertises gzip, sets a 10s connect and 120s read timeout (both overridable), and follows no redirects. `Retry-After` is honored up to `RetryPolicy::max_delay` and a longer hint surfaces the response; read timeouts are not replayed unless `RetryPolicy::retry_read_timeouts` is set. Both rules are mirrored in `cirrus-metadata`. `CirrusError` is `#[non_exhaustive]`.
 
 `cirrus-auth`:
 - All five priority OAuth flows: JWT Bearer (RFC 7523), Refresh Token (RFC 6749 §6), Client Credentials (RFC 6749 §4.4), Web Server with PKCE (RFC 6749 §4.1 + RFC 7636), Token Exchange (RFC 8693).
@@ -34,6 +34,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - Utility: `list_metadata`, `describe_metadata`, `describe_value_type`.
 - Typed `package.xml` via `PackageManifest` builder; `MetadataType` ships constants for the common types and `MetadataType::new` names anything else.
 - Open-ended escape hatch (`MetadataClient::request_builder()`), retry policy, and `INVALID_SESSION_ID` auto-refresh against the configured `AuthSession`.
+- Transport contract: same https-or-loopback rule as `cirrus` (shared in `cirrus_auth::transport`), checked at build and on every call since the instance URL is re-read from the session; `MetadataClientBuilder::allow_insecure_transport(true)` is the opt-out. `api_version` must be the bare `XX.X` form. Errors that retain a non-SOAP body are scrubbed of the session id.
 
 Tests: ~585 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s wall). Integration tests against real orgs are `#[ignore]`-gated and live under each crate's `tests/integration/`.
 

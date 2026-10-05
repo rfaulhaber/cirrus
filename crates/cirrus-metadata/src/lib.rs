@@ -28,6 +28,19 @@
 //! - **Same credentials as `cirrus`.** Both crates wrap the same
 //!   `AuthSession` trait; one [`SharedAuth`] drives both clients.
 //!
+//! ## Transport contract
+//!
+//! The session id travels inside every SOAP envelope, so the instance
+//! URL must be `https`; exact `localhost` and the loopback literals are
+//! the only exemption, for local mock servers. The rule is the one
+//! `cirrus` applies, from [`cirrus_auth::transport`], checked when the
+//! client is built and again on every call because an [`AuthSession`]
+//! may change its instance URL. [`MetadataClientBuilder::allow_insecure_transport`]
+//! is the opt-out for a deliberate plaintext hop. The HTTP client the
+//! builder creates follows no redirects, and a `Retry-After` hint longer
+//! than the policy's `max_delay` ends the retry loop instead of being
+//! shortened.
+//!
 //! ## Quick start
 //!
 //! ```no_run
@@ -151,6 +164,7 @@ pub struct MetadataClient {
     pub(crate) auth: SharedAuth,
     pub(crate) api_version: String,
     pub(crate) retry_policy: RetryPolicy,
+    pub(crate) allow_insecure_transport: bool,
 }
 
 impl std::fmt::Debug for MetadataClient {
@@ -161,6 +175,7 @@ impl std::fmt::Debug for MetadataClient {
             .field("api_version", &self.api_version)
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
+            .field("allow_insecure_transport", &self.allow_insecure_transport)
             .finish_non_exhaustive()
     }
 }
@@ -267,6 +282,7 @@ pub struct MetadataClientBuilder {
     // caller asking for no deadline at all.
     connect_timeout: Option<Option<std::time::Duration>>,
     read_timeout: Option<Option<std::time::Duration>>,
+    allow_insecure_transport: bool,
 }
 
 impl MetadataClientBuilder {
@@ -278,8 +294,10 @@ impl MetadataClientBuilder {
     }
 
     /// Sets the Metadata API version, e.g. `"66.0"`. Defaults to
-    /// [`DEFAULT_API_VERSION`]. Note: SOAP endpoint paths use the bare
-    /// number without a `v` prefix.
+    /// [`DEFAULT_API_VERSION`]. SOAP endpoint paths use the bare
+    /// `XX.X` number, so [`build`](Self::build) rejects the REST
+    /// client's `v66.0` form and anything else that is not
+    /// digits-dot-digits.
     pub fn api_version(mut self, version: impl Into<String>) -> Self {
         self.api_version = Some(version.into());
         self
@@ -340,9 +358,31 @@ impl MetadataClientBuilder {
         self
     }
 
+    /// Allows an instance URL that is neither `https` nor loopback.
+    ///
+    /// Every SOAP envelope carries the session id in its body, so by
+    /// default [`build`](Self::build) and every call refuse to send one
+    /// to a plaintext host (RFC 6750 §5.3). Set this only for a
+    /// deliberate plaintext hop, such as a recording proxy on a trusted
+    /// network, and never for an org.
+    pub fn allow_insecure_transport(mut self, allow: bool) -> Self {
+        self.allow_insecure_transport = allow;
+        self
+    }
+
     /// Finalizes the builder.
+    ///
+    /// Fails when no [`auth`](Self::auth) session was supplied, when
+    /// [`api_version`](Self::api_version) is not a bare `XX.X` number,
+    /// or when the auth session's instance URL would send the session
+    /// id in the clear.
     pub fn build(self) -> MetadataResult<MetadataClient> {
         let auth = self.auth.ok_or(MetadataError::MissingField("auth"))?;
+        let api_version = self
+            .api_version
+            .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
+        validate_api_version(&api_version)?;
+        check_transport_security(auth.instance_url(), self.allow_insecure_transport)?;
 
         let http = if let Some(c) = self.http_client {
             c
@@ -377,12 +417,54 @@ impl MetadataClientBuilder {
         Ok(MetadataClient {
             http,
             auth,
-            api_version: self
-                .api_version
-                .unwrap_or_else(|| DEFAULT_API_VERSION.to_string()),
+            api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
+            allow_insecure_transport: self.allow_insecure_transport,
         })
     }
+}
+
+/// Refuses an instance URL that would carry the session id in the clear:
+/// anything that is not `https` or loopback, under the rule shared with
+/// `cirrus` in [`cirrus_auth::transport`]. `allow_insecure` is the
+/// caller's deliberate opt-out.
+pub(crate) fn check_transport_security(url: &str, allow_insecure: bool) -> MetadataResult<()> {
+    if allow_insecure {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url).map_err(|e| {
+        MetadataError::InvalidArgument(format!("instance URL `{url}` is not a valid URL: {e}"))
+    })?;
+    if cirrus_auth::transport::is_secure_transport(&parsed) {
+        return Ok(());
+    }
+    Err(MetadataError::InvalidArgument(format!(
+        "instance URL `{url}` is not an https target, and the Salesforce session id inside every \
+         SOAP envelope must not travel in the clear; opt out with \
+         MetadataClientBuilder::allow_insecure_transport if the plaintext hop is deliberate",
+    )))
+}
+
+/// Accepts the bare `XX.X` form the SOAP endpoint path uses.
+///
+/// The REST client's `vXX.X` is the mistake worth catching: it would
+/// build `/services/Soap/m/v66.0`, a path the server does not serve, and
+/// a value with path characters could address something outside
+/// `/services/Soap/m/` altogether.
+fn validate_api_version(version: &str) -> MetadataResult<()> {
+    let well_formed = version.split_once('.').is_some_and(|(major, minor)| {
+        !major.is_empty()
+            && !minor.is_empty()
+            && major.bytes().all(|b| b.is_ascii_digit())
+            && minor.bytes().all(|b| b.is_ascii_digit())
+    });
+    if well_formed {
+        return Ok(());
+    }
+    Err(MetadataError::InvalidArgument(format!(
+        "api_version: expected the bare `XX.X` form the SOAP endpoint path uses (for example \
+         `{DEFAULT_API_VERSION}`), got `{version}`",
+    )))
 }
 
 #[cfg(test)]

@@ -7,7 +7,10 @@
 //! 1. Asks [`AuthSession`] for a bearer token.
 //! 2. Builds the envelope around the rendered body.
 //! 3. POSTs to `/services/Soap/m/{api_version}` with the SOAP-required
-//!    headers (`Content-Type: text/xml; charset=UTF-8`, `SOAPAction: ""`).
+//!    headers (`Content-Type: text/xml; charset=UTF-8`, `SOAPAction: ""`),
+//!    after confirming the instance URL is still `https` or loopback —
+//!    the session id rides in the body, and the URL is re-read from the
+//!    session on every call.
 //! 4. Parses the response envelope into either a typed `O::Response` or
 //!    a [`MetadataError::Soap`] carrying the [`SoapFault`].
 //! 5. Retries transient failures per the client's [`RetryPolicy`]. The
@@ -16,6 +19,8 @@
 //!    rule.
 //! 6. On `INVALID_SESSION_ID` faults, invalidates the cached token and
 //!    retries the entire call once with a freshly-minted token.
+//! 7. Scrubs the attempt's session id from any error that retains body
+//!    text, since an intermediary's error page may echo the envelope.
 //!
 //! [`AuthSession`]: cirrus_auth::AuthSession
 //! [`SoapFault`]: crate::error::SoapFault
@@ -106,8 +111,13 @@ pub(crate) async fn soap_call<O: SoapOperation>(
     // `from_str` borrows text nodes straight out of `inner`; the
     // `from_reader` path would copy every event — including the
     // multi-megabyte base64 `<zipFile>` — through an internal buffer
-    // first.
-    let parsed: O::Response = quick_xml::de::from_str(&inner)?;
+    // first. The path wrapper names the element that failed, so a
+    // field Salesforce changes in a release is diagnosable without a
+    // traffic capture.
+    let mut de = quick_xml::de::Deserializer::from_str(&inner);
+    let parsed: O::Response = serde_path_to_error::deserialize(&mut de).map_err(|e| {
+        MetadataError::Xml(format!("{response_local}: {} at `{}`", e.inner(), e.path()))
+    })?;
     Ok(parsed)
 }
 
@@ -140,7 +150,12 @@ async fn call_with_auth_retry(
         let envelope = envelope::build_envelope(&token_str, op_name, body_xml);
         // Bytes is Arc-backed — clones on retry are cheap.
         let body = Bytes::from(envelope.into_bytes());
-        let result = send_with_retries(client, idempotent, body, response_local).await;
+        // An intermediary's error page may echo the envelope, token
+        // included; scrub it here, where the attempt's token is still in
+        // hand, before the error can reach a log sink.
+        let result = send_with_retries(client, idempotent, body, response_local)
+            .await
+            .map_err(|e| e.redact_secrets(&token_str));
 
         if !auth_retried
             && let Err(MetadataError::Soap { fault, .. }) = &result
@@ -181,6 +196,7 @@ async fn send_with_retries(
     envelope_bytes: Bytes,
     response_local: &str,
 ) -> MetadataResult<String> {
+    crate::check_transport_security(client.auth.instance_url(), client.allow_insecure_transport)?;
     let url = client.endpoint_url();
     let mut attempt: u32 = 0;
     loop {
@@ -209,15 +225,15 @@ async fn send_with_retries(
                         // a failed send, so it follows the same replay
                         // rules.
                         let err: MetadataError = e.into();
-                        if status_retryable
+                        let retryable = status_retryable
                             || retry::should_retry_network(
                                 &client.retry_policy,
                                 idempotent,
                                 &err,
                                 attempt,
-                            )
-                        {
-                            sleep_before_retry(client, attempt, &headers).await;
+                            );
+                        if retryable && let Some(delay) = backoff(client, attempt, &headers) {
+                            tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         }
@@ -235,8 +251,11 @@ async fn send_with_retries(
                 match envelope::parse_envelope(&bytes, response_local) {
                     Ok(EnvelopeBody::Success(inner)) => return Ok(inner),
                     Ok(EnvelopeBody::Fault(fault)) => {
-                        if status_retryable && retry::is_transient_fault(&fault) {
-                            sleep_before_retry(client, attempt, &headers).await;
+                        if status_retryable
+                            && retry::is_transient_fault(&fault)
+                            && let Some(delay) = backoff(client, attempt, &headers)
+                        {
+                            tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         }
@@ -246,19 +265,22 @@ async fn send_with_retries(
                         // No SOAP envelope means the response came from
                         // an intermediary rather than the org, so the
                         // status is all we have to go on.
-                        if status_retryable {
-                            sleep_before_retry(client, attempt, &headers).await;
+                        if status_retryable && let Some(delay) = backoff(client, attempt, &headers)
+                        {
+                            tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         }
                         // 2xx with a body we couldn't parse is a
                         // server-shape problem, not an HTTP error:
                         // route through InvalidResponse so the variant
-                        // name matches the wire. Non-2xx with non-SOAP
-                        // body keeps Http4xx5xx.
+                        // name matches the wire, with a short excerpt
+                        // so the caller can see what answered. Non-2xx
+                        // with non-SOAP body keeps Http4xx5xx.
                         if (200..300).contains(&status) {
                             return Err(MetadataError::InvalidResponse(format!(
-                                "HTTP {status} with non-SOAP body: {parse_err}"
+                                "HTTP {status} with non-SOAP body: {parse_err}; body starts: {}",
+                                crate::error::cap_body_excerpt(&bytes)
                             )));
                         }
                         return Err(MetadataError::Http4xx5xx {
@@ -270,8 +292,9 @@ async fn send_with_retries(
             }
             Err(e) => {
                 let err: MetadataError = e.into();
-                if retry::should_retry_network(&client.retry_policy, idempotent, &err, attempt) {
-                    let delay = retry::compute_delay(&client.retry_policy, attempt, None);
+                if retry::should_retry_network(&client.retry_policy, idempotent, &err, attempt)
+                    && let Some(delay) = retry::compute_delay(&client.retry_policy, attempt, None)
+                {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
@@ -282,14 +305,15 @@ async fn send_with_retries(
     }
 }
 
-/// Wait out the backoff for `attempt`, honoring a `Retry-After` hint on
-/// the response that prompted the retry.
-async fn sleep_before_retry(
+/// The backoff for `attempt`, honoring a `Retry-After` hint on the
+/// response that prompted the retry — or `None` when the hint is longer
+/// than the policy's `max_delay`, in which case the response surfaces
+/// instead of being retried inside the server's window.
+fn backoff(
     client: &MetadataClient,
     attempt: u32,
     headers: &reqwest::header::HeaderMap,
-) {
+) -> Option<std::time::Duration> {
     let retry_after = retry::parse_retry_after(headers);
-    let delay = retry::compute_delay(&client.retry_policy, attempt, retry_after);
-    tokio::time::sleep(delay).await;
+    retry::compute_delay(&client.retry_policy, attempt, retry_after)
 }

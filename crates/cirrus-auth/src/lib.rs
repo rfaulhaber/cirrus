@@ -35,6 +35,9 @@
 //!   user comes back through the redirect URL.
 //! - [`token_exchange`] — OAuth 2.0 Token Exchange (RFC 8693).
 //!
+//! [`transport`] holds the https-or-loopback rule that every Cirrus
+//! client applies before sending a bearer token anywhere.
+//!
 //! Flows Salesforce lists as legacy or deprecated are intentionally not
 //! supported.
 
@@ -49,6 +52,7 @@ pub mod refresh;
 pub mod static_token;
 mod token_endpoint;
 pub mod token_exchange;
+pub mod transport;
 pub mod web_server;
 
 /// Re-export of [`reqwest`].

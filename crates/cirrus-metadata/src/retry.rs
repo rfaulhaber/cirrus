@@ -3,8 +3,12 @@
 //! Policy: retry only what's clearly safe — 429 (rate limited, the
 //! request was refused without being processed) for every operation,
 //! and 5xx / mid-request network failures only for operations declared
-//! idempotent — honor any `Retry-After` hint, and add jitter to avoid
-//! thundering herds.
+//! idempotent — honor a `Retry-After` hint up to
+//! [`RetryPolicy::max_delay`] and surface the response when the hint is
+//! longer, and add jitter to avoid thundering herds. A read timeout is
+//! surfaced rather than replayed unless
+//! [`RetryPolicy::retry_read_timeouts`] is on. The same rules apply in
+//! `cirrus`.
 //!
 //! The Metadata API SOAP endpoint is always POST, so the HTTP method
 //! carries no idempotency signal; instead each [`SoapOperation`]
@@ -44,7 +48,9 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     /// Base delay for the exponential backoff schedule. Default 100 ms.
     pub base_delay: Duration,
-    /// Cap on the computed backoff delay. Default 30 s.
+    /// Cap on the computed backoff delay. Default 30 s. Also the
+    /// longest `Retry-After` hint the client will wait out: a longer
+    /// hint ends the retry loop and the response surfaces to the caller.
     pub max_delay: Duration,
     /// Apply full jitter — pick a random delay in `[0, computed]`
     /// rather than using the deterministic exponential value. Default
@@ -57,6 +63,17 @@ pub struct RetryPolicy {
     /// Non-idempotent operations (`deploy`, the CRUD calls, …) are
     /// *never* retried on 5xx, regardless of this flag.
     pub retry_idempotent_5xx: bool,
+    /// When `true`, a request that hits the read timeout is re-sent on
+    /// the same terms as a connection reset — only for an idempotent
+    /// operation. Default `false`: the read timeout is the caller's
+    /// deadline on getting an answer, a `checkDeployStatus` the org
+    /// takes 150 s to build is not a transient fault, and each replay
+    /// makes the org build it again. With this on, the worst case is
+    /// `(max_retries + 1) × read_timeout` plus backoff, doubled across
+    /// an `INVALID_SESSION_ID` refresh. Connect-phase timeouts are
+    /// unaffected: the request never reached the server, so they
+    /// always retry.
+    pub retry_read_timeouts: bool,
 }
 
 impl Default for RetryPolicy {
@@ -67,6 +84,7 @@ impl Default for RetryPolicy {
             max_delay: Duration::from_secs(30),
             jitter: true,
             retry_idempotent_5xx: true,
+            retry_read_timeouts: false,
         }
     }
 }
@@ -140,6 +158,18 @@ pub(crate) fn is_transient_fault(fault: &SoapFault) -> bool {
 }
 
 /// Decision point: should we retry this network-level failure?
+///
+/// Errors raised while *building* the request — an instance URL that
+/// doesn't parse, a header value reqwest rejects — are permanent: no
+/// amount of backoff turns them into a request, so they surface on the
+/// first attempt instead of burning the budget on identical failures.
+/// Connect-phase errors mean the request never reached the server, so
+/// retrying is safe even for non-idempotent operations; this covers DNS
+/// failures, TCP RSTs, TLS handshake failures and connect timeouts. A
+/// read timeout is the caller's deadline and is surfaced unless
+/// [`RetryPolicy::retry_read_timeouts`] is on. Every other mid-request
+/// failure is ambiguous — the server may have processed the request —
+/// so it replays only idempotent operations.
 pub(crate) fn should_retry_network(
     policy: &RetryPolicy,
     idempotent: bool,
@@ -152,14 +182,14 @@ pub(crate) fn should_retry_network(
     let MetadataError::Http(http) = error else {
         return false;
     };
-    // Connect-phase errors mean the request never reached the server,
-    // so retrying is safe even for non-idempotent operations. This
-    // covers DNS failures, TCP RSTs, TLS handshake failures, and
-    // connect timeouts. Mid-request failures are ambiguous — the
-    // server may have processed the request — so they replay only
-    // idempotent operations.
+    if http.is_builder() {
+        return false;
+    }
     if http.is_connect() {
         return true;
+    }
+    if http.is_timeout() && !policy.retry_read_timeouts {
+        return false;
     }
     idempotent
 }
@@ -186,22 +216,39 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     )
 }
 
-/// Compute the next backoff delay.
+/// Compute the next backoff delay, or `None` when the retry should not
+/// happen at all.
+///
+/// A `Retry-After` hint within [`RetryPolicy::max_delay`] is used as is.
+/// A longer hint yields `None`: the client cannot wait that long under
+/// its own policy, and retrying early would land inside the window the
+/// server asked it to stay out of. Without a hint the delay is
+/// `base_delay * 2^attempt`, capped at `max_delay` and jittered when
+/// the policy says so.
 pub(crate) fn compute_delay(
     policy: &RetryPolicy,
     attempt: u32,
     retry_after: Option<Duration>,
-) -> Duration {
+) -> Option<Duration> {
     if let Some(hint) = retry_after {
-        let capped = hint.min(policy.max_delay);
+        if hint > policy.max_delay {
+            tracing::warn!(
+                target: "cirrus_metadata::retry",
+                attempt = attempt + 1,
+                retry_after_ms = hint.as_millis() as u64,
+                max_delay_ms = policy.max_delay.as_millis() as u64,
+                "Retry-After exceeds max_delay; surfacing the response instead of retrying",
+            );
+            return None;
+        }
         tracing::warn!(
             target: "cirrus_metadata::retry",
             attempt = attempt + 1,
-            delay_ms = capped.as_millis() as u64,
+            delay_ms = hint.as_millis() as u64,
             source = "retry-after-header",
             "scheduling request retry",
         );
-        return capped;
+        return Some(hint);
     }
     let factor: u128 = 1u128.checked_shl(attempt).unwrap_or(u128::MAX);
     let computed_ms = policy.base_delay.as_millis().saturating_mul(factor);
@@ -218,9 +265,17 @@ pub(crate) fn compute_delay(
         } else {
             let mut buf = [0u8; 8];
             if getrandom::fill(&mut buf).is_err() {
+                // Random source down — degrade gracefully to deterministic.
                 computed
             } else {
-                let r = u64::from_le_bytes(buf) % (max_ms + 1);
+                let sample = u64::from_le_bytes(buf);
+                // `[0, max_ms]` inclusive. When max_ms is u64::MAX the
+                // range is already the whole of u64, so the sample
+                // stands as is — computing the span would overflow.
+                let r = match max_ms.checked_add(1) {
+                    Some(span) => sample % span,
+                    None => sample,
+                };
                 Duration::from_millis(r)
             }
         }
@@ -232,7 +287,7 @@ pub(crate) fn compute_delay(
         source = "exponential-backoff",
         "scheduling request retry",
     );
-    final_delay
+    Some(final_delay)
 }
 
 #[cfg(test)]
@@ -374,15 +429,22 @@ mod tests {
     }
 
     #[test]
-    fn compute_delay_honors_retry_after_capped_at_max() {
+    fn compute_delay_honors_a_retry_after_within_max_delay_and_refuses_a_longer_one() {
         let p = RetryPolicy {
             max_delay: Duration::from_secs(10),
             ..RetryPolicy::default()
         };
         assert_eq!(
-            compute_delay(&p, 0, Some(Duration::from_secs(99))),
-            Duration::from_secs(10)
+            compute_delay(&p, 0, Some(Duration::from_secs(3))),
+            Some(Duration::from_secs(3))
         );
+        assert_eq!(
+            compute_delay(&p, 0, Some(Duration::from_secs(10))),
+            Some(Duration::from_secs(10))
+        );
+        // Beyond the cap the retry does not happen: sleeping for a
+        // truncated interval would retry inside the server's window.
+        assert_eq!(compute_delay(&p, 0, Some(Duration::from_secs(99))), None);
     }
 
     #[test]
@@ -393,9 +455,45 @@ mod tests {
             jitter: false,
             ..RetryPolicy::default()
         };
-        assert_eq!(compute_delay(&p, 0, None), Duration::from_millis(100));
-        assert_eq!(compute_delay(&p, 4, None), Duration::from_secs(1));
-        assert_eq!(compute_delay(&p, 100, None), Duration::from_secs(1));
+        assert_eq!(compute_delay(&p, 0, None), Some(Duration::from_millis(100)));
+        assert_eq!(compute_delay(&p, 4, None), Some(Duration::from_secs(1)));
+        assert_eq!(compute_delay(&p, 100, None), Some(Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_request_builder_errors() {
+        // An unparseable URL is latched by the builder and returned
+        // from send(); replaying it can only fail the same way.
+        let p = RetryPolicy::default();
+        let err: MetadataError = reqwest::Client::new()
+            .post("not a url/services/Soap/m/66.0")
+            .send()
+            .await
+            .unwrap_err()
+            .into();
+        match &err {
+            MetadataError::Http(http) => assert!(http.is_builder(), "expected a builder error"),
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        assert!(!should_retry_network(&p, true, &err, 0));
+    }
+
+    #[test]
+    fn compute_delay_survives_an_unbounded_max_delay() {
+        // "No ceiling" is expressible through the public policy, and at
+        // a high attempt count the capped delay saturates at u64::MAX
+        // milliseconds — the upper edge of the jitter sample.
+        let p = RetryPolicy {
+            max_retries: 60,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::MAX,
+            jitter: true,
+            ..RetryPolicy::default()
+        };
+        for attempt in [0, 57, 58, 63, 64, 100] {
+            let d = compute_delay(&p, attempt, None).unwrap();
+            assert!(d <= Duration::from_millis(u64::MAX));
+        }
     }
 }
 
@@ -440,7 +538,8 @@ mod property_tests {
 
     proptest! {
         /// Cap invariant: regardless of attempt count or `retry_after`
-        /// hint, the returned delay never exceeds `max_delay`. The
+        /// hint, a delay that is returned never exceeds `max_delay`, and
+        /// the only case that returns no delay is a hint beyond it. The
         /// `1u128.checked_shl(attempt)` saturating path means
         /// `attempt = u32::MAX` should still bound the result.
         ///
@@ -453,13 +552,18 @@ mod property_tests {
             hint_ms in proptest::option::of(0u64..=300_000u64),
         ) {
             let hint = hint_ms.map(Duration::from_millis);
-            let delay = compute_delay(&policy, attempt, hint);
-            prop_assert!(
-                delay <= policy.max_delay,
-                "delay {:?} exceeded max_delay {:?} (attempt={attempt}, hint={hint:?})",
-                delay,
-                policy.max_delay,
-            );
+            match compute_delay(&policy, attempt, hint) {
+                Some(delay) => prop_assert!(
+                    delay <= policy.max_delay,
+                    "delay {:?} exceeded max_delay {:?} (attempt={attempt}, hint={hint:?})",
+                    delay,
+                    policy.max_delay,
+                ),
+                None => prop_assert!(
+                    hint.is_some_and(|h| h > policy.max_delay),
+                    "no delay without an over-cap hint (attempt={attempt}, hint={hint:?})",
+                ),
+            }
         }
 
         /// Without jitter and without a `retry_after` hint, the
@@ -474,8 +578,8 @@ mod property_tests {
             b in 0u32..=200,
         ) {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            let dl = compute_delay(&policy, lo, None);
-            let dh = compute_delay(&policy, hi, None);
+            let dl = compute_delay(&policy, lo, None).unwrap();
+            let dh = compute_delay(&policy, hi, None).unwrap();
             prop_assert!(
                 dl <= dh,
                 "non-monotonic: delay({lo})={dl:?} > delay({hi})={dh:?} for policy {policy:?}",
@@ -483,18 +587,19 @@ mod property_tests {
         }
 
         /// A `retry_after` hint always wins over the computed
-        /// exponential value AND is itself capped at `max_delay`.
-        /// This is the explicit-server-control path documented in
+        /// exponential value: within `max_delay` it is returned as is,
+        /// beyond it the retry is refused. This is the
+        /// explicit-server-control path documented in
         /// `should_retry_status` / `parse_retry_after`.
         #[test]
-        fn compute_delay_with_hint_returns_capped_hint(
+        fn compute_delay_with_hint_returns_the_hint_or_refuses(
             policy in deterministic_policy(),
             attempt in 0u32..=200,
             hint_ms in 0u64..=120_000u64,
         ) {
             let hint = Duration::from_millis(hint_ms);
             let delay = compute_delay(&policy, attempt, Some(hint));
-            prop_assert_eq!(delay, hint.min(policy.max_delay));
+            prop_assert_eq!(delay, (hint <= policy.max_delay).then_some(hint));
         }
 
         /// `u32::MAX` attempts shouldn't panic. The `1u128.checked_shl`
@@ -509,7 +614,7 @@ mod property_tests {
             policy in deterministic_policy(),
             attempt in (u32::MAX - 100)..=u32::MAX,
         ) {
-            let delay = compute_delay(&policy, attempt, None);
+            let delay = compute_delay(&policy, attempt, None).unwrap();
             prop_assert!(delay <= policy.max_delay);
         }
     }

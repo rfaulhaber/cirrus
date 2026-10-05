@@ -23,9 +23,11 @@ httpdate.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_path_to_error.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -36,7 +38,6 @@ proptest.workspace = true
 # tests use for a wire-level failure wiremock can't produce: a response
 # body that stops mid-stream.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
-url.workspace = true
 wiremock.workspace = true
 zip.workspace = true
 
