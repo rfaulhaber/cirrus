@@ -20,9 +20,10 @@ use cirrus_metadata::auth::{AuthResult, AuthSession, StaticTokenAuth};
 use cirrus_metadata::{MetadataClient, MetadataError, MetadataResult, RetryPolicy, SoapOperation};
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 // -- Test operation ----------------------------------------------------------
 
@@ -60,6 +61,69 @@ impl SoapOperation for Mutate {
     fn render_body(&self) -> MetadataResult<String> {
         Ok(String::new())
     }
+}
+
+/// Replay-safe op whose response carries a number, so a value the typed
+/// envelope cannot parse has a specific element to be named after.
+struct Count;
+
+#[derive(Debug, Deserialize)]
+struct CountResponse {
+    #[allow(dead_code)]
+    result: CountResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct CountResult {
+    #[allow(dead_code)]
+    count: i32,
+}
+
+impl SoapOperation for Count {
+    const NAME: &'static str = "count";
+    const IDEMPOTENT: bool = true;
+    type Response = CountResponse;
+    fn render_body(&self) -> MetadataResult<String> {
+        Ok(String::new())
+    }
+}
+
+/// Answers every request with the request's own body, the way a proxy
+/// or WAF error page echoes the request that provoked it.
+struct EchoBody(u16);
+
+impl Respond for EchoBody {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        ResponseTemplate::new(self.0)
+            .insert_header("content-type", "text/html")
+            .set_body_bytes(request.body.clone())
+    }
+}
+
+/// Static token whose instance URL can be switched after the client is
+/// built — the shape of a session that re-reads its instance URL on
+/// refresh and comes back with a different one.
+struct FlippingAuth {
+    secure: String,
+    insecure: String,
+    flipped: AtomicBool,
+}
+
+#[async_trait]
+impl AuthSession for FlippingAuth {
+    async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
+        Ok(Cow::Borrowed("tok"))
+    }
+
+    fn instance_url(&self) -> &str {
+        if self.flipped.load(Ordering::SeqCst) {
+            &self.insecure
+        } else {
+            &self.secure
+        }
+    }
+
+    async fn invalidate(&self, _stale_token: &str) {}
 }
 
 // -- Mock AuthSession that can refresh --------------------------------------
@@ -677,4 +741,330 @@ async fn a_response_body_that_stops_mid_stream_is_replayed() {
         }
     );
     server.await.unwrap();
+}
+
+// -- Transport security (shared rule with cirrus) -----------------------------
+
+#[tokio::test]
+async fn build_rejects_a_plaintext_instance_url() {
+    // SOURCE: https://www.rfc-editor.org/rfc/rfc6750#section-5.3
+    // "Clients MUST always use TLS [RFC5246] (https) or equivalent
+    // transport security when making requests with bearer tokens." The
+    // session id rides in every envelope's <sessionId>, so the instance
+    // URL has to be https — or loopback, where the hop never leaves the
+    // machine — exactly as `Cirrus::builder()` already requires of the
+    // same `AuthSession`.
+    let auth = Arc::new(StaticTokenAuth::new(
+        "tok",
+        "http://my-org.my.salesforce.com",
+    ));
+    let err = MetadataClient::builder().auth(auth).build().unwrap_err();
+    match err {
+        MetadataError::InvalidArgument(msg) => {
+            assert!(msg.contains("https"), "{msg}");
+            assert!(msg.contains("allow_insecure_transport"), "{msg}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_call_refuses_an_instance_url_that_turned_plaintext() {
+    // `endpoint_url` re-reads the session's instance URL on every call,
+    // so the build-time check alone would let a later, insecure URL
+    // through. 192.0.2.1 is TEST-NET-1 (RFC 5737): never routable, so a
+    // request that did go out could only time out.
+    let auth = Arc::new(FlippingAuth {
+        secure: "https://my-org.my.salesforce.com".into(),
+        insecure: "http://192.0.2.1".into(),
+        flipped: AtomicBool::new(false),
+    });
+    let md = MetadataClient::builder()
+        .auth(auth.clone())
+        .connect_timeout(std::time::Duration::from_millis(50))
+        .retry_policy(RetryPolicy::none())
+        .build()
+        .unwrap();
+    auth.flipped.store(true, Ordering::SeqCst);
+
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_echoed_error_body_does_not_leak_the_session_id() {
+    // A gateway that blocks the POST and reflects the offending request
+    // puts the live session id about 270 bytes into its page — inside
+    // the raw-body cap — and the SDK itself logs this error with
+    // `error = %e` in `wait_for_deploy`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(EchoBody(400))
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("00Dxx!AQ-very-secret", server.uri()));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .retry_policy(RetryPolicy::none())
+        .build()
+        .unwrap();
+
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Http4xx5xx { status: 400, .. }),
+        "{err:?}"
+    );
+    let shown = format!("{err}");
+    let debugged = format!("{err:?}");
+    assert!(
+        !shown.contains("very-secret"),
+        "Display leaked the token: {shown}"
+    );
+    assert!(
+        !debugged.contains("very-secret"),
+        "Debug leaked the token: {debugged}"
+    );
+    assert!(shown.contains("[redacted]"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_non_soap_2xx_echo_does_not_leak_the_session_id() {
+    // Same echo, but with a 2xx status: the body is retained as a short
+    // excerpt on InvalidResponse. Whether the excerpt stops before the
+    // session header or cuts through the token, no part of the token may
+    // reach the caller.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(EchoBody(200))
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("00Dxx!AQ-very-secret", server.uri()));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .retry_policy(RetryPolicy::none())
+        .build()
+        .unwrap();
+
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(matches!(err, MetadataError::InvalidResponse(_)), "{err:?}");
+    let shown = format!("{err}");
+    assert!(shown.contains("body starts:"), "{shown}");
+    assert!(
+        !shown.contains("00Dxx"),
+        "Display leaked the token: {shown}"
+    );
+    assert!(
+        !shown.contains("sessionId>0"),
+        "Display leaked session id text: {shown}"
+    );
+}
+
+// -- Retry parity with cirrus --------------------------------------------------
+
+#[tokio::test]
+async fn a_read_timeout_is_not_replayed() {
+    // The read timeout is the caller's deadline on getting an answer at
+    // all; re-sending the request up to `max_retries` more times would
+    // quietly multiply that deadline and the org's work by four.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .read_timeout(std::time::Duration::from_millis(50))
+        .retry_policy(RetryPolicy {
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            jitter: false,
+            ..RetryPolicy::default()
+        })
+        .build()
+        .unwrap();
+
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_retry_after_beyond_max_delay_ends_the_retry_loop() {
+    // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+    // Retry-After "indicates how long the user agent ought to wait before
+    // making a follow-up request." A hint longer than the policy's
+    // `max_delay` cannot be honored, and retrying sooner than the server
+    // asked only spends requests inside its window — so the response
+    // surfaces at once instead.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "120")
+                .set_body_string("rate limited"),
+        )
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Http4xx5xx { status: 429, .. }),
+        "expected the 429 to surface, got {err:?}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+// -- Builder validation -----------------------------------------------------------
+
+#[test]
+fn build_rejects_an_api_version_that_is_not_a_bare_number() {
+    // SOAP endpoint paths carry the bare `XX.X` form. The REST client's
+    // `v66.0` and anything with path characters would otherwise build a
+    // URL the server does not serve, or one outside `/services/Soap/m/`.
+    let auth = Arc::new(StaticTokenAuth::new(
+        "tok",
+        "https://my-org.my.salesforce.com",
+    ));
+    for bad in ["v66.0", "66", "66.0/../x", "latest", ""] {
+        let err = MetadataClient::builder()
+            .auth(auth.clone())
+            .api_version(bad)
+            .build()
+            .unwrap_err();
+        match err {
+            MetadataError::InvalidArgument(msg) => {
+                assert!(msg.contains(bad), "{bad:?}: {msg}");
+            }
+            other => panic!("{bad:?}: expected InvalidArgument, got {other:?}"),
+        }
+    }
+    for good in ["58.0", "66.0", "100.0"] {
+        MetadataClient::builder()
+            .auth(auth.clone())
+            .api_version(good)
+            .build()
+            .unwrap_or_else(|e| panic!("{good:?} rejected: {e}"));
+    }
+}
+
+// -- Parse failures name what broke ------------------------------------------------
+
+#[tokio::test]
+async fn a_typed_parse_failure_names_the_operation_and_element() {
+    // A value the typed envelope cannot parse should point at the
+    // element, so a Salesforce release that changes one field out of
+    // dozens does not need a traffic capture to diagnose.
+    let server = MockServer::start().await;
+    let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Body>
+    <countResponse>
+      <result><count>many</count></result>
+    </countResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let err = md.call(&Count).await.unwrap_err();
+    let msg = match err {
+        MetadataError::Xml(msg) => msg,
+        other => panic!("expected Xml, got {other:?}"),
+    };
+    assert!(msg.contains("countResponse"), "{msg}");
+    assert!(msg.contains("result.count"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_non_soap_2xx_body_carries_an_excerpt() {
+    // The non-2xx branch keeps a capped excerpt of a non-SOAP body; a
+    // 2xx from an intermediary (a maintenance page, a captive portal)
+    // deserves the same, or the caller only learns that "a body" failed.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html>scheduled maintenance</html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::InvalidResponse(msg) => {
+            assert!(msg.contains("200"), "{msg}");
+            assert!(msg.contains("scheduled maintenance"), "{msg}");
+        }
+        other => panic!("expected InvalidResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn build_accepts_a_plaintext_instance_url_when_opted_in() {
+    let auth = Arc::new(StaticTokenAuth::new(
+        "tok",
+        "http://my-org.my.salesforce.com",
+    ));
+    MetadataClient::builder()
+        .auth(auth)
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retry_read_timeouts_restores_replay_of_idempotent_operations() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .read_timeout(std::time::Duration::from_millis(50))
+        .retry_policy(RetryPolicy {
+            max_retries: 2,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            jitter: false,
+            retry_read_timeouts: true,
+            ..RetryPolicy::default()
+        })
+        .build()
+        .unwrap();
+
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Http(ref e) if e.is_timeout()),
+        "{err:?}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }

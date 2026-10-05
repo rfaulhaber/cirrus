@@ -55,11 +55,18 @@ you need anything beyond `deployRequest`.
 - **Cross-cutting** — retry/backoff via `RetryPolicy`, automatic
   `INVALID_SESSION_ID` refresh against the configured `AuthSession`, SOAP
   fault parsing into a typed `MetadataError::Soap`.
-- **Transport defaults** — the HTTP client the builder creates applies a 30 s
-  connect timeout and a 120 s read timeout
+- **Transport defaults** — the instance URL must be `https` (exact
+  `localhost` and the loopback literals excepted) because the session id
+  rides in every envelope; `MetadataClientBuilder::allow_insecure_transport`
+  is the opt-out, and the same rule governs `cirrus`. The HTTP client the
+  builder creates applies a 30 s connect timeout and a 120 s read timeout
   (`MetadataClientBuilder::connect_timeout` / `read_timeout` override either),
   and doesn't follow redirects — a 3xx surfaces as an error rather than
   re-POSTing the envelope, session token included, to the `Location` host.
+  A read timeout is surfaced, not replayed, unless
+  `RetryPolicy::retry_read_timeouts` is set, and a `Retry-After` longer than
+  `max_delay` ends the retry loop instead of being shortened. Errors that
+  retain a non-SOAP body have the session id replaced with `[redacted]`.
   The read timeout runs until the response head arrives, so it also bounds
   the upload of a deploy's base64 zip, and only then becomes a per-chunk
   deadline; widen it for a large deploy or retrieve over a slow link.

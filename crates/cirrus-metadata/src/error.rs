@@ -93,7 +93,9 @@ pub enum MetadataError {
         /// Raw response body, capped at 2 KiB (longer bodies are
         /// truncated with a marker — non-SOAP shapes come from
         /// proxies/gateways, and retaining them unboundedly would let
-        /// echoed request data flow into logs).
+        /// echoed request data flow into logs). The session id of the
+        /// attempt, and the content of any echoed `<sessionId>`
+        /// element, are replaced with `[redacted]`.
         raw: String,
     },
 
@@ -111,6 +113,8 @@ pub enum MetadataError {
     InvalidHeader(String),
 
     /// Response could not be interpreted as the requested type or shape.
+    /// A 2xx body that is not a SOAP envelope carries a short excerpt
+    /// here, with the session id redacted as for [`Self::Http4xx5xx`].
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 
@@ -132,22 +136,39 @@ pub enum MetadataError {
 /// Ceiling on how much of a non-SOAP error body is preserved in
 /// [`MetadataError::Http4xx5xx`]. Such bodies come from proxies and
 /// gateways, which can echo request data — capping what we retain
-/// bounds what can end up in the caller's logs via `Display`/`Debug`.
+/// bounds the size of what can end up in the caller's logs via
+/// `Display`/`Debug`; the session id itself is removed separately by
+/// [`MetadataError::redact_secrets`], since it sits well inside any
+/// useful cap.
 const RAW_ERROR_BODY_CAP: usize = 2048;
+
+/// Ceiling on the excerpt carried by the [`MetadataError::InvalidResponse`]
+/// raised when a 2xx body is not a SOAP envelope. Tighter than
+/// [`RAW_ERROR_BODY_CAP`]: the excerpt only has to show what answered.
+const NON_SOAP_BODY_EXCERPT_CAP: usize = 256;
 
 /// Decodes an error body for inclusion in an error, bounded by
 /// [`RAW_ERROR_BODY_CAP`] bytes and marked when anything was dropped.
-///
+pub(crate) fn cap_raw_body(bytes: &[u8]) -> String {
+    cap_body(bytes, RAW_ERROR_BODY_CAP)
+}
+
+/// Decodes the start of a 2xx body that was not a SOAP envelope, bounded
+/// by [`NON_SOAP_BODY_EXCERPT_CAP`] bytes.
+pub(crate) fn cap_body_excerpt(bytes: &[u8]) -> String {
+    cap_body(bytes, NON_SOAP_BODY_EXCERPT_CAP)
+}
+
 /// Only the capped byte prefix is decoded, so a multi-megabyte body never
 /// gets a full owned copy. Lossy decoding expands each invalid byte to a
 /// three-byte U+FFFD, which can push even that prefix past the cap, so the
 /// decoded string is trimmed again at a char boundary.
-pub(crate) fn cap_raw_body(bytes: &[u8]) -> String {
-    let mut truncated = bytes.len() > RAW_ERROR_BODY_CAP;
-    let head = &bytes[..bytes.len().min(RAW_ERROR_BODY_CAP)];
+fn cap_body(bytes: &[u8], cap: usize) -> String {
+    let mut truncated = bytes.len() > cap;
+    let head = &bytes[..bytes.len().min(cap)];
     let mut body = String::from_utf8_lossy(head).into_owned();
-    if body.len() > RAW_ERROR_BODY_CAP {
-        let mut end = RAW_ERROR_BODY_CAP;
+    if body.len() > cap {
+        let mut end = cap;
         while !body.is_char_boundary(end) {
             end -= 1;
         }
@@ -158,6 +179,78 @@ pub(crate) fn cap_raw_body(bytes: &[u8]) -> String {
         body.push_str("… <truncated>");
     }
     body
+}
+
+/// Stand-in for credential material removed from a stored error body.
+const REDACTED: &str = "[redacted]";
+
+impl MetadataError {
+    /// Removes the session id from every variant that retains body text
+    /// from an intermediary.
+    ///
+    /// A body is only retained when it was not a SOAP envelope, and such
+    /// bodies are written by proxies, gateways and WAFs, which routinely
+    /// echo the request that provoked them — envelope and `<sessionId>`
+    /// included. That text is interpolated into the error's `Display`,
+    /// so an ordinary `tracing::error!("{e}")` would otherwise write a
+    /// live session id into the caller's log sink.
+    ///
+    /// Every new variant that stores body text has to be added here.
+    pub(crate) fn redact_secrets(self, token: &str) -> Self {
+        match self {
+            Self::Http4xx5xx { status, raw } => Self::Http4xx5xx {
+                status,
+                raw: redact_body(&raw, token),
+            },
+            Self::InvalidResponse(message) => Self::InvalidResponse(redact_body(&message, token)),
+            other => other,
+        }
+    }
+}
+
+/// Replaces the live token, plus the content of any echoed `<sessionId>`
+/// element, with [`REDACTED`]. The second pass matters because an echoed
+/// envelope may carry a token other than this attempt's — one rotated
+/// mid-call — that the exact match misses.
+fn redact_body(body: &str, token: &str) -> String {
+    let stripped = if token.is_empty() {
+        body.to_string()
+    } else {
+        body.replace(token, REDACTED)
+    };
+    redact_session_id_elements(&stripped)
+}
+
+fn redact_session_id_elements(body: &str) -> String {
+    const LOCAL_NAME: &str = "sessionId>";
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0;
+    while let Some(offset) = body[cursor..].find(LOCAL_NAME) {
+        let name_start = cursor + offset;
+        let name_end = name_start + LOCAL_NAME.len();
+        // An opening tag is `<`, an optional `prefix:`, then the name; a
+        // closing tag has `/` right after the `<` and is left alone.
+        let before = &body[cursor..name_start];
+        let is_opening_tag = before.rfind('<').is_some_and(|lt| {
+            let between = &before[lt + 1..];
+            !between.starts_with('/')
+                && between
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.'))
+        });
+        out.push_str(&body[cursor..name_end]);
+        if !is_opening_tag {
+            cursor = name_end;
+            continue;
+        }
+        out.push_str(REDACTED);
+        // Skip the element's text content, up to its closing tag.
+        cursor = body[name_end..]
+            .find('<')
+            .map_or(body.len(), |i| name_end + i);
+    }
+    out.push_str(&body[cursor..]);
+    out
 }
 
 impl From<quick_xml::Error> for MetadataError {
@@ -216,6 +309,52 @@ mod tests {
     fn cap_raw_body_keeps_a_body_exactly_at_the_cap_whole() {
         let body = "x".repeat(RAW_ERROR_BODY_CAP);
         assert_eq!(cap_raw_body(body.as_bytes()), body);
+    }
+
+    #[test]
+    fn redact_secrets_strips_the_token_and_any_session_id_element() {
+        let echoed = "<html>blocked: <met:sessionId>00Dxx!live</met:sessionId> and \
+                      <sessionId>00Dxx!rotated</sessionId> and <sessionIdHint>x</sessionIdHint></html>";
+        let err = MetadataError::Http4xx5xx {
+            status: 400,
+            raw: echoed.into(),
+        }
+        .redact_secrets("00Dxx!live");
+        let MetadataError::Http4xx5xx { raw, .. } = &err else {
+            panic!("variant changed: {err:?}");
+        };
+        assert!(!raw.contains("00Dxx!live"), "{raw}");
+        assert!(!raw.contains("00Dxx!rotated"), "{raw}");
+        assert_eq!(
+            raw,
+            "<html>blocked: <met:sessionId>[redacted]</met:sessionId> and \
+             <sessionId>[redacted]</sessionId> and <sessionIdHint>x</sessionIdHint></html>"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_covers_invalid_response_and_leaves_other_variants() {
+        let err = MetadataError::InvalidResponse("body starts: <sessionId>tok</sessionId>".into())
+            .redact_secrets("tok");
+        assert_eq!(
+            err.to_string(),
+            "invalid response: body starts: <sessionId>[redacted]</sessionId>"
+        );
+        let untouched =
+            MetadataError::InvalidArgument("tok is fine here".into()).redact_secrets("tok");
+        assert_eq!(untouched.to_string(), "invalid argument: tok is fine here");
+    }
+
+    #[test]
+    fn cap_body_excerpt_is_tighter_than_the_raw_cap() {
+        let body = "x".repeat(RAW_ERROR_BODY_CAP);
+        let excerpt = cap_body_excerpt(body.as_bytes());
+        assert!(excerpt.ends_with("… <truncated>"));
+        assert!(
+            excerpt.len() < NON_SOAP_BODY_EXCERPT_CAP + 32,
+            "{}",
+            excerpt.len()
+        );
     }
 
     #[test]

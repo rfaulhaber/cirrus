@@ -37,6 +37,7 @@ httpdate = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
+serde_path_to_error = "0.1"
 # 0.41+ required: RUSTSEC-2026-0195 (unbounded namespace-declaration
 # allocation in NamespaceResolver::push) is fixed there.
 quick-xml = { version = "0.41", features = ["serialize"] }

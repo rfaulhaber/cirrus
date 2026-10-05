@@ -111,7 +111,8 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// own processing time — and from then on bounds the gap between two
 /// chunks of the response body. Only that second phase resets, so this
 /// is a deadline on getting an answer at all, not merely a stall
-/// detector.
+/// detector. A request that hits it is surfaced, not re-sent, unless
+/// [`RetryPolicy::retry_read_timeouts`] is on.
 ///
 /// Widen it with [`CirrusBuilder::read_timeout`] for a large Bulk 2.0
 /// or blob upload, or for a synchronous call the org takes a long time
@@ -765,13 +766,14 @@ impl Cirrus {
                             replay,
                             status,
                             attempt,
+                        ) && let Some(delay) = retry::compute_delay(
+                            &self.retry_policy,
+                            attempt,
+                            retry::parse_retry_after(&headers),
                         ) {
                             // Drain the body so the connection returns
                             // to the pool clean.
                             let _ = response.bytes().await;
-                            let retry_after = retry::parse_retry_after(&headers);
-                            let delay =
-                                retry::compute_delay(&self.retry_policy, attempt, retry_after);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -791,8 +793,8 @@ impl Cirrus {
                     replay,
                     &transport_error,
                     attempt,
-                ) {
-                    let delay = retry::compute_delay(&self.retry_policy, attempt, None);
+                ) && let Some(delay) = retry::compute_delay(&self.retry_policy, attempt, None)
+                {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
@@ -1149,6 +1151,11 @@ impl CirrusBuilder {
     /// very large result page over a slow link, and for a call the org
     /// takes a long time to answer.
     ///
+    /// A request that hits the deadline is surfaced as a timeout rather
+    /// than re-sent. With [`RetryPolicy::retry_read_timeouts`] on, the
+    /// worst case becomes `(max_retries + 1) × read_timeout` plus
+    /// backoff, doubled across a 401 refresh.
+    ///
     /// Ignored when [`http_client`](Self::http_client) supplies a client.
     pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.read_timeout = Some(timeout.into());
@@ -1290,16 +1297,7 @@ fn check_transport_security(
         return Ok(());
     }
     let parsed = url::Url::parse(url)?;
-    if parsed.scheme() == "https" {
-        return Ok(());
-    }
-    let loopback = match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
-        None => false,
-    };
-    if loopback {
+    if cirrus_auth::transport::is_secure_transport(&parsed) {
         return Ok(());
     }
     Err(CirrusError::InvalidInput {
@@ -1412,6 +1410,27 @@ mod tests {
             CirrusError::InvalidInput { field, .. } => assert_eq!(field, "instance URL"),
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_rejects_a_dotted_localhost_subdomain() {
+        // SOURCE: https://www.rfc-editor.org/rfc/rfc6761#section-6.3
+        // Resolvers only "SHOULD" treat `*.localhost` as loopback; glibc
+        // without nss-myhostname and macOS forward such names to DNS, so
+        // `sf.localhost` can resolve off-machine and is no exemption from
+        // the https rule. Exact `localhost` and the loopback literals are.
+        let auth = Arc::new(StaticTokenAuth::new("tok", "http://sf.localhost:8080"));
+        let err = Cirrus::builder().auth(auth).build().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CirrusError::InvalidInput {
+                    field: "instance URL",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1939,6 +1958,94 @@ mod tests {
                 .retry_policy(policy)
                 .build()
                 .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_read_timeout_is_not_replayed() {
+            // The read timeout is the caller's deadline on getting an
+            // answer at all; re-sending a GET up to `max_retries` more
+            // times would quietly multiply that deadline by four and
+            // take another long-running-request slot each time.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok": true}))
+                        .set_delay(Duration::from_secs(5)),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .read_timeout(Duration::from_millis(50))
+                .retry_policy(fast_retry_policy())
+                .build()
+                .unwrap();
+
+            let err = sf.get::<serde_json::Value>("limits").await.unwrap_err();
+            match err {
+                CirrusError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
+                other => panic!("expected a transport error, got {other:?}"),
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn retry_read_timeouts_restores_replay_of_idempotent_reads() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok": true}))
+                        .set_delay(Duration::from_secs(5)),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .read_timeout(Duration::from_millis(50))
+                .retry_policy(RetryPolicy {
+                    max_retries: 2,
+                    retry_read_timeouts: true,
+                    ..fast_retry_policy()
+                })
+                .build()
+                .unwrap();
+
+            let err = sf.get::<serde_json::Value>("limits").await.unwrap_err();
+            assert!(
+                matches!(err, CirrusError::Http(ref e) if e.is_timeout()),
+                "{err:?}"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        }
+
+        #[tokio::test]
+        async fn a_retry_after_beyond_max_delay_surfaces_the_response() {
+            // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+            // A Retry-After the policy cannot honor within `max_delay` ends
+            // the retry loop: retrying sooner than the server asked only
+            // spends requests inside its window.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "120"))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let err = sf.get::<serde_json::Value>("limits").await.unwrap_err();
+            assert!(
+                matches!(err, CirrusError::Api { status: 503, .. }),
+                "expected the 503 to surface, got {err:?}"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
 
         #[tokio::test]

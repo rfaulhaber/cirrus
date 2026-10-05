@@ -165,13 +165,7 @@ pub(super) fn normalize_url(url: &str) -> String {
 /// Expects an already-[`normalize_url`]d value.
 pub(super) fn require_secure_login_url(url: &str) -> AuthResult<()> {
     let parsed = url::Url::parse(url)?;
-    let loopback = match parsed.host() {
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        None => false,
-    };
-    if parsed.scheme() == "https" || loopback {
+    if crate::transport::is_secure_transport(&parsed) {
         Ok(())
     } else {
         Err(AuthError::InsecureLoginUrl {
@@ -377,6 +371,18 @@ mod tests {
         require_secure_login_url("http://127.0.0.1:8080").unwrap();
         require_secure_login_url("http://localhost:8080").unwrap();
         require_secure_login_url("http://[::1]:8080").unwrap();
+    }
+
+    #[test]
+    fn a_dotted_localhost_login_url_is_rejected() {
+        // `sf.localhost` is not the loopback exemption: resolvers may
+        // forward it to DNS, so the shared rule in `crate::transport`
+        // treats it like any other host.
+        let err = require_secure_login_url("http://sf.localhost:8080").unwrap_err();
+        assert!(
+            matches!(err, AuthError::InsecureLoginUrl { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

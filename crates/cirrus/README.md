@@ -107,7 +107,10 @@ boundary between auth and REST without extra plumbing.
 - **`CirrusError` is `#[non_exhaustive]`** — match the variants you handle and
   keep a `_` arm; a new variant in a later release stays an additive change.
 - **Retry + backoff** — `RetryPolicy` covers 429, 503, and transient 5xx with
-  full jitter; honors `Retry-After`. Configurable; off by default for non-idempotent 5xx.
+  full jitter; honors `Retry-After` up to `max_delay` and surfaces the response
+  when the hint is longer. Configurable; off by default for non-idempotent 5xx,
+  and a read timeout is surfaced rather than replayed unless
+  `retry_read_timeouts` is set.
   GET, PUT and DELETE are replayed after a 5xx or a lost response and POST and
   PATCH are not; `send_with_replay` takes an explicit `Replay` when the method
   misstates what an endpoint does, and Apex REST never replays.

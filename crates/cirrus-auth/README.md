@@ -100,8 +100,10 @@ don't break downstream `match` arms.
 When a flow builder isn't given an `http_client`, the client it builds
 applies connect and request timeouts and refuses to follow redirects: the
 grants here carry their credential in the request body, which reqwest
-replays on a 307/308. Login URLs must be `https` (loopback hosts
-excepted, for local test servers).
+replays on a 307/308. Login URLs must be `https`; exact `localhost` and the
+loopback literals are excepted for local test servers, and `*.localhost`
+names are not. The same rule, `cirrus_auth::transport::is_secure_transport`,
+governs instance URLs in `cirrus` and `cirrus-metadata`.
 
 `cirrus` carries a `From<AuthError> for CirrusError` impl, so REST call
 sites that need an auth token can use `?` and surface the failure as

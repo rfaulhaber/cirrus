@@ -32,7 +32,10 @@
 //! 2. **Honor server hints.** When the server provides a
 //!    [`Retry-After`] header — either RFC 7231 §7.1.3 form,
 //!    delta-seconds or an HTTP-date — use that delay instead of our
-//!    backoff schedule.
+//!    backoff schedule. A hint longer than
+//!    [`max_delay`](RetryPolicy::max_delay) cannot be honored, and
+//!    retrying sooner than the server asked only spends requests inside
+//!    its window, so the response surfaces to the caller at once.
 //! 3. **Jitter to avoid thundering herd.** Default policy applies
 //!    *full jitter* — random uniform `[0, computed_delay]` — per
 //!    AWS's recommendations for distributed clients hitting a shared
@@ -82,7 +85,9 @@ pub struct RetryPolicy {
     /// 100 ms.
     pub base_delay: Duration,
     /// Cap on the computed backoff delay — prevents pathological
-    /// growth on high attempt counts. Default 30 s.
+    /// growth on high attempt counts. Default 30 s. Also the longest
+    /// `Retry-After` hint the client will wait out: a longer hint ends
+    /// the retry loop and the response surfaces to the caller.
     pub max_delay: Duration,
     /// Apply *full jitter* — pick a random delay in `[0, computed]`
     /// rather than using the deterministic exponential value. Default
@@ -98,6 +103,16 @@ pub struct RetryPolicy {
     /// 5xx, regardless of this flag — duplicate-record risk outweighs
     /// the convenience.
     pub retry_idempotent_5xx: bool,
+    /// When `true`, a request that hits the read timeout is re-sent on
+    /// the same terms as a connection reset — only when the call is
+    /// replay-safe. Default `false`: the read timeout is the caller's
+    /// deadline on getting an answer, a slow org is not a transient
+    /// fault, and each replay takes another of the org's concurrent
+    /// long-running-request slots. With this on, the worst case is
+    /// `(max_retries + 1) × read_timeout` plus backoff, doubled across
+    /// a 401 refresh. Connect-phase timeouts are unaffected: the request
+    /// never reached the server, so they always retry.
+    pub retry_read_timeouts: bool,
 }
 
 impl Default for RetryPolicy {
@@ -108,6 +123,7 @@ impl Default for RetryPolicy {
             max_delay: Duration::from_secs(30),
             jitter: true,
             retry_idempotent_5xx: true,
+            retry_read_timeouts: false,
         }
     }
 }
@@ -201,14 +217,16 @@ pub(crate) fn should_retry_status(
 
 /// Decision point: should we retry this network-level failure?
 ///
-/// Network errors that occur mid-request (connection reset, read
-/// timeout) are ambiguous — the server may or may not have processed
+/// Network errors that occur mid-request (a connection reset, a body
+/// that stops) are ambiguous — the server may or may not have processed
 /// the request before the connection dropped — so those retry only when
 /// the request is replay-safe, where a duplicated effect is harmless.
-/// Connect-phase errors (DNS failure, TCP RST, TLS handshake failure,
-/// connect timeout) mean the request never reached the server, so
-/// retrying is safe for any method. Same policy as the
-/// `cirrus-metadata` sibling.
+/// A read timeout is surfaced rather than replayed unless
+/// [`RetryPolicy::retry_read_timeouts`] is on: it is the caller's
+/// deadline, and a replay would quietly multiply it. Connect-phase
+/// errors (DNS failure, TCP RST, TLS handshake failure, connect
+/// timeout) mean the request never reached the server, so retrying is
+/// safe for any method. Same policy as the `cirrus-metadata` sibling.
 ///
 /// Errors raised while *building* the request — an instance URL that
 /// doesn't parse, a header value reqwest rejects — are permanent: no
@@ -232,6 +250,9 @@ pub(crate) fn should_retry_network(
     }
     if http.is_connect() {
         return true;
+    }
+    if http.is_timeout() && !policy.retry_read_timeouts {
+        return false;
     }
     is_replayable(method, replay)
 }
@@ -270,11 +291,14 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
     )
 }
 
-/// Compute the next backoff delay.
+/// Compute the next backoff delay, or `None` when the retry should not
+/// happen at all.
 ///
 /// Precedence:
-/// 1. If a `Retry-After` hint is present, honor it (capped at
-///    [`max_delay`](RetryPolicy::max_delay)).
+/// 1. A `Retry-After` hint within [`max_delay`](RetryPolicy::max_delay)
+///    is used as is. A longer hint yields `None`: the client cannot
+///    wait that long under its own policy, and retrying early would
+///    land inside the window the server asked it to stay out of.
 /// 2. Otherwise compute `base_delay * 2^attempt`, capped at
 ///    `max_delay`.
 /// 3. If [`jitter`](RetryPolicy::jitter) is enabled, sample uniformly
@@ -284,17 +308,26 @@ pub(crate) fn compute_delay(
     policy: &RetryPolicy,
     attempt: u32,
     retry_after: Option<Duration>,
-) -> Duration {
+) -> Option<Duration> {
     if let Some(hint) = retry_after {
-        let capped = hint.min(policy.max_delay);
+        if hint > policy.max_delay {
+            tracing::warn!(
+                target: "cirrus::retry",
+                attempt = attempt + 1,
+                retry_after_ms = hint.as_millis() as u64,
+                max_delay_ms = policy.max_delay.as_millis() as u64,
+                "Retry-After exceeds max_delay; surfacing the response instead of retrying",
+            );
+            return None;
+        }
         tracing::warn!(
             target: "cirrus::retry",
             attempt = attempt + 1,
-            delay_ms = capped.as_millis() as u64,
+            delay_ms = hint.as_millis() as u64,
             source = "retry-after-header",
             "scheduling request retry",
         );
-        return capped;
+        return Some(hint);
     }
     // base_delay * 2^attempt, in milliseconds, saturating on overflow.
     let factor: u128 = 1u128.checked_shl(attempt).unwrap_or(u128::MAX);
@@ -335,7 +368,7 @@ pub(crate) fn compute_delay(
         source = "exponential-backoff",
         "scheduling request retry",
     );
-    final_delay
+    Some(final_delay)
 }
 
 #[cfg(test)]
@@ -574,7 +607,8 @@ mod tests {
         ));
 
         // A response that never arrives is ambiguous: the org may have
-        // processed the request already.
+        // processed the request already. By default the read timeout is
+        // the caller's deadline, so it is surfaced for every call site.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
@@ -589,6 +623,20 @@ mod tests {
             .await
             .unwrap_err()
             .into();
+        assert!(!should_retry_network(
+            &p,
+            &reqwest::Method::GET,
+            Replay::ByMethod,
+            &stalled,
+            0
+        ));
+
+        // Opting into timeout replay re-enables it for replay-safe calls
+        // only; `Never` still drops the ambiguous outcome.
+        let p = RetryPolicy {
+            retry_read_timeouts: true,
+            ..RetryPolicy::default()
+        };
         assert!(should_retry_network(
             &p,
             &reqwest::Method::GET,
@@ -747,21 +795,23 @@ mod tests {
     }
 
     #[test]
-    fn compute_delay_honors_retry_after_capped_at_max() {
+    fn compute_delay_honors_a_retry_after_within_max_delay_and_refuses_a_longer_one() {
         let p = RetryPolicy {
             max_delay: Duration::from_secs(10),
             ..RetryPolicy::default()
         };
-        // Hint within cap → use it.
+        // Within the cap, the hint is used as is — right up to the cap.
         assert_eq!(
             compute_delay(&p, 0, Some(Duration::from_secs(3))),
-            Duration::from_secs(3)
+            Some(Duration::from_secs(3))
         );
-        // Hint over cap → clamp.
         assert_eq!(
-            compute_delay(&p, 0, Some(Duration::from_secs(99))),
-            Duration::from_secs(10)
+            compute_delay(&p, 0, Some(Duration::from_secs(10))),
+            Some(Duration::from_secs(10))
         );
+        // Beyond it, the retry does not happen: sleeping for a
+        // truncated interval would retry inside the server's window.
+        assert_eq!(compute_delay(&p, 0, Some(Duration::from_secs(99))), None);
     }
 
     #[test]
@@ -773,14 +823,14 @@ mod tests {
             jitter: false,
             ..RetryPolicy::default()
         };
-        assert_eq!(compute_delay(&p, 0, None), Duration::from_millis(100));
-        assert_eq!(compute_delay(&p, 1, None), Duration::from_millis(200));
-        assert_eq!(compute_delay(&p, 2, None), Duration::from_millis(400));
-        assert_eq!(compute_delay(&p, 3, None), Duration::from_millis(800));
+        assert_eq!(compute_delay(&p, 0, None), Some(Duration::from_millis(100)));
+        assert_eq!(compute_delay(&p, 1, None), Some(Duration::from_millis(200)));
+        assert_eq!(compute_delay(&p, 2, None), Some(Duration::from_millis(400)));
+        assert_eq!(compute_delay(&p, 3, None), Some(Duration::from_millis(800)));
         // 100ms * 2^4 = 1600ms → clamped to 1000ms (max_delay).
-        assert_eq!(compute_delay(&p, 4, None), Duration::from_secs(1));
+        assert_eq!(compute_delay(&p, 4, None), Some(Duration::from_secs(1)));
         // Way beyond cap — still clamped, no overflow.
-        assert_eq!(compute_delay(&p, 100, None), Duration::from_secs(1));
+        assert_eq!(compute_delay(&p, 100, None), Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -793,7 +843,7 @@ mod tests {
         };
         // 100ms * 2^2 = 400ms ceiling.
         for _ in 0..50 {
-            let d = compute_delay(&p, 2, None);
+            let d = compute_delay(&p, 2, None).unwrap();
             assert!(d <= Duration::from_millis(400));
         }
     }
@@ -811,7 +861,7 @@ mod tests {
             ..RetryPolicy::default()
         };
         for attempt in [0, 57, 58, 63, 64, 100] {
-            let d = compute_delay(&p, attempt, None);
+            let d = compute_delay(&p, attempt, None).unwrap();
             assert!(d <= Duration::from_millis(u64::MAX));
         }
     }
@@ -824,7 +874,7 @@ mod tests {
             jitter: true,
             ..RetryPolicy::default()
         };
-        assert_eq!(compute_delay(&p, 0, None), Duration::ZERO);
-        assert_eq!(compute_delay(&p, 5, None), Duration::ZERO);
+        assert_eq!(compute_delay(&p, 0, None), Some(Duration::ZERO));
+        assert_eq!(compute_delay(&p, 5, None), Some(Duration::ZERO));
     }
 }
