@@ -37,8 +37,8 @@
 //!
 //! [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
 
-use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
+use crate::{Cirrus, Replay};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -83,6 +83,18 @@ impl Cirrus {
 /// including `U+0020` — the C0 controls and the space — see the
 /// [module docs](self#path-encoding).
 ///
+/// No method here is replayed once the request has reached the org,
+/// whatever its HTTP verb. The status codes come from developer code:
+/// Salesforce documents the Apex REST 500 as an unhandled Apex
+/// exception rather than a transient failure, and nothing stops an
+/// `@HttpGet`, `@HttpPut` or `@HttpDelete` method from writing, so a
+/// re-sent request would run that Apex again, DML and callouts
+/// included. Only 429 and connect-phase failures retry, and a 401 the
+/// Apex sets is surfaced as-is rather than treated as an expired token.
+/// For an endpoint the org documents as read-only,
+/// [`Cirrus::send_with_replay`] with [`Replay::ByMethod`] restores the
+/// default retry behaviour.
+///
 /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
 #[derive(Debug)]
 pub struct ApexHandler<'a> {
@@ -92,7 +104,16 @@ pub struct ApexHandler<'a> {
 impl ApexHandler<'_> {
     /// `GET /services/apexrest/{path}`.
     pub async fn get<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
-        self.client.get(&apex_path(path)?).await
+        self.client
+            .send_with_replay::<R, ()>(
+                reqwest::Method::GET,
+                &apex_path(path)?,
+                None,
+                &[],
+                None,
+                Replay::Never,
+            )
+            .await
     }
 
     /// `GET /services/apexrest/{path}` with a query string. `query` is
@@ -103,7 +124,9 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
-        self.client.get_with_query(&apex_path(path)?, query).await
+        self.client
+            .get_with_query_no_replay(&apex_path(path)?, query)
+            .await
     }
 
     /// `POST /services/apexrest/{path}` with a JSON body.
@@ -112,7 +135,16 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.client.post(&apex_path(path)?, body).await
+        self.client
+            .send_with_replay(
+                reqwest::Method::POST,
+                &apex_path(path)?,
+                None,
+                &[],
+                Some(body),
+                Replay::Never,
+            )
+            .await
     }
 
     /// `PUT /services/apexrest/{path}` with a JSON body.
@@ -121,7 +153,16 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.client.put(&apex_path(path)?, body).await
+        self.client
+            .send_with_replay(
+                reqwest::Method::PUT,
+                &apex_path(path)?,
+                None,
+                &[],
+                Some(body),
+                Replay::Never,
+            )
+            .await
     }
 
     /// `PATCH /services/apexrest/{path}` with a JSON body.
@@ -130,12 +171,30 @@ impl ApexHandler<'_> {
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        self.client.patch(&apex_path(path)?, body).await
+        self.client
+            .send_with_replay(
+                reqwest::Method::PATCH,
+                &apex_path(path)?,
+                None,
+                &[],
+                Some(body),
+                Replay::Never,
+            )
+            .await
     }
 
     /// `DELETE /services/apexrest/{path}`.
     pub async fn delete<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
-        self.client.delete(&apex_path(path)?).await
+        self.client
+            .send_with_replay::<R, ()>(
+                reqwest::Method::DELETE,
+                &apex_path(path)?,
+                None,
+                &[],
+                None,
+                Replay::Never,
+            )
+            .await
     }
 }
 
@@ -223,6 +282,23 @@ mod tests {
     fn fixture(uri: String) -> Cirrus {
         let auth = Arc::new(StaticTokenAuth::new("tok", uri));
         Cirrus::builder().auth(auth).build().unwrap()
+    }
+
+    fn fixture_with_fast_retries(uri: String) -> Cirrus {
+        // The default retry budget with zero delays, so a replay that
+        // should not happen shows up as an extra request, not as a
+        // slow test.
+        let auth = Arc::new(StaticTokenAuth::new("tok", uri));
+        Cirrus::builder()
+            .auth(auth)
+            .retry_policy(crate::RetryPolicy {
+                base_delay: std::time::Duration::ZERO,
+                max_delay: std::time::Duration::ZERO,
+                jitter: false,
+                ..crate::RetryPolicy::default()
+            })
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -589,6 +665,121 @@ mod tests {
 
         let sf = fixture(server.uri());
         sf.apex().delete::<()>("Cases/500xx").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn apex_get_is_not_replayed_after_a_5xx() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_rest_methods.htm
+        // Response Status Codes: 500 is "An unhandled Apex exception
+        // occurred." The Apex already ran, so a re-sent GET runs it
+        // again — DML, callouts and all — before the caller sees the
+        // same failure.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Cases/500xx"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!([{
+                "message": "System.QueryException: List has no rows for assignment to SObject",
+                "errorCode": "APEX_ERROR"
+            }])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let err = sf
+            .apex()
+            .get::<serde_json::Value>("Cases/500xx")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 500, .. }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apex_get_with_query_is_not_replayed_after_a_5xx() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Report"))
+            .and(query_param("since", "2026-01-01"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let err = sf
+            .apex()
+            .get_with_query::<serde_json::Value, _>("Report", &[("since", "2026-01-01")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 502, .. }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apex_put_is_not_replayed_after_a_503() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_classes_annotation_http_put.htm
+        // "@HttpPut ... creates or updates the specified resource": the
+        // method name promises nothing about idempotency of the Apex
+        // behind it, so a 503 from an intermediary after the commit must
+        // not be followed by a second PUT.
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/services/apexrest/Orders/801xx"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let err = sf
+            .apex()
+            .put::<serde_json::Value, _>("Orders/801xx", &json!({"status": "Shipped"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 503, .. }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apex_delete_is_not_replayed_after_a_503() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/services/apexrest/Orders/801xx"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let err = sf.apex().delete::<()>("Orders/801xx").await.unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 503, .. }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apex_retries_a_429_because_the_request_was_refused() {
+        // 429 means the org never ran the Apex, so the one retry class
+        // that survives `Replay::Never` still applies here.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Cases/500xx"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Cases/500xx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Id": "500xx"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let case: serde_json::Value = sf.apex().get("Cases/500xx").await.unwrap();
+        assert_eq!(case["Id"], "500xx");
     }
 
     #[tokio::test]

@@ -90,9 +90,10 @@ trait so handlers don't care which flow you used.
 - **Static token** — `auth::StaticTokenAuth::new(token, instance_url)` for
   paste-from-`sf-org-display` workflows
 
-Auto-refresh on 401: when an expired token surfaces, `JwtAuth`,
+Auto-refresh on 401: when Salesforce answers `INVALID_SESSION_ID`, `JwtAuth`,
 `RefreshTokenAuth`, and `ClientCredentialsAuth` invalidate their cache and
-retry once with a fresh token, transparently. Compare-and-swap semantics avoid
+retry once with a fresh token, transparently. Any other 401 — one an Apex REST
+class sets, say — is surfaced as-is. Compare-and-swap semantics avoid
 clobbering a token a concurrent task just refreshed.
 
 The flows live in the [`cirrus-auth`](../cirrus-auth/) sub-crate and are
@@ -107,6 +108,9 @@ boundary between auth and REST without extra plumbing.
   keep a `_` arm; a new variant in a later release stays an additive change.
 - **Retry + backoff** — `RetryPolicy` covers 429, 503, and transient 5xx with
   full jitter; honors `Retry-After`. Configurable; off by default for non-idempotent 5xx.
+  GET, PUT and DELETE are replayed after a 5xx or a lost response and POST and
+  PATCH are not; `send_with_replay` takes an explicit `Replay` when the method
+  misstates what an endpoint does, and Apex REST never replays.
 - **Sforce-Limit-Info capture** — every response sent through the typed verb
   methods and handlers has its API quota header parsed and surfaced via
   `sf.last_limit_info()`. `request_builder` and `execute` step outside the

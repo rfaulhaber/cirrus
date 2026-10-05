@@ -19,6 +19,10 @@ use thiserror::Error;
 /// Specialized `Result` type for Cirrus operations.
 pub type CirrusResult<T> = Result<T, CirrusError>;
 
+/// The `errorCode` Salesforce puts on a 401 whose cause is the bearer
+/// token itself. No other 401 is cured by a fresh token.
+const INVALID_SESSION_ID: &str = "INVALID_SESSION_ID";
+
 /// A single Salesforce API error entry.
 ///
 /// Salesforce REST endpoints return errors as a JSON array of these objects.
@@ -119,6 +123,19 @@ pub enum CirrusError {
 const REDACTED: &str = "[redacted]";
 
 impl CirrusError {
+    /// Whether this is Salesforce's own report that the bearer token is
+    /// expired or invalid: a 401 whose error array carries
+    /// `INVALID_SESSION_ID`. A 401 that an Apex REST class sets, or that
+    /// a scope check produces, is the endpoint's verdict on the request
+    /// and is not one of these.
+    pub(crate) fn is_invalid_session(&self) -> bool {
+        matches!(
+            self,
+            Self::Api { status: 401, errors, .. }
+                if errors.iter().any(|e| e.error_code == INVALID_SESSION_ID)
+        )
+    }
+
     /// Removes bearer-token material from every variant that carries
     /// response-body text.
     ///
