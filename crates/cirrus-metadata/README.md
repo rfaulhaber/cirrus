@@ -165,7 +165,18 @@ propagate from any `AuthSession::access_token` call alongside SOAP
 traffic.
 
 `MetadataError` is `#[non_exhaustive]` so future variants don't break
-downstream `match` arms.
+downstream `match` arms. Variants that wrap another error (`Http`,
+`HttpClient`) expose it through `source()` and don't repeat it in
+`Display`; print the chain (anyhow's `{:#}`) to see the cause.
+
+## Logging
+
+Events are emitted under `cirrus_metadata::auth` (the `INVALID_SESSION_ID`
+refresh), `cirrus_metadata::retry` (backoff scheduling) and
+`cirrus_metadata::poll` (the deploy and retrieve polling helpers). The
+auth flows log under `cirrus_auth::*`, so a filter such as
+`RUST_LOG=cirrus_metadata=debug,cirrus_auth=debug` covers both layers. No
+event carries a session id or a credential.
 
 ## Integration tests
 

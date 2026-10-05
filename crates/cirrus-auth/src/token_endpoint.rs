@@ -116,34 +116,111 @@ impl TokenResponse {
     }
 }
 
-/// Connect timeout applied to the token-endpoint client the builders
-/// construct when the caller supplies none.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connect-phase timeout of the token-endpoint client a flow builder
+/// creates when it is not given one. Override per flow with the builder's
+/// `connect_timeout`.
+pub const DEFAULT_TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Total request timeout applied to that same client. Token responses are
-/// a few hundred bytes, so a bound this generous only ever fires on a
-/// stalled peer — and without it a silently dropped connection parks the
-/// mint (and, for [`crate::refresh`], the lock it holds) indefinitely.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Builds the `reqwest::Client` used for token exchanges when a flow
-/// builder is not given one.
+/// Deadline for each token request that same client sends, from dispatch
+/// until the whole response has arrived. Override per flow with the
+/// builder's `request_timeout`.
 ///
-/// Two properties matter beyond the timeouts above. Redirects are
-/// **not** followed: every grant in this crate carries its credential in
-/// the form body (`client_secret`, `refresh_token`, the JWT `assertion`,
-/// the RFC 8693 `subject_token`, the PKCE `code_verifier`), and reqwest
-/// replays the body on a 307/308 — so a redirect from the token endpoint
-/// would re-POST live credentials to whatever host the `Location` names.
-/// A flow that is handed a caller-supplied client inherits that client's
-/// policy instead, so callers sharing a connection pool should configure
-/// both there.
-pub(super) fn default_http_client() -> AuthResult<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .timeout(DEFAULT_REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+/// Token responses are a few hundred bytes, so a bound this generous only
+/// ever fires on a stalled peer. Without one, a connection the peer
+/// accepts and never answers parks the mint, and every caller queued
+/// behind it, indefinitely.
+pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `reqwest::ClientBuilder` carrying the settings the flow builders
+/// apply to the token-endpoint client they create: the two default
+/// timeouts and a redirect policy that follows nothing.
+///
+/// Redirects are not followed because every grant in this crate carries
+/// its credential in the form body (`client_secret`, `refresh_token`, the
+/// JWT `assertion`, the RFC 8693 `subject_token`, the PKCE
+/// `code_verifier`), and reqwest replays the body on a 307/308, so a
+/// redirect from the token endpoint would re-POST live credentials to
+/// whatever host the `Location` header names.
+///
+/// Start from this builder when the token client needs a setting the
+/// flow builders do not expose, such as a private root CA, a proxy or a
+/// connection pool shared with other clients, so that adding it does not
+/// silently drop the no-redirect rule or the timeouts:
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use cirrus_auth::{JwtAuth, reqwest, token_client_builder};
+///
+/// let ca = reqwest::Certificate::from_pem(&fs_err::read("corp-root.pem")?)?;
+/// let http = token_client_builder().add_root_certificate(ca).build()?;
+/// let auth = JwtAuth::builder()
+///     .consumer_key("3MVG9...")
+///     .username("integration-user@example.com")
+///     .instance_url("https://my-org.my.salesforce.com")
+///     .private_key_pem_file("./private.pem")?
+///     .http_client(http)
+///     .build()?;
+/// # let _ = auth;
+/// # Ok(())
+/// # }
+/// ```
+pub fn token_client_builder() -> reqwest::ClientBuilder {
+    hardened_client_builder(
+        Some(DEFAULT_TOKEN_CONNECT_TIMEOUT),
+        Some(DEFAULT_TOKEN_REQUEST_TIMEOUT),
+    )
+}
+
+/// The no-redirect policy plus whichever timeouts are given; `None`
+/// leaves that bound off.
+fn hardened_client_builder(
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+) -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(timeout) = connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    if let Some(timeout) = request_timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder
+}
+
+/// Finishes a client builder, reporting a failure as
+/// [`AuthError::HttpClient`]: no request was made, so it must not read
+/// as one that failed.
+fn finish_client(builder: reqwest::ClientBuilder) -> AuthResult<reqwest::Client> {
+    builder.build().map_err(AuthError::HttpClient)
+}
+
+/// The transport settings a flow builder collects for its token-endpoint
+/// client: a caller-supplied client, or the timeouts to apply to the one
+/// the builder constructs.
+///
+/// Each timeout is `None` until its setter is called; `Some(None)` is an
+/// explicit request for no bound.
+#[derive(Default)]
+pub(super) struct HttpClientConfig {
+    pub(super) client: Option<reqwest::Client>,
+    pub(super) connect_timeout: Option<Option<Duration>>,
+    pub(super) request_timeout: Option<Option<Duration>>,
+}
+
+impl HttpClientConfig {
+    /// The client the flow will use. A supplied client wins outright,
+    /// timeouts and redirect policy included.
+    pub(super) fn into_client(self) -> AuthResult<reqwest::Client> {
+        match self.client {
+            Some(client) => Ok(client),
+            None => finish_client(hardened_client_builder(
+                self.connect_timeout
+                    .unwrap_or(Some(DEFAULT_TOKEN_CONNECT_TIMEOUT)),
+                self.request_timeout
+                    .unwrap_or(Some(DEFAULT_TOKEN_REQUEST_TIMEOUT)),
+            )),
+        }
+    }
 }
 
 /// Normalizes a configured or server-returned Salesforce URL: surrounding
@@ -284,8 +361,8 @@ fn transport_failure_is_retryable(error: &reqwest::Error, replay: GrantReplay) -
 /// [`GrantReplay::Safe`] grant, up to [`TOKEN_REQUEST_BACKOFF`]'s budget.
 /// On a terminal non-2xx, the body is parsed as the OAuth error shape if
 /// possible; otherwise only the status is surfaced as
-/// [`AuthError::UnexpectedResponse`] — the body is logged at TRACE rather
-/// than carried, since non-standard error pages can echo credentials.
+/// [`AuthError::UnexpectedResponse`]. Such a body is neither carried nor
+/// logged, since non-standard error pages can echo credentials.
 pub(super) async fn exchange<B>(
     http: &reqwest::Client,
     login_url: &str,
@@ -297,14 +374,14 @@ where
 {
     let url = format!("{login_url}/services/oauth2/token");
     let mut attempt = 0usize;
-    let (status, bytes) = loop {
+    let (status, content_type, bytes) = loop {
         // `None` once the budget is spent: the attempt below is the last.
         let backoff = TOKEN_REQUEST_BACKOFF.get(attempt).copied();
         let response = match (http.post(&url).form(body).send().await, backoff) {
             (Ok(response), _) => response,
             (Err(e), Some(delay)) if transport_failure_is_retryable(&e, replay) => {
                 tracing::warn!(
-                    target: "cirrus::auth",
+                    target: "cirrus_auth::token_endpoint",
                     attempt = attempt + 1,
                     error = %e,
                     "token request failed in transport; retrying",
@@ -316,13 +393,18 @@ where
             (Err(e), _) => return Err(e.into()),
         };
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let bytes = match (response.bytes().await, backoff) {
             (Ok(bytes), _) => bytes,
             // A body that dies mid-stream is as ambiguous as a lost
             // response: the server may already have acted on the grant.
             (Err(e), Some(delay)) if replay == GrantReplay::Safe => {
                 tracing::warn!(
-                    target: "cirrus::auth",
+                    target: "cirrus_auth::token_endpoint",
                     attempt = attempt + 1,
                     error = %e,
                     "token response body failed mid-stream; retrying",
@@ -338,7 +420,7 @@ where
             && (status == 429 || (500..600).contains(&status))
         {
             tracing::warn!(
-                target: "cirrus::auth",
+                target: "cirrus_auth::token_endpoint",
                 attempt = attempt + 1,
                 status,
                 "token endpoint answered a retryable status; retrying",
@@ -347,7 +429,7 @@ where
             attempt += 1;
             continue;
         }
-        break (status, bytes);
+        break (status, content_type, bytes);
     };
 
     if !(200..300).contains(&status) {
@@ -357,16 +439,17 @@ where
                 error_description: oauth_err.error_description,
             });
         }
-        // The body didn't match the OAuth error shape. Do NOT fold it into
-        // the error message: non-standard token-endpoint bodies (HTML error
-        // pages, proxies, reflected request parameters) can echo token
-        // material, and the error message flows into logs. Surface only the
-        // status; expose the body solely at TRACE, which is off by default
-        // and a deliberate per-target opt-in for debugging.
+        // A body outside the OAuth error shape came from an intermediary
+        // (an HTML error page, a proxy), and those tend to echo the form
+        // that provoked them, credentials included. The body is therefore
+        // neither carried on the error nor logged at any level, since a
+        // global TRACE filter would receive it. Status, content type and
+        // length are enough to tell such a page from a Salesforce answer.
         tracing::trace!(
-            target: "cirrus::auth",
+            target: "cirrus_auth::token_endpoint",
             status,
-            body = %String::from_utf8_lossy(&bytes),
+            content_type = content_type.as_deref().unwrap_or("<none>"),
+            body_len = bytes.len(),
             "token endpoint returned a non-2xx body that did not parse as an OAuth error",
         );
         return Err(AuthError::UnexpectedResponse { status });
@@ -488,7 +571,7 @@ mod tests {
     async fn a_replay_safe_grant_retries_429_and_5xx_within_the_budget() {
         let server = wiremock::MockServer::start().await;
         mount_then_succeed(&server, 503, 2).await;
-        let http = default_http_client().unwrap();
+        let http = token_client_builder().build().unwrap();
         let token = exchange(
             &http,
             &server.uri(),
@@ -517,7 +600,7 @@ mod tests {
     async fn the_retry_budget_is_exhausted_after_three_attempts() {
         let server = wiremock::MockServer::start().await;
         mount_then_succeed(&server, 503, 3).await;
-        let http = default_http_client().unwrap();
+        let http = token_client_builder().build().unwrap();
         let err = exchange(
             &http,
             &server.uri(),
@@ -537,7 +620,7 @@ mod tests {
     async fn a_grant_marked_never_is_not_replayed_after_a_5xx() {
         let server = wiremock::MockServer::start().await;
         mount_then_succeed(&server, 503, 1).await;
-        let http = default_http_client().unwrap();
+        let http = token_client_builder().build().unwrap();
         let err = exchange(
             &http,
             &server.uri(),
@@ -565,7 +648,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let http = default_http_client().unwrap();
+        let http = token_client_builder().build().unwrap();
         let err = exchange(
             &http,
             &server.uri(),
@@ -635,5 +718,127 @@ mod tests {
         // instant must not overflow the caller's task.
         let expiry = response("https://x", Some(u64::MAX)).cache_expiry(Duration::from_secs(300));
         assert!(expiry <= Instant::now() + Duration::from_secs(300));
+    }
+
+    /// Records every event emitted under a `cirrus_auth` target as one
+    /// line: `target LEVEL field=value ...`.
+    #[derive(Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().starts_with("cirrus_auth")
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Line(String);
+            impl tracing::field::Visit for Line {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!(" {}={value:?}", field.name()));
+                }
+            }
+            let metadata = event.metadata();
+            let mut line = Line(format!("{} {}", metadata.target(), metadata.level()));
+            event.record(&mut line);
+            self.0.lock().unwrap().push(line.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_non_oauth_error_body_is_logged_by_shape_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        // An intermediary's error page can echo the form it was sent,
+        // credentials included, so the event records only what tells a
+        // proxy page from a Salesforce answer: status, content type and
+        // length.
+        let server = wiremock::MockServer::start().await;
+        let body = "<html>proxy error: upstream token=LEAKED_SECRET</html>";
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(502).set_body_raw(body, "text/html"))
+            .mount(&server)
+            .await;
+
+        let capture = Capture::default();
+        let lines = capture.0.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "refresh_token")],
+            GrantReplay::Never,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::UnexpectedResponse { status: 502 }));
+
+        let lines = lines.lock().unwrap();
+        let event = lines
+            .iter()
+            .find(|line| line.starts_with("cirrus_auth::token_endpoint TRACE"))
+            .unwrap_or_else(|| {
+                panic!("no TRACE event under cirrus_auth::token_endpoint in {lines:?}")
+            });
+        assert!(!event.contains("LEAKED_SECRET"), "{event}");
+        for expected in [
+            "status=502",
+            "content_type=\"text/html\"",
+            &format!("body_len={}", body.len()),
+        ] {
+            assert!(event.contains(expected), "missing {expected} in {event}");
+        }
+    }
+
+    #[test]
+    fn a_client_that_fails_to_build_is_an_http_client_error() {
+        // An invalid default header value is reported when the client is
+        // built, before any request exists.
+        let err = finish_client(token_client_builder().user_agent("line\nbreak")).unwrap_err();
+        assert!(
+            matches!(err, AuthError::HttpClient(ref e) if e.is_builder()),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "failed to construct HTTP client");
+        assert!(!err.is_transient());
+    }
+
+    #[tokio::test]
+    async fn token_client_builder_keeps_the_no_redirect_policy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", "/elsewhere"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let http = token_client_builder().build().unwrap();
+        let response = http
+            .post(format!("{}/services/oauth2/token", server.uri()))
+            .form(&[("grant_type", "refresh_token")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 307);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

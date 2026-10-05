@@ -124,8 +124,10 @@ boundary between auth and REST without extra plumbing.
   runs on tokio, like the rest of the crate.)
 - **Conditional requests** — `describe_*_if_modified_since(SystemTime)` returns
   `Option<T>`; `None` on 304 Not Modified.
-- **Structured `tracing` events** — `cirrus::retry`, `cirrus::auth`,
-  `cirrus::limit_info` targets. Never logs tokens or bodies.
+- **Structured `tracing` events** — `cirrus::retry`, `cirrus::auth` (the
+  401 refresh) and `cirrus::limit_info` targets; the auth flows themselves
+  log under `cirrus_auth::*` (see the `cirrus-auth` README). No event
+  carries a token or a body.
 - **Transport defaults** — the HTTP client the builder creates advertises
   gzip and decompresses responses, applies a 10 s connect timeout and a 120 s
   read timeout, and doesn't follow redirects — a 3xx surfaces as

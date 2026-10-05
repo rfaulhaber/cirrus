@@ -117,7 +117,7 @@ impl MintState {
                 match self.still_valid_token() {
                     Some(token) if transient => {
                         tracing::warn!(
-                            target: "cirrus::auth",
+                            target: "cirrus_auth::mint",
                             flow,
                             error = %error,
                             "token mint failed transiently; using the cached token, which is \
@@ -141,14 +141,14 @@ impl MintState {
             .is_some_and(|c| c.access_token == stale_token)
         {
             tracing::debug!(
-                target: "cirrus::auth",
+                target: "cirrus_auth::mint",
                 flow,
                 "invalidating cached token (CAS matched)",
             );
             self.cached = None;
         } else {
             tracing::trace!(
-                target: "cirrus::auth",
+                target: "cirrus_auth::mint",
                 flow,
                 "invalidate called but cached token differs (concurrent refresh?); no-op",
             );

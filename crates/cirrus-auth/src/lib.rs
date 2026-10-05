@@ -38,6 +38,20 @@
 //! [`transport`] holds the https-or-loopback rule that every Cirrus
 //! client applies before sending a bearer token anywhere.
 //!
+//! ## Transport and logging
+//!
+//! The token-endpoint client a flow builder creates applies
+//! [`DEFAULT_TOKEN_CONNECT_TIMEOUT`] and [`DEFAULT_TOKEN_REQUEST_TIMEOUT`]
+//! and follows no redirects. Every builder has `connect_timeout` and
+//! `request_timeout` setters, and [`token_client_builder`] hands out the
+//! same configuration as a `reqwest::ClientBuilder` to extend with a
+//! private root CA, a proxy or a shared connection pool.
+//!
+//! Events are emitted under the `cirrus_auth::mint` (token caching and
+//! minting), `cirrus_auth::token_endpoint` (the HTTP exchange) and
+//! `cirrus_auth::rotation` (refresh-token rotation) targets. No event
+//! carries a token, a credential or a response body.
+//!
 //! Flows Salesforce lists as legacy or deprecated are intentionally not
 //! supported.
 
@@ -69,6 +83,9 @@ pub use error::{AuthError, AuthResult};
 pub use jwt::{JwtAuth, JwtAuthBuilder};
 pub use refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
 pub use static_token::StaticTokenAuth;
+pub use token_endpoint::{
+    DEFAULT_TOKEN_CONNECT_TIMEOUT, DEFAULT_TOKEN_REQUEST_TIMEOUT, token_client_builder,
+};
 pub use token_exchange::{
     SubjectTokenType, TokenExchangeFlow, TokenExchangeFlowBuilder, TokenExchangeSession,
 };

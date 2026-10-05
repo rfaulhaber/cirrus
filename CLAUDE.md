@@ -28,6 +28,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - `StaticTokenAuth` for paste-from-`sf-org-display` workflows and tests.
 - Shared `AuthSession` trait, `SharedAuth = Arc<dyn AuthSession>` alias, automatic compare-and-swap on `invalidate`.
 - Caching flows share one mint outcome among callers queued behind it (`src/mint.rs`), fall back to a still-valid cached token when a refresh inside the 60 s margin fails transiently, and retry the token request (connect failures for every grant; 429/5xx and lost responses too for JWT and client credentials, never for refresh, authorization code or token exchange). JWT signing binds to jsonwebtoken's aws-lc-rs provider directly, not the process-global one.
+- Transport: the token-endpoint client a builder creates applies `DEFAULT_TOKEN_CONNECT_TIMEOUT` (10 s) and `DEFAULT_TOKEN_REQUEST_TIMEOUT` (30 s) and follows no redirects; every builder has `connect_timeout` / `request_timeout` setters, and `cirrus_auth::token_client_builder()` hands out the same configuration as a `reqwest::ClientBuilder` to extend. A client that fails to build is `AuthError::HttpClient`. Tracing targets are `cirrus_auth::{mint,token_endpoint,rotation}`; a non-OAuth token-endpoint error body is recorded only as status, content type and length. `StaticTokenAuth::new` trims the token.
 
 `cirrus-metadata`:
 - File-based: `deploy`, `check_deploy_status`, `cancel_deploy`, `deploy_recent_validation`, `retrieve`, `check_retrieve_status`, plus `wait_for_deploy` / `wait_for_retrieve` polling helpers.
@@ -44,6 +45,7 @@ Tests: ~585 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s w
 - **No legacy or deprecated Salesforce APIs.** Skip anything Salesforce marks legacy or deprecated: Bulk 1.0, SOAP login, username-password OAuth, pre-API-31 CRUD calls, etc. This applies across every crate.
 - **No org-specific types.** The SDK never models concrete sObjects like `Account` or `Contact`. Record types are caller-supplied generics; only platform-contract envelopes (response shapes Salesforce defines) are typed.
 - **Doc-driven wire shapes.** Test fixtures must match Salesforce's documented examples, not prior assumptions about the wire shape. See [Test conventions](#test-conventions).
+- **Errors name their category and expose their cause.** A `CirrusError`, `AuthError` or `MetadataError` variant that wraps another error exposes it through `source()` only; its `Display` does not repeat the inner text, so chain reporters print each message once.
 
 ## Architecture
 

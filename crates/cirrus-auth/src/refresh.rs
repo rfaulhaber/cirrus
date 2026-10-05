@@ -92,7 +92,7 @@ use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
-    GrantReplay, check_instance_url, default_http_client, exchange, normalize_url,
+    GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
     require_secure_login_url,
 };
 use async_trait::async_trait;
@@ -234,7 +234,7 @@ impl MintConfig {
     /// the refresh token is serialized against every other mint.
     async fn mint_token(&self, state: &mut AuthState) -> AuthResult<CachedToken> {
         tracing::info!(
-            target: "cirrus::auth",
+            target: "cirrus_auth::mint",
             flow = "refresh-token",
             login_url = %self.login_url,
             "minting fresh access token",
@@ -267,7 +267,7 @@ impl MintConfig {
         {
             state.refresh_token = rotated.to_string();
             tracing::info!(
-                target: "cirrus::auth",
+                target: "cirrus_auth::rotation",
                 flow = "refresh-token",
                 "adopted rotated refresh token",
             );
@@ -366,7 +366,7 @@ pub struct RefreshTokenAuthBuilder {
     login_url: Option<String>,
     instance_url: Option<String>,
     token_ttl: Option<Duration>,
-    http_client: Option<reqwest::Client>,
+    http: HttpClientConfig,
     rotation_handler: Option<Arc<dyn RotationHandler>>,
 }
 
@@ -458,7 +458,9 @@ impl RefreshTokenAuthBuilder {
     /// the connection and never answers blocks every concurrent
     /// [`access_token`](crate::AuthSession::access_token) and
     /// [`invalidate`](crate::AuthSession::invalidate) call on this session
-    /// for as long as it stalls.
+    /// for as long as it stalls. Start from
+    /// [`token_client_builder`](crate::token_client_builder) to keep the
+    /// defaults while adding settings.
     ///
     /// A refresh grant is re-sent only when the request never left the
     /// client (up to twice, 250 ms then 500 ms later). After an ambiguous
@@ -467,7 +469,32 @@ impl RefreshTokenAuthBuilder {
     /// lost may already have rotated the token, and presenting the old one
     /// again would revoke the whole family.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
+        self.http.client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout of the token-endpoint client this
+    /// builder creates. Defaults to
+    /// [`DEFAULT_TOKEN_CONNECT_TIMEOUT`](crate::DEFAULT_TOKEN_CONNECT_TIMEOUT);
+    /// `None` waits indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the deadline for each token request the client this builder
+    /// creates sends, from dispatch until the whole response has arrived.
+    /// Defaults to
+    /// [`DEFAULT_TOKEN_REQUEST_TIMEOUT`](crate::DEFAULT_TOKEN_REQUEST_TIMEOUT);
+    /// `None` removes the bound, and a token endpoint that accepts the
+    /// connection and never answers then stalls the call indefinitely.
+    /// Each retry of the request gets its own deadline.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.request_timeout = Some(timeout.into());
         self
     }
 
@@ -491,10 +518,7 @@ impl RefreshTokenAuthBuilder {
         );
         require_secure_login_url(&login_url)?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
-        let http = match self.http_client {
-            Some(client) => client,
-            None => default_http_client()?,
-        };
+        let http = self.http.into_client()?;
 
         Ok(RefreshTokenAuth {
             config: Arc::new(MintConfig {
@@ -1361,6 +1385,36 @@ mod tests {
         assert!(
             !builder_dbg.contains("super-secret-value"),
             "builder leaked secret: {builder_dbg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_bounds_the_token_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "tok",
+                        "instance_url": "https://my-org.my.salesforce.com",
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .connect_timeout(Duration::from_secs(1))
+            .request_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let err = auth.access_token().await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::Http(ref e) if e.is_timeout()),
+            "{err:?}"
         );
     }
 }

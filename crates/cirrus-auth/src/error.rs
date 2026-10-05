@@ -27,6 +27,14 @@ pub type AuthResult<T> = Result<T, AuthError>;
 /// it is redacted from both the `Display` and `Debug` representations of
 /// this type — only the machine-readable `error` code is shown. Callers
 /// that need the description can read it from the variant field directly.
+///
+/// Variants that wrap another error ([`HttpClient`](Self::HttpClient),
+/// [`Http`](Self::Http), [`Serialization`](Self::Serialization),
+/// [`Url`](Self::Url)) expose it through
+/// [`source()`](std::error::Error::source) and do not repeat its text in
+/// their own `Display`, so a reporter that walks the chain prints each
+/// message once. Print the chain (anyhow's `{:#}`, for example) to see
+/// the underlying cause; `{}` alone names only the category.
 #[derive(Error)]
 #[non_exhaustive]
 pub enum AuthError {
@@ -74,9 +82,10 @@ pub enum AuthError {
     /// RFC 6749 §5.2 error shape — typically a proxy or gateway page
     /// rather than Salesforce.
     ///
-    /// The body is deliberately not carried: non-standard error pages
-    /// can echo request parameters, including credentials. It is logged
-    /// at `TRACE` on the `cirrus::auth` target instead.
+    /// The body is neither carried nor logged: non-standard error pages
+    /// can echo request parameters, including credentials. Its status,
+    /// content type and length are recorded at `TRACE` on the
+    /// `cirrus_auth::token_endpoint` target.
     #[error("token endpoint returned status {status} with an unrecognized error body")]
     UnexpectedResponse { status: u16 },
 
@@ -103,18 +112,24 @@ pub enum AuthError {
     #[error("authentication failed: {0}")]
     Other(String),
 
+    /// The HTTP client a flow builder constructs could not be built. No
+    /// request was made; the cause is the
+    /// [`source()`](std::error::Error::source).
+    #[error("failed to construct HTTP client")]
+    HttpClient(#[source] reqwest::Error),
+
     /// Network or transport-level HTTP failure while contacting an
     /// OAuth endpoint.
-    #[error("HTTP request failed: {0}")]
+    #[error("HTTP request failed")]
     Http(#[from] reqwest::Error),
 
     /// JSON serialization or deserialization failure.
-    #[error("serialization error: {0}")]
+    #[error("serialization error")]
     Serialization(#[from] serde_json::Error),
 
     /// URL parsing failure (instance URL, redirect URI, login URL,
     /// etc.).
-    #[error("invalid URL: {0}")]
+    #[error("invalid URL")]
     Url(#[from] url::ParseError),
 }
 
@@ -166,6 +181,7 @@ impl AuthError {
             Self::Signing(msg) => Self::Signing(msg.clone()),
             Self::Randomness(msg) => Self::Randomness(msg.clone()),
             Self::Other(msg) => Self::Other(msg.clone()),
+            Self::HttpClient(e) => Self::Other(format!("failed to construct HTTP client: {e}")),
             Self::Http(e) => Self::Other(format!("HTTP request failed: {e}")),
             Self::Serialization(e) => Self::Other(format!("serialization error: {e}")),
             Self::Url(e) => Self::Url(*e),
@@ -212,6 +228,7 @@ impl std::fmt::Debug for AuthError {
             Self::Signing(msg) => f.debug_tuple("Signing").field(msg).finish(),
             Self::Randomness(msg) => f.debug_tuple("Randomness").field(msg).finish(),
             Self::Other(msg) => f.debug_tuple("Other").field(msg).finish(),
+            Self::HttpClient(e) => f.debug_tuple("HttpClient").field(e).finish(),
             Self::Http(e) => f.debug_tuple("Http").field(e).finish(),
             Self::Serialization(e) => f.debug_tuple("Serialization").field(e).finish(),
             Self::Url(e) => f.debug_tuple("Url").field(e).finish(),
@@ -310,5 +327,33 @@ mod tests {
         assert!(debug.contains("invalid_client"));
         assert!(debug.contains("None"));
         assert!(!debug.contains("[redacted]"));
+    }
+
+    /// A `reqwest::Error` produced without any network: an invalid default
+    /// header value is reported when the client is built.
+    fn client_build_error() -> reqwest::Error {
+        reqwest::Client::builder()
+            .user_agent("line\nbreak")
+            .build()
+            .unwrap_err()
+    }
+
+    #[test]
+    fn display_does_not_repeat_the_text_of_the_source() {
+        use std::error::Error as _;
+        let errors = [
+            AuthError::HttpClient(client_build_error()),
+            AuthError::Http(client_build_error()),
+            AuthError::Serialization(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+            AuthError::Url(url::Url::parse("not a url").unwrap_err()),
+        ];
+        for err in errors {
+            let source = err.source().expect("variant carries a source").to_string();
+            let display = err.to_string();
+            assert!(
+                !display.contains(&source),
+                "{display:?} repeats its source {source:?}"
+            );
+        }
     }
 }

@@ -34,10 +34,14 @@ impl std::fmt::Debug for StaticTokenAuth {
 impl StaticTokenAuth {
     /// Constructs a session from a known token and instance URL.
     ///
-    /// `instance_url` is normalized by trimming surrounding whitespace
-    /// and every trailing slash, so path concatenation in the client
-    /// always produces clean URLs — the same normalization the OAuth
-    /// flow builders apply.
+    /// `access_token` is trimmed of surrounding whitespace: a token pasted
+    /// from `sf org display` or read from a file usually carries a
+    /// trailing newline, which would otherwise make every request fail to
+    /// build its `Authorization` header, and a Salesforce session id never
+    /// contains whitespace. `instance_url` is normalized by trimming
+    /// surrounding whitespace and every trailing slash, so path
+    /// concatenation in the client always produces clean URLs — the same
+    /// normalization the OAuth flow builders apply.
     ///
     /// Static-token auth doesn't refresh — when the token expires, calls
     /// will surface 401. Use for short-lived scripts, CLI tools, or
@@ -59,7 +63,7 @@ impl StaticTokenAuth {
     /// ```
     pub fn new(access_token: impl Into<String>, instance_url: impl Into<String>) -> Self {
         Self {
-            access_token: access_token.into(),
+            access_token: access_token.into().trim().to_string(),
             instance_url: normalize_url(&instance_url.into()),
         }
     }
@@ -92,5 +96,13 @@ mod tests {
     async fn strips_every_trailing_slash_from_instance_url() {
         let auth = StaticTokenAuth::new("tok", "https://example.my.salesforce.com//");
         assert_eq!(auth.instance_url(), "https://example.my.salesforce.com");
+    }
+
+    #[tokio::test]
+    async fn trims_whitespace_around_the_token() {
+        // A token read from a file written by `sf org display ... > token.txt`
+        // carries a trailing newline; a session id never contains whitespace.
+        let auth = StaticTokenAuth::new("  00Dxx!AQ.tok\n", "https://example.my.salesforce.com");
+        assert_eq!(auth.access_token().await.unwrap(), "00Dxx!AQ.tok");
     }
 }

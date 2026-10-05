@@ -58,12 +58,13 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
-    GrantReplay, default_http_client, exchange, normalize_url, require_secure_login_url,
+    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 /// Salesforce production login URL — also the default authorization host.
 pub const PRODUCTION_LOGIN_URL: &str = "https://login.salesforce.com";
@@ -324,7 +325,7 @@ pub struct WebServerFlowBuilder {
     scopes: Vec<String>,
     prompt: Option<String>,
     login_hint: Option<String>,
-    http_client: Option<reqwest::Client>,
+    http: HttpClientConfig,
 }
 
 impl std::fmt::Debug for WebServerFlowBuilder {
@@ -411,10 +412,37 @@ impl WebServerFlowBuilder {
     /// The client built by default applies connect and request timeouts
     /// and refuses to follow redirects, so a redirect cannot replay the
     /// authorization code and PKCE verifier to another host. A client
-    /// supplied here replaces those defaults wholesale — configure both
-    /// on it.
+    /// supplied here replaces those defaults wholesale, the timeout setters
+    /// included; start from
+    /// [`token_client_builder`](crate::token_client_builder) to keep them
+    /// while adding settings.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
+        self.http.client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout of the token-endpoint client this
+    /// builder creates. Defaults to
+    /// [`DEFAULT_TOKEN_CONNECT_TIMEOUT`](crate::DEFAULT_TOKEN_CONNECT_TIMEOUT);
+    /// `None` waits indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the deadline for each token request the client this builder
+    /// creates sends, from dispatch until the whole response has arrived.
+    /// Defaults to
+    /// [`DEFAULT_TOKEN_REQUEST_TIMEOUT`](crate::DEFAULT_TOKEN_REQUEST_TIMEOUT);
+    /// `None` removes the bound, and a token endpoint that accepts the
+    /// connection and never answers then stalls the call indefinitely.
+    /// Each retry of the request gets its own deadline.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.request_timeout = Some(timeout.into());
         self
     }
 
@@ -432,10 +460,7 @@ impl WebServerFlowBuilder {
                 .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string()),
         );
         require_secure_login_url(&login_url)?;
-        let http = match self.http_client {
-            Some(client) => client,
-            None => default_http_client()?,
-        };
+        let http = self.http.into_client()?;
         Ok(WebServerFlow {
             consumer_key,
             consumer_secret: self.consumer_secret,

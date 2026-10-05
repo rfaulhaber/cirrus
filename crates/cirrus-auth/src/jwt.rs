@@ -42,7 +42,7 @@ use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
-    GrantReplay, check_instance_url, default_http_client, exchange, normalize_url,
+    GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
     require_secure_login_url,
 };
 use async_trait::async_trait;
@@ -163,7 +163,7 @@ impl JwtAuth {
 
     async fn mint_token(&self) -> AuthResult<CachedToken> {
         tracing::info!(
-            target: "cirrus::auth",
+            target: "cirrus_auth::mint",
             flow = "jwt-bearer",
             login_url = %self.login_url,
             "minting fresh access token",
@@ -265,7 +265,7 @@ pub struct JwtAuthBuilder {
     login_url: Option<String>,
     instance_url: Option<String>,
     token_ttl: Option<Duration>,
-    http_client: Option<reqwest::Client>,
+    http: HttpClientConfig,
 }
 
 impl std::fmt::Debug for JwtAuthBuilder {
@@ -364,7 +364,9 @@ impl JwtAuthBuilder {
     /// The client built by default applies connect and request timeouts
     /// and refuses to follow redirects, so a redirect cannot replay the
     /// signed assertion to another host. A client supplied here replaces
-    /// those defaults wholesale — configure both on it.
+    /// those defaults wholesale, the timeout setters included; start from
+    /// [`token_client_builder`](crate::token_client_builder) to keep them
+    /// while adding settings.
     ///
     /// A token request that fails to connect, is lost in transit or is
     /// answered with a 429 or 5xx is retried up to twice, 250 ms then
@@ -372,7 +374,32 @@ impl JwtAuthBuilder {
     /// Salesforce does not bind it to a single use. A mint can therefore
     /// take up to three request timeouts.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
+        self.http.client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout of the token-endpoint client this
+    /// builder creates. Defaults to
+    /// [`DEFAULT_TOKEN_CONNECT_TIMEOUT`](crate::DEFAULT_TOKEN_CONNECT_TIMEOUT);
+    /// `None` waits indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the deadline for each token request the client this builder
+    /// creates sends, from dispatch until the whole response has arrived.
+    /// Defaults to
+    /// [`DEFAULT_TOKEN_REQUEST_TIMEOUT`](crate::DEFAULT_TOKEN_REQUEST_TIMEOUT);
+    /// `None` removes the bound, and a token endpoint that accepts the
+    /// connection and never answers then stalls the call indefinitely.
+    /// Each retry of the request gets its own deadline.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.request_timeout = Some(timeout.into());
         self
     }
 
@@ -397,10 +424,7 @@ impl JwtAuthBuilder {
         );
         require_secure_login_url(&login_url)?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
-        let http = match self.http_client {
-            Some(client) => client,
-            None => default_http_client()?,
-        };
+        let http = self.http.into_client()?;
 
         Ok(JwtAuth {
             consumer_key,
