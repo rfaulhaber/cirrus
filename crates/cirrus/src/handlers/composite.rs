@@ -488,6 +488,12 @@ impl CompositeSObjectsHandler<'_> {
     /// [`retrieve`](Self::retrieve). Use [`retrieve_with_body_as`]`::<Option<T>>`
     /// for typed deserialization in the presence of nulls.
     ///
+    /// The request is a `POST` only because the ID list outgrows a URL;
+    /// Salesforce documents the endpoint as a read, so a transient 5xx
+    /// or a lost response is retried under the
+    /// [`RetryPolicy`](crate::RetryPolicy) exactly as for
+    /// [`retrieve`](Self::retrieve).
+    ///
     /// [`retrieve_with_body_as`]: Self::retrieve_with_body_as
     pub async fn retrieve_with_body(
         &self,
@@ -513,7 +519,13 @@ impl CompositeSObjectsHandler<'_> {
             "fields": fields,
         });
         self.client
-            .send_at::<_, (), _>(reqwest::Method::POST, &url, None, Some(&body))
+            .send_at_with_replay::<_, (), _>(
+                reqwest::Method::POST,
+                &url,
+                None,
+                Some(&body),
+                crate::Replay::Always,
+            )
             .await
     }
 }
@@ -589,6 +601,20 @@ mod tests {
     fn fixture(uri: String) -> Cirrus {
         let auth = Arc::new(StaticTokenAuth::new("tok", uri));
         Cirrus::builder().auth(auth).build().unwrap()
+    }
+
+    fn fixture_with_fast_retries(uri: String) -> Cirrus {
+        let auth = Arc::new(StaticTokenAuth::new("tok", uri));
+        Cirrus::builder()
+            .auth(auth)
+            .retry_policy(crate::RetryPolicy {
+                base_delay: std::time::Duration::ZERO,
+                max_delay: std::time::Duration::ZERO,
+                jitter: false,
+                ..crate::RetryPolicy::default()
+            })
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1524,6 +1550,41 @@ mod tests {
             .unwrap();
         assert_eq!(records[0]["Id"], "001xx");
         assert!(records[1].is_null());
+    }
+
+    #[tokio::test]
+    async fn sobjects_retrieve_with_body_retries_a_transient_5xx_like_retrieve() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_retrieve_post.htm
+        // "Use a POST request with sObject Collections to get one or more
+        // records": a read that rides POST only because the ID list
+        // outgrows the URL, so a 503 is as safe to replay here as on the
+        // GET form.
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"attributes": {"type": "Account"}, "Id": "001xx", "Name": "Acme"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let records = sf
+            .composite()
+            .sobjects()
+            .retrieve_with_body("Account", &["001xx"], &["Id", "Name"])
+            .await
+            .unwrap();
+        assert_eq!(records[0]["Id"], "001xx");
     }
 
     #[tokio::test]

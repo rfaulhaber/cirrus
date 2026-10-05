@@ -14,10 +14,13 @@
 //!    spec-idempotent (GET, HEAD, DELETE, PUT), because nothing
 //!    guarantees the request wasn't processed before an intermediary
 //!    emitted the error — and a duplicate `INSERT` is a worse failure
-//!    mode than a one-shot error surfaced to the caller. A handler
-//!    whose HTTP method understates its effect (anonymous Apex over
-//!    GET, a Bulk 2.0 job-data upload over PUT) opts out of replay
-//!    entirely, so only 429 and connect-phase failures retry there.
+//!    mode than a one-shot error surfaced to the caller. Where the
+//!    HTTP method misstates what an endpoint does, the call site says
+//!    so with a [`Replay`]: Apex REST, anonymous Apex and the Bulk 2.0
+//!    job-data upload never replay, so only 429 and connect-phase
+//!    failures retry there, and the sObject Collections `POST`
+//!    retrieve always replays because it is a read.
+//!    [`Cirrus::send_with_replay`] gives callers the same choice.
 //!
 //!    Note on Salesforce specifics: the REST API's documented
 //!    rate-limit signal is **403 with `errorCode:
@@ -36,6 +39,7 @@
 //!    backend.
 //!
 //! [`Retry-After`]: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+//! [`Cirrus::send_with_replay`]: crate::Cirrus::send_with_replay
 
 use crate::error::CirrusError;
 use std::time::Duration;
@@ -120,30 +124,46 @@ impl RetryPolicy {
 }
 
 /// Whether a request may be re-sent when the outcome of an attempt is
-/// unknown — an ambiguous mid-request failure, or a 5xx that an
-/// intermediary may have emitted after the origin already processed the
-/// call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Replay {
-    /// Replay whenever the request method is spec-idempotent. The
-    /// default across the REST surface.
+/// unknown: an ambiguous mid-request failure, or a 5xx that an
+/// intermediary may have emitted after the origin already processed
+/// the call.
+///
+/// Connect-phase failures and 429 responses retry under every variant,
+/// because in both cases the request was never processed. The variant
+/// only decides what happens once a request has reached the server.
+/// Every typed verb and handler picks a value; pass one yourself
+/// through [`Cirrus::send_with_replay`] when the HTTP method says
+/// something different from what the endpoint does.
+///
+/// [`Cirrus::send_with_replay`]: crate::Cirrus::send_with_replay
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Replay {
+    /// Replay whenever the request method is spec-idempotent (GET,
+    /// HEAD, PUT, DELETE, OPTIONS, TRACE) and never for POST or PATCH.
+    /// The default across the REST surface.
+    #[default]
     ByMethod,
     /// Never replay once the request reached the server, whatever the
-    /// method says. Connect-phase failures still retry (the request
-    /// never arrived) and so does 429 (the request was refused rather
-    /// than processed).
-    ///
-    /// For the call sites whose HTTP method understates their effect:
-    /// `GET tooling/executeAnonymous` runs arbitrary Apex, and `PUT
-    /// jobs/ingest/{job}/batches` uploads job data, which is documented
-    /// as a submission rather than a replacement.
+    /// method says. For endpoints whose method understates their
+    /// effect: Apex REST, where a `GET` can run any Apex;
+    /// `GET tooling/executeAnonymous`; and the Bulk 2.0 job-data `PUT`,
+    /// which submits data rather than replacing it.
     Never,
+    /// Replay whatever the method, for a read that rides a
+    /// non-idempotent method. The sObject Collections retrieve carries
+    /// its ID list in a `POST` body, so it uses this. Pass it only when
+    /// the endpoint is documented as side-effect free.
+    Always,
 }
 
-/// Whether an ambiguous outcome may be replayed: the method has to be
-/// spec-idempotent *and* the call site must not have opted out.
+/// Whether an ambiguous outcome may be replayed.
 fn is_replayable(method: &reqwest::Method, replay: Replay) -> bool {
-    matches!(replay, Replay::ByMethod) && is_idempotent(method)
+    match replay {
+        Replay::ByMethod => is_idempotent(method),
+        Replay::Never => false,
+        Replay::Always => true,
+    }
 }
 
 /// Decision point: should we retry this HTTP response?
@@ -509,6 +529,29 @@ mod tests {
             429,
             0
         ));
+    }
+
+    #[test]
+    fn always_replay_retries_5xx_on_post() {
+        // The sObject Collections retrieve is a read sent as POST, so a
+        // 5xx replays for it exactly as it would for the GET form.
+        let p = RetryPolicy::default();
+        for status in [500, 502, 503, 504] {
+            assert!(should_retry_status(
+                &p,
+                &reqwest::Method::POST,
+                Replay::Always,
+                status,
+                0
+            ));
+            assert!(!should_retry_status(
+                &p,
+                &reqwest::Method::POST,
+                Replay::ByMethod,
+                status,
+                0
+            ));
+        }
     }
 
     #[tokio::test]

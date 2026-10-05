@@ -89,7 +89,7 @@ pub use response::{
     OrgLimits, QueryResult, SObjectCollectionResult, SObjectCreateResult, SObjectMetadata,
     SearchResult,
 };
-pub use retry::RetryPolicy;
+pub use retry::{Replay, RetryPolicy};
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Serialize;
@@ -178,10 +178,10 @@ enum AuthRetry {
     /// The cached token was invalidated and a genuinely new one obtained;
     /// the caller should loop and retry the request.
     Retry,
-    /// Not a refreshable 401 — already retried once, the result wasn't a
-    /// 401, or the auth session couldn't produce a different token (static
-    /// auth, scope/permission issue). The caller should return the result
-    /// as-is.
+    /// Not a refreshable 401 — already retried once, the result wasn't an
+    /// `INVALID_SESSION_ID` 401, or the auth session couldn't produce a
+    /// different token (static auth, scope/permission issue). The caller
+    /// should return the result as-is.
     Done,
 }
 
@@ -343,6 +343,10 @@ impl Cirrus {
     /// Path resolution follows [`Cirrus`]'s three-mode
     /// semantics. Use this as the open-ended client escape hatch when no
     /// typed builder exists for the resource you need.
+    ///
+    /// Under the default [`RetryPolicy`] a GET is replayed after a 5xx
+    /// or a lost response. For a resource whose GET has side effects,
+    /// send it through [`Self::send_with_replay`] with [`Replay::Never`].
     pub async fn get<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
         let url = self.resolve_url(path);
         self.send::<R, (), ()>(reqwest::Method::GET, &url, None, None)
@@ -350,7 +354,8 @@ impl Cirrus {
     }
 
     /// GET with query parameters. `query` is anything `Serialize` —
-    /// typically `&[("k", "v")]` or a struct.
+    /// typically `&[("k", "v")]` or a struct. Replayed on the same terms
+    /// as [`Self::get`].
     pub async fn get_with_query<R, Q>(&self, path: &str, query: &Q) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -373,6 +378,11 @@ impl Cirrus {
     ///
     /// `query` and `body` are optional; path resolution follows
     /// [`Cirrus`]'s three-mode semantics.
+    ///
+    /// Replay follows the method: under the default [`RetryPolicy`] a
+    /// GET, PUT or DELETE is re-sent after a 5xx or a lost response and
+    /// a POST or PATCH is not. [`Self::send_with_replay`] takes an
+    /// explicit [`Replay`] instead.
     ///
     /// # Example
     ///
@@ -411,7 +421,65 @@ impl Cirrus {
         B: Serialize + ?Sized,
     {
         let url = self.resolve_url(path);
-        self.send_with_replay(method, &url, query, headers, body, retry::Replay::ByMethod)
+        self.send_resolved(method, &url, query, headers, body, Replay::ByMethod)
+            .await
+    }
+
+    /// Sends a request with an explicit [`Replay`] choice, deserializing
+    /// the response into `R`.
+    ///
+    /// Same request loop as [`Self::send_with_headers`] — retry policy,
+    /// 401 auto-refresh and `Sforce-Limit-Info` capture included — but
+    /// `replay` replaces the method-derived rule for re-sending a
+    /// request whose outcome is unknown. Reach for it when the HTTP
+    /// method says something different from what the endpoint does: a
+    /// `GET` that writes takes [`Replay::Never`]; a read that has to be
+    /// a `POST` takes [`Replay::Always`].
+    ///
+    /// `query` and `body` are optional; path resolution follows
+    /// [`Cirrus`]'s three-mode semantics.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, Replay, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::Value;
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // A custom Apex REST GET the org documents as read-only, so a
+    /// // lost response may be re-sent. `sf.apex()` itself never replays.
+    /// let health: Value = sf
+    ///     .send_with_replay(
+    ///         cirrus::reqwest::Method::GET,
+    ///         "/services/apexrest/Health",
+    ///         None,
+    ///         &[],
+    ///         None::<&()>,
+    ///         Replay::ByMethod,
+    ///     )
+    ///     .await?;
+    /// # let _ = health;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_with_replay<R, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: Option<&B>,
+        replay: Replay,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = self.resolve_url(path);
+        self.send_resolved(method, &url, query, headers, body, replay)
             .await
     }
 
@@ -429,18 +497,22 @@ impl Cirrus {
         Q: Serialize + ?Sized,
     {
         let url = self.resolve_url(path);
-        self.send_with_replay::<R, Q, ()>(
+        self.send_resolved::<R, Q, ()>(
             reqwest::Method::GET,
             &url,
             Some(query),
             &[],
             None,
-            retry::Replay::Never,
+            Replay::Never,
         )
         .await
     }
 
     /// POST a JSON body.
+    ///
+    /// Never replayed once the request has reached the server: only 429
+    /// and connect-phase failures retry. [`Self::send_with_replay`] with
+    /// [`Replay::Always`] opts a documented read-only POST back in.
     pub async fn post<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -454,7 +526,9 @@ impl Cirrus {
     /// PUT a JSON body.
     ///
     /// Salesforce REST proper rarely uses PUT; provided for surfaces that
-    /// do (Tooling API, Apex REST, etc.).
+    /// do (Tooling API, Apex REST, etc.). Replayed after a 5xx or a lost
+    /// response like GET; when the endpoint behind the PUT is not
+    /// idempotent, use [`Self::send_with_replay`] with [`Replay::Never`].
     pub async fn put<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -465,7 +539,8 @@ impl Cirrus {
             .await
     }
 
-    /// PATCH a JSON body.
+    /// PATCH a JSON body. Never replayed once the request has reached
+    /// the server, like [`Self::post`].
     pub async fn patch<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -478,6 +553,10 @@ impl Cirrus {
 
     /// DELETE a resource. Salesforce typically returns 204 No Content on
     /// success — call with `R = ()`.
+    ///
+    /// Replayed after a 5xx or a lost response; a replay of a delete
+    /// that had already committed can come back 404.
+    /// [`Self::send_with_replay`] with [`Replay::Never`] opts out.
     pub async fn delete<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
         let url = self.resolve_url(path);
         self.send::<R, (), ()>(reqwest::Method::DELETE, &url, None, None)
@@ -500,7 +579,27 @@ impl Cirrus {
         Q: Serialize + ?Sized,
         B: Serialize + ?Sized,
     {
-        self.send(method, url, query, body).await
+        self.send_at_with_replay(method, url, query, body, Replay::ByMethod)
+            .await
+    }
+
+    /// [`Self::send_at`] with an explicit [`Replay`], for a handler whose
+    /// HTTP method misstates the endpoint's effect.
+    pub(crate) async fn send_at_with_replay<R, Q, B>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        query: Option<&Q>,
+        body: Option<&B>,
+        replay: Replay,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+        Q: Serialize + ?Sized,
+        B: Serialize + ?Sized,
+    {
+        self.send_resolved(method, url, query, &[], body, replay)
+            .await
     }
 
     /// Returns a pre-authenticated [`reqwest::RequestBuilder`] targeting
@@ -560,12 +659,13 @@ impl Cirrus {
 
     /// Shared 401 auth-refresh tail used by every send path.
     ///
-    /// On a 401 that hasn't already been retried this call, invalidate the
-    /// cached token (compare-and-swap against `token`) and fetch a fresh
-    /// one. Returns [`AuthRetry::Retry`] when a genuinely different token
-    /// was obtained — the caller should set its own `auth_retried` latch
-    /// and loop — or [`AuthRetry::Done`] otherwise. `auth_retried` short-
-    /// circuits the whole check so the refresh happens at most once.
+    /// On a 401 carrying `INVALID_SESSION_ID` that hasn't already been
+    /// retried this call, invalidate the cached token (compare-and-swap
+    /// against `token`) and fetch a fresh one. Returns
+    /// [`AuthRetry::Retry`] when a genuinely different token was obtained
+    /// — the caller should set its own `auth_retried` latch and loop — or
+    /// [`AuthRetry::Done`] otherwise. `auth_retried` short-circuits the
+    /// whole check so the refresh happens at most once.
     ///
     /// Every send path reaches this through the shared [`Self::dispatch`]
     /// loop, so the refresh behavior lives in one place. This is the place
@@ -624,9 +724,10 @@ impl Cirrus {
     /// result shape. `Sforce-Limit-Info` capture happens here, on every
     /// response, so no send path can forget it.
     ///
-    /// `replay` lets a call site whose HTTP method understates its
-    /// effect (anonymous Apex, Bulk job-data upload) opt out of the
-    /// method-derived idempotency assumption.
+    /// `replay` replaces the method-derived idempotency assumption where
+    /// the HTTP method misstates an endpoint's effect: Apex REST,
+    /// anonymous Apex and the Bulk job-data upload opt out, the sObject
+    /// Collections `POST` retrieve opts in.
     async fn dispatch<T, MakeReq, Parse>(
         &self,
         method: &reqwest::Method,
@@ -706,10 +807,14 @@ impl Cirrus {
             // log sink.
             let result = result.map_err(|e| e.redact_secrets(&token));
 
-            // 401 → invalidate the cached token and try once more with
-            // a fresh one. If the auth session can't refresh (returns
-            // the same token), surface the 401 verbatim.
-            let is_retryable_401 = matches!(&result, Err(CirrusError::Api { status: 401, .. }));
+            // Refresh only when Salesforce itself says the token is the
+            // problem: a 401 carrying INVALID_SESSION_ID. Any other 401
+            // is the endpoint's own verdict — an Apex REST class can set
+            // the status, a scope check can refuse the call — so a fresh
+            // token would not change it, and the replay would re-run
+            // whatever the request did. If the auth session can't
+            // refresh (returns the same token), surface the 401 verbatim.
+            let is_retryable_401 = matches!(&result, Err(err) if err.is_invalid_session());
             match self
                 .auth_retry_decision(is_retryable_401, &token, auth_retried)
                 .await?
@@ -736,11 +841,11 @@ impl Cirrus {
         Q: Serialize + ?Sized,
         B: Serialize + ?Sized,
     {
-        self.send_with_replay(method, url, query, &[], body, retry::Replay::ByMethod)
+        self.send_resolved(method, url, query, &[], body, Replay::ByMethod)
             .await
     }
 
-    async fn send_with_replay<R, Q, B>(
+    async fn send_resolved<R, Q, B>(
         &self,
         method: reqwest::Method,
         url: &str,
@@ -1837,6 +1942,67 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn send_with_replay_never_surfaces_a_503_after_one_request() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let err = sf
+                .send_with_replay::<serde_json::Value, ()>(
+                    reqwest::Method::GET,
+                    "limits",
+                    None,
+                    &[],
+                    None,
+                    Replay::Never,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 503, .. }));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn send_with_replay_always_retries_a_post_after_a_503() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/services/data/v66.0/composite/sobjects/Account"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/services/data/v66.0/composite/sobjects/Account"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let v: serde_json::Value = sf
+                .send_with_replay(
+                    reqwest::Method::POST,
+                    "composite/sobjects/Account",
+                    None,
+                    &[],
+                    Some(&serde_json::json!({"ids": ["001xx"], "fields": ["Id"]})),
+                    Replay::Always,
+                )
+                .await
+                .unwrap();
+            assert_eq!(v["ok"], true);
+        }
+
+        #[tokio::test]
         async fn retries_429_until_success() {
             let server = MockServer::start().await;
 
@@ -2155,9 +2321,10 @@ mod tests {
         }
     }
 
-    /// Auto-refresh on 401. Uses a custom AuthSession impl that hands
-    /// out a different token on each `access_token()` call so we can
-    /// observe the SDK switching tokens after invalidation.
+    /// Auto-refresh on 401. Uses a custom AuthSession impl that keeps
+    /// returning its current token until that token is invalidated, as
+    /// every caching flow does, so the tests observe both the token
+    /// switch and the order of invalidate-then-refetch it depends on.
     mod auth_refresh {
         use super::*;
         use crate::auth::{AuthResult, AuthSession, SharedAuth};
@@ -2170,15 +2337,16 @@ mod tests {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        /// Test-only AuthSession that yields tokens from a sequence,
-        /// counts `access_token()` calls, and tracks `invalidate()`
-        /// calls. Subsequent calls past the end of the sequence
-        /// return the last token (so a static-token-equivalent can be
-        /// modeled by passing a single-element sequence).
+        /// Test-only AuthSession that yields tokens from a sequence the
+        /// way a caching flow does: `access_token()` returns the current
+        /// token until exactly that token is invalidated, and only then
+        /// advances. The last token repeats forever, so a single-element
+        /// sequence models a static session. Every `invalidate()` call
+        /// is recorded.
         struct RotatingAuth {
             instance_url: String,
             tokens: Vec<String>,
-            access_count: AtomicUsize,
+            current: AtomicUsize,
             invalidations: Mutex<Vec<String>>,
         }
 
@@ -2187,7 +2355,7 @@ mod tests {
                 Self {
                     instance_url: instance_url.into(),
                     tokens: tokens.into_iter().map(String::from).collect(),
-                    access_count: AtomicUsize::new(0),
+                    current: AtomicUsize::new(0),
                     invalidations: Mutex::new(Vec::new()),
                 }
             }
@@ -2196,9 +2364,9 @@ mod tests {
         #[async_trait]
         impl AuthSession for RotatingAuth {
             async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
-                let n = self.access_count.fetch_add(1, Ordering::SeqCst);
-                let idx = n.min(self.tokens.len() - 1);
-                Ok(Cow::Borrowed(&self.tokens[idx]))
+                Ok(Cow::Borrowed(
+                    &self.tokens[self.current.load(Ordering::SeqCst)],
+                ))
             }
 
             fn instance_url(&self) -> &str {
@@ -2208,6 +2376,10 @@ mod tests {
             async fn invalidate(&self, stale_token: &str) {
                 if let Ok(mut g) = self.invalidations.lock() {
                     g.push(stale_token.to_string());
+                }
+                let idx = self.current.load(Ordering::SeqCst);
+                if self.tokens[idx] == stale_token && idx + 1 < self.tokens.len() {
+                    self.current.store(idx + 1, Ordering::SeqCst);
                 }
             }
         }
@@ -2351,16 +2523,16 @@ mod tests {
 
         #[tokio::test]
         async fn second_401_after_refresh_surfaces_without_third_attempt() {
-            // After auth-retry, a *second* 401 means the issue isn't
-            // token expiry — it's permission/scope. Don't loop forever.
+            // After auth-retry, a *second* INVALID_SESSION_ID means the
+            // fresh token is rejected too. Don't loop forever.
             let server = MockServer::start().await;
 
             // Both Bearer values get 401.
             Mock::given(method("GET"))
                 .and(path("/services/data/v66.0/limits"))
                 .respond_with(ResponseTemplate::new(401).set_body_json(json!([{
-                    "errorCode": "INSUFFICIENT_ACCESS",
-                    "message": "..."
+                    "errorCode": "INVALID_SESSION_ID",
+                    "message": "Session expired or invalid"
                 }])))
                 .expect(2)
                 .mount(&server)
@@ -2371,6 +2543,64 @@ mod tests {
 
             let err = sf.get::<Value>("limits").await.unwrap_err();
             assert!(matches!(err, CirrusError::Api { status: 401, .. }));
+        }
+
+        #[tokio::test]
+        async fn non_session_401_surfaces_without_refresh() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+            // 401: "The session ID or OAuth token used has expired or is
+            // invalid. The response body contains the message and
+            // errorCode." Only INVALID_SESSION_ID names the token as the
+            // problem; any other 401 is the endpoint's own verdict, and a
+            // fresh token would not change it.
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(401).set_body_json(json!([{
+                    "errorCode": "INSUFFICIENT_ACCESS",
+                    "message": "..."
+                }])))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(RotatingAuth::new(server.uri(), vec!["t1", "t2"]));
+            let sf = fixture(server.uri(), auth.clone());
+
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 401, .. }));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert!(auth.invalidations.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn apex_post_answered_401_by_developer_code_is_not_replayed() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.apexref.meta/apexref/apex_methods_system_restresponse.htm
+            // RestResponse.statusCode lists "401 | UNAUTHORIZED" among the
+            // values Apex may set. The POST already ran once; a new
+            // token followed by a second POST would run it again.
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/services/apexrest/Orders"))
+                .respond_with(ResponseTemplate::new(401).set_body_json(json!([{
+                    "errorCode": "UNAUTHORIZED",
+                    "message": "caller is not an approved buyer"
+                }])))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(RotatingAuth::new(server.uri(), vec!["t1", "t2"]));
+            let sf = fixture(server.uri(), auth.clone());
+
+            let err = sf
+                .apex()
+                .post::<Value, _>("Orders", &json!({"sku": "A-1"}))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 401, .. }));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert!(auth.invalidations.lock().unwrap().is_empty());
         }
 
         #[tokio::test]

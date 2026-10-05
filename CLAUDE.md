@@ -20,7 +20,7 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 - Phase 1: versions, limits, describe (global + per-object), sObject CRUD, query/queryAll/queryMore, search/parameterizedSearch.
 - Phase 2: composite/batch, composite/tree, composite/sobjects (incl. `retrieve_with_body`), generic `/composite`, Bulk 2.0 (ingest + query), Apex REST passthrough, Tooling API, Event Monitoring.
 - Phase 3: Metadata REST API (`Cirrus::metadata()` — the four `deployRequest` endpoints). The rest of the Metadata API surface is SOAP-only and lives in `cirrus-metadata`.
-- Cross-cutting: open-ended client escape hatch, pagination stream (`futures::Stream`), retry + backoff policy, `Sforce-Limit-Info` surfacing, auto-refresh on 401, multipart blob uploads.
+- Cross-cutting: open-ended client escape hatch, pagination stream (`futures::Stream`), retry + backoff policy, `Sforce-Limit-Info` surfacing, auto-refresh on an `INVALID_SESSION_ID` 401 only, multipart blob uploads.
 - Transport contract: session-token targets must be `https` (loopback excepted) or the request is refused with `CirrusError::InvalidInput` — `CirrusBuilder::allow_insecure_transport(true)` is the opt-out; the client the builder creates advertises gzip, sets a 10s connect and 120s read timeout (both overridable), and follows no redirects. `CirrusError` is `#[non_exhaustive]`.
 
 `cirrus-auth`:
@@ -47,7 +47,7 @@ Tests: ~585 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s w
 
 ### Open-ended client (escape hatch)
 
-Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` (the header-carrying verb — it stays inside the retry / 401-refresh / limit-info loop, unlike the two below), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
+Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` (the header-carrying verb — it stays inside the retry / 401-refresh / limit-info loop, unlike the two below), `send_with_replay` (same loop, with an explicit `Replay` for endpoints whose HTTP method misstates their effect — Apex REST uses `Replay::Never` throughout), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
 
 - **Relative** (`limits`) → versioned: `{instance}/services/data/{version}/limits`
 - **Leading slash** (`/services/apexrest/foo`) → instance-rooted
