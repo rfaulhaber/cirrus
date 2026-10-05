@@ -3,10 +3,10 @@
 //! Two flavors live under `/services/data/{version}/jobs/`:
 //!
 //! - **Ingest** (`/jobs/ingest`) — create / update / upsert / delete /
-//!   hardDelete records from CSV uploads. Salesforce base64-encodes an
-//!   upload and caps the encoded form at 150 MB; because that
-//!   conversion adds roughly 50%, keep each upload's raw CSV under
-//!   100 MB. The caller drives the job through `Open` →
+//!   hardDelete records from CSV uploads. A job holds at most 150 MB
+//!   of data after base64 encoding, roughly 100 MB of raw CSV, and
+//!   that ceiling is per job rather than per upload: larger data sets
+//!   need additional jobs. The caller drives the job through `Open` →
 //!   `UploadComplete` → `InProgress` → `JobComplete` / `Failed` /
 //!   `Aborted`. Reach via [`BulkHandler::ingest`].
 //! - **Query** (`/jobs/query`) — async SOQL execution that streams
@@ -16,11 +16,16 @@
 //! # CSV transport
 //!
 //! Bulk 2.0 is the only Salesforce REST surface that uses `text/csv`
-//! bodies (not JSON). Upload and result-fetch methods take/return
-//! [`bytes::Bytes`] rather than typed bodies so callers can stream large
-//! payloads without forcing buffer copies. CSV parsing/encoding is the
-//! caller's responsibility — pick whichever crate fits the use case
-//! (`csv`, `polars`, etc.).
+//! bodies (not JSON). Upload and result-fetch methods take and return
+//! [`bytes::Bytes`] rather than typed bodies. `Bytes` avoids copies but
+//! does not stream: an upload is sent from one in-memory buffer, and
+//! every result page or download is read completely into memory before
+//! it is returned. Bound query pages with the `max_records` argument to
+//! [`BulkQueryHandler::results`]. For true streaming, build the request
+//! with [`Cirrus::request_builder`] and read the body with reqwest's
+//! chunked API, which bypasses retry, 401 refresh, and limit-info
+//! capture. CSV parsing/encoding is the caller's responsibility — pick
+//! whichever crate fits the use case (`csv`, `polars`, etc.).
 //!
 //! # Polling is on the caller
 //!
@@ -157,9 +162,11 @@ impl BulkIngestHandler<'_> {
     /// Uploads CSV record data for a job. The job must be in `Open` state.
     /// Salesforce returns 201 with no body on success.
     ///
-    /// Keep `csv` under 100 MB: Salesforce converts the body to base64
-    /// before applying its 150 MB ceiling, and that conversion inflates
-    /// the data by roughly 50%. Split larger data across uploads.
+    /// A job accepts at most 150 MB of data after base64 encoding, and
+    /// that conversion inflates the data by roughly 50%, so keep a job's
+    /// total CSV under 100 MB. The ceiling is per job, not per upload:
+    /// data beyond it belongs in a separate ingest job. See
+    /// [Step 3: Bulk Insert] and the [Bulk API limits] cheatsheet.
     ///
     /// An upload that size needs a read timeout to match, because the
     /// deadline covers pushing the body as well as waiting for the
@@ -168,11 +175,17 @@ impl BulkIngestHandler<'_> {
     /// A lost response is never retried automatically. Salesforce
     /// documents this `PUT` as uploading job data, not as replacing
     /// data the job already holds, so a replay risks loading the same
-    /// rows twice. After a transient failure, check the job with
-    /// [`get`](Self::get) before deciding whether to upload again.
+    /// rows twice. Job info cannot settle the question either: nothing
+    /// in an `Open` job's state or counters changes when data arrives.
+    /// After an ambiguous failure, [`abort`](Self::abort) the job and
+    /// create a new one with the same data — an `Open` job has
+    /// processed nothing, so aborting it commits nothing.
     ///
     /// Calls `PUT /services/data/{api_version}/jobs/ingest/{job_id}/batches`
     /// with `Content-Type: text/csv`.
+    ///
+    /// [Step 3: Bulk Insert]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/walkthrough_upload_data.htm
+    /// [Bulk API limits]: https://developer.salesforce.com/docs/atlas.en-us.salesforce_app_limits_cheatsheet.meta/salesforce_app_limits_cheatsheet/salesforce_app_limits_platform_bulkapi.htm
     pub async fn upload(&self, job_id: &str, csv: bytes::Bytes) -> CirrusResult<()> {
         let path = self
             .client
@@ -298,7 +311,9 @@ impl BulkIngestHandler<'_> {
 ///    `Failed`, or `Aborted`.
 /// 3. Drain results via [`results`](Self::results), passing
 ///    [`BulkQueryResults::locator`] back as the cursor on subsequent
-///    calls until it returns `None`.
+///    calls until it returns `None`. Fetch them through a client on
+///    the same API version that created the job; Salesforce answers
+///    409 otherwise.
 /// 4. [`delete`](Self::delete) when done.
 #[derive(Debug)]
 pub struct BulkQueryHandler<'a> {
@@ -350,9 +365,16 @@ impl BulkQueryHandler<'_> {
     /// about the end of the result set — keep draining until
     /// [`BulkQueryResults::locator`] returns `None`.
     ///
+    /// The request goes out at this client's API version, which must be
+    /// the version the job was created with — Salesforce returns a 409
+    /// error for any other ([`BulkQueryJob::api_version`] records the
+    /// job's). See [Get Results for a Query Job].
+    ///
     /// Calls
     /// `GET /services/data/{api_version}/jobs/query/{job_id}/results`
     /// with optional `?locator=&maxRecords=` query parameters.
+    ///
+    /// [Get Results for a Query Job]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_job_results.htm
     pub async fn results(
         &self,
         job_id: &str,
@@ -457,9 +479,17 @@ pub struct BulkIngestSpec {
 
 /// Request body for [`BulkQueryHandler::create`].
 ///
-/// Note that Salesforce caps a single bulk query at 60 minutes of
-/// processing — for larger result sets, partition the SOQL with `WHERE`
-/// clauses and run multiple jobs.
+/// Salesforce retries a query job's processing automatically; a job
+/// that reports more than 15 retries needs narrower filter criteria, so
+/// partition the SOQL with `WHERE` clauses and run several jobs.
+/// `ORDER BY` and `LIMIT` disable PK chunking and make timeouts more
+/// likely, so drop them before troubleshooting further. Retrieving
+/// results times out after 20 minutes. See
+/// [Understanding Bulk API 2.0 Query] and the [Bulk API limits]
+/// cheatsheet.
+///
+/// [Understanding Bulk API 2.0 Query]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/queries.htm
+/// [Bulk API limits]: https://developer.salesforce.com/docs/atlas.en-us.salesforce_app_limits_cheatsheet.meta/salesforce_app_limits_cheatsheet/salesforce_app_limits_platform_bulkapi.htm
 #[derive(Debug, Clone, Serialize)]
 pub struct BulkQuerySpec {
     /// SOQL to execute.
@@ -495,7 +525,7 @@ mod tests {
     use crate::response::{BulkColumnDelimiter, BulkJobState, BulkLineEnding};
     use serde_json::json;
     use std::sync::Arc;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{body_bytes, body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fixture(uri: String) -> Cirrus {
@@ -540,6 +570,27 @@ mod tests {
         })
     }
 
+    fn ingest_create_response(id: &str) -> serde_json::Value {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/walkthrough_upload_data.htm
+        // Step 3's create-job "Example response body": the job is `Open`
+        // with a `contentUrl`, and `jobType` is absent until GET.
+        json!({
+            "id": id,
+            "operation": "insert",
+            "object": "Account",
+            "createdById": "0055fEXAMPLEtG4AAM",
+            "createdDate": "2022-01-02T21:33:43.000+0000",
+            "systemModstamp": "2022-01-02T21:33:43.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "contentUrl": format!("services/data/v67.0/jobs/ingest/{id}/batches"),
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA"
+        })
+    }
+
     #[tokio::test]
     async fn ingest_create_posts_spec_and_parses_open_job() {
         let server = MockServer::start().await;
@@ -551,9 +602,7 @@ mod tests {
                 "object": "Account",
                 "operation": "insert"
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(ingest_job_response("750xx", "Open")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(ingest_create_response("750xx")))
             .mount(&server)
             .await;
 
@@ -573,6 +622,11 @@ mod tests {
             .unwrap();
         assert_eq!(job.id, "750xx");
         assert_eq!(job.state, BulkJobState::Open);
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/v67.0/jobs/ingest/750xx/batches")
+        );
+        assert!(job.job_type.is_none());
     }
 
     #[tokio::test]
@@ -602,7 +656,6 @@ mod tests {
                 "concurrencyMode": "Parallel",
                 "contentType": "CSV",
                 "apiVersion": 60.0,
-                "jobType": "V2Ingest",
                 "contentUrl": "services/data/v66.0/jobs/ingest/750xx/batches",
                 "lineEnding": "LF",
                 "columnDelimiter": "COMMA"
@@ -701,9 +754,7 @@ mod tests {
                 "lineEnding": "CRLF",
                 "columnDelimiter": "TAB"
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(ingest_job_response("750xx", "Open")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(ingest_create_response("750xx")))
             .mount(&server)
             .await;
 
@@ -730,7 +781,9 @@ mod tests {
             .and(path("/services/data/v66.0/jobs/ingest/750xx/batches"))
             .and(header("content-type", "text/csv"))
             .and(header("authorization", "Bearer tok"))
+            .and(body_bytes(b"Name\nAcme\nGlobex\n".to_vec()))
             .respond_with(ResponseTemplate::new(201))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -1006,12 +1059,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_get_parses_documented_job_info() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_one_job.htm
+        // "Response Body" example, verbatim.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/750R0000000zlh9IAA"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "750R0000000zlh9IAA",
+                "operation": "query",
+                "object": "Account",
+                "createdById": "005R0000000GiwjIAC",
+                "createdDate": "2018-12-10T17:50:19.000+0000",
+                "systemModstamp": "2018-12-10T17:51:27.000+0000",
+                "state": "JobComplete",
+                "concurrencyMode": "Parallel",
+                "contentType": "CSV",
+                "apiVersion": 46.0,
+                "jobType": "V2Query",
+                "lineEnding": "LF",
+                "columnDelimiter": "COMMA",
+                "numberRecordsProcessed": 500,
+                "retries": 0,
+                "totalProcessingTime": 334,
+                "isPkChunkingSupported": true
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let job = sf.bulk().query().get("750R0000000zlh9IAA").await.unwrap();
+        assert_eq!(job.id, "750R0000000zlh9IAA");
+        assert_eq!(job.state, BulkJobState::JobComplete);
+        assert_eq!(job.job_type.as_deref(), Some("V2Query"));
+        assert_eq!(job.number_records_processed, Some(500));
+        assert_eq!(job.is_pk_chunking_supported, Some(true));
+    }
+
+    #[tokio::test]
+    async fn query_delete_returns_unit_on_204() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_delete_job.htm
+        // "If the method is successful, the status code is 204 (No
+        // Content) and there is no response body."
+        let server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/services/data/v66.0/jobs/query/750R0000000zxnaIAA"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.bulk()
+            .query()
+            .delete("750R0000000zxnaIAA")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_delete_surfaces_documented_400_error_array() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_delete_job.htm
+        // "Response Body - For an Unsuccessful Request", verbatim: a job
+        // that has not terminated cannot be deleted.
+        let server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/services/data/v66.0/jobs/query/750xx"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!([{
+                "errorCode": "API_ERROR",
+                "message": "Error encountered when deleting the job because the job is not terminated"
+            }])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf.bulk().query().delete("750xx").await.unwrap_err();
+        match err {
+            crate::CirrusError::Api { status, errors, .. } => {
+                assert_eq!(status, 400);
+                assert_eq!(errors[0].error_code, "API_ERROR");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn query_results_returns_csv_with_locator_header() {
         let server = MockServer::start().await;
 
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_job_results.htm
+        // "The Accept header must match what was specified when the job
+        // was created. Currently, only text/csv is supported."
         let csv = "Id,Name\n001xx,Acme\n";
         Mock::given(method("GET"))
             .and(path("/services/data/v66.0/jobs/query/750xx/results"))
+            .and(header("accept", "text/csv"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(csv)

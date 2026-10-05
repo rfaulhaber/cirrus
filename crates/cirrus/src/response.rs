@@ -295,8 +295,18 @@ pub enum BulkJobState {
     JobComplete,
     /// Job was aborted by the caller or an admin.
     Aborted,
-    /// Job failed at the platform level. For ingest jobs, see
-    /// [`BulkIngestJob::error_message`] for the reason.
+    /// Job failed. For an ingest job this means some records failed,
+    /// and rows that were processed successfully stay committed —
+    /// Salesforce does not roll them back. Read
+    /// [`successful_results`], [`failed_results`], and
+    /// [`unprocessed_records`] before resubmitting the same data;
+    /// [`BulkIngestJob::error_message`] carries a job-level reason when
+    /// there is one. See [Get Job Info].
+    ///
+    /// [`successful_results`]: crate::handlers::bulk::BulkIngestHandler::successful_results
+    /// [`failed_results`]: crate::handlers::bulk::BulkIngestHandler::failed_results
+    /// [`unprocessed_records`]: crate::handlers::bulk::BulkIngestHandler::unprocessed_records
+    /// [Get Job Info]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
     Failed,
 }
 
@@ -327,10 +337,12 @@ pub enum BulkColumnDelimiter {
 
 /// Response from `POST /jobs/ingest` and `GET /jobs/ingest/{jobId}`.
 ///
-/// Field availability varies by job state — `number_records_processed`,
-/// `number_records_failed`, and timing fields are populated only after
-/// the job reaches `JobComplete` or `Failed`. `content_url` is populated
-/// only while the job is in `Open` state.
+/// Field availability varies by job state and request kind —
+/// `number_records_processed`, `number_records_failed`, and timing
+/// fields are populated only after the job reaches `JobComplete` or
+/// `Failed`; `content_url` is populated only while the job is in `Open`
+/// state; and the create response (`POST`) omits `job_type`, which only
+/// the `GET` response carries.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BulkIngestJob {
     pub id: String,
@@ -368,8 +380,13 @@ pub struct BulkIngestJob {
     /// rather than the `String` used by [`ApiVersion::version`].
     #[serde(rename = "apiVersion")]
     pub api_version: f64,
-    #[serde(rename = "jobType")]
-    pub job_type: String,
+    /// `"V2Ingest"` on `GET` responses. The create-job response omits
+    /// it, so expect `None` from [`BulkIngestHandler::create`] until a
+    /// [`get`](crate::handlers::bulk::BulkIngestHandler::get).
+    ///
+    /// [`BulkIngestHandler::create`]: crate::handlers::bulk::BulkIngestHandler::create
+    #[serde(rename = "jobType", default)]
+    pub job_type: Option<String>,
     #[serde(rename = "concurrencyMode")]
     pub concurrency_mode: String,
     #[serde(rename = "createdById")]
@@ -1470,7 +1487,42 @@ mod tests {
             job.content_url.as_deref(),
             Some("services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches")
         );
+        assert_eq!(job.job_type.as_deref(), Some("V2Ingest"));
         assert!(job.number_records_processed.is_none());
+    }
+
+    #[test]
+    fn parses_bulk_ingest_job_create_response_without_jobtype() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/walkthrough_upload_data.htm
+        // Step 3's "Example response body" for `POST /jobs/ingest`,
+        // verbatim. The create response carries no `jobType`; only the
+        // later GET example on the same page does. The example's
+        // `contentUrl` also lacks the `v` in its version segment (the
+        // Get Job Info example has it) and is kept as published.
+        let body = json!({
+            "id": "7505fEXAMPLE4C2AAM",
+            "operation": "insert",
+            "object": "Account",
+            "createdById": "0055fEXAMPLEtG4AAM",
+            "createdDate": "2022-01-02T21:33:43.000+0000",
+            "systemModstamp": "2022-01-02T21:33:43.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "contentUrl": "services/data/67.0/jobs/ingest/7505fEXAMPLE4C2AAM/batches",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA"
+        })
+        .to_string();
+        let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(job.id, "7505fEXAMPLE4C2AAM");
+        assert_eq!(job.state, BulkJobState::Open);
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/67.0/jobs/ingest/7505fEXAMPLE4C2AAM/batches")
+        );
+        assert!(job.job_type.is_none());
     }
 
     #[test]
