@@ -29,13 +29,17 @@
 //!
 //! Per RFC 6749 §4.4.3, the Client Credentials grant does not issue a
 //! refresh token. Token rotation is handled by re-running the grant when
-//! the local TTL elapses; semantics match [`crate::jwt::JwtAuth`].
+//! the local TTL elapses; semantics match [`crate::jwt::JwtAuth`],
+//! including single-flight minting shared with queued callers, the
+//! fallback to a still-valid cached token when a refresh inside the
+//! margin fails transiently, and the bounded retry of the token request.
 
 use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
+use crate::mint::MintState;
 use crate::token_endpoint::{
-    check_instance_url, default_http_client, exchange, normalize_url, require_secure_login_url,
-    token_is_fresh,
+    GrantReplay, check_instance_url, default_http_client, exchange, normalize_url,
+    require_secure_login_url,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -44,21 +48,6 @@ use tokio::sync::RwLock;
 
 /// Default cache TTL for an access token after it's issued.
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
-
-#[derive(Clone)]
-struct CachedToken {
-    access_token: String,
-    expires_at: Instant,
-}
-
-impl std::fmt::Debug for CachedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedToken")
-            .field("access_token", &"[redacted]")
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
-}
 
 /// Client-credentials-grant auth session.
 ///
@@ -70,7 +59,7 @@ pub struct ClientCredentialsAuth {
     instance_url: String,
     token_ttl: Duration,
     http: reqwest::Client,
-    cached: RwLock<Option<CachedToken>>,
+    state: RwLock<MintState>,
 }
 
 impl std::fmt::Debug for ClientCredentialsAuth {
@@ -114,7 +103,7 @@ impl ClientCredentialsAuth {
         ClientCredentialsAuthBuilder::default()
     }
 
-    async fn mint_token(&self) -> AuthResult<CachedToken> {
+    async fn mint_token(&self) -> AuthResult<crate::mint::CachedToken> {
         tracing::info!(
             target: "cirrus::auth",
             flow = "client-credentials",
@@ -127,11 +116,11 @@ impl ClientCredentialsAuth {
             ("client_secret", self.consumer_secret.as_str()),
         ];
 
-        let token = exchange(&self.http, &self.login_url, &body).await?;
+        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Safe).await?;
         check_instance_url(&self.instance_url, &token)?;
 
         let expires_at = token.cache_expiry(self.token_ttl);
-        Ok(CachedToken {
+        Ok(crate::mint::CachedToken {
             access_token: token.access_token,
             expires_at,
         })
@@ -141,27 +130,24 @@ impl ClientCredentialsAuth {
 #[async_trait]
 impl AuthSession for ClientCredentialsAuth {
     async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
-        // Fast path — read lock, return clone of cached token if still valid.
-        {
-            let guard = self.cached.read().await;
-            if let Some(cached) = guard.as_ref()
-                && token_is_fresh(cached.expires_at)
-            {
-                return Ok(Cow::Owned(cached.access_token.clone()));
-            }
+        // Taken before any lock: the read lock below queues behind an
+        // in-flight mint, so the start time is what tells a caller, under
+        // the write lock, that a completed mint was concurrent with it and
+        // that its outcome is this caller's too.
+        let started = Instant::now();
+
+        // Fast path — read lock, return the cached token while it is fresh.
+        if let Some(token) = self.state.read().await.fresh_token() {
+            return Ok(Cow::Owned(token));
         }
 
-        // Slow path — write lock, double-check, mint.
-        let mut guard = self.cached.write().await;
-        if let Some(cached) = guard.as_ref()
-            && token_is_fresh(cached.expires_at)
-        {
-            return Ok(Cow::Owned(cached.access_token.clone()));
+        // Slow path — write lock, then share rather than repeat.
+        let mut guard = self.state.write().await;
+        if let Some(outcome) = guard.shared_outcome(started) {
+            return outcome.map(Cow::Owned);
         }
-        let new_token = self.mint_token().await?;
-        let token_str = new_token.access_token.clone();
-        *guard = Some(new_token);
-        Ok(Cow::Owned(token_str))
+        let minted = self.mint_token().await;
+        guard.record("client-credentials", minted).map(Cow::Owned)
     }
 
     fn instance_url(&self) -> &str {
@@ -169,26 +155,10 @@ impl AuthSession for ClientCredentialsAuth {
     }
 
     async fn invalidate(&self, stale_token: &str) {
-        // Compare-and-swap: only clear the cached token if it still
-        // matches what the failing request used. Avoids racing with a
-        // concurrent task that already refreshed.
-        let mut guard = self.cached.write().await;
-        if let Some(cached) = guard.as_ref()
-            && cached.access_token == stale_token
-        {
-            tracing::debug!(
-                target: "cirrus::auth",
-                flow = "client-credentials",
-                "invalidating cached token (CAS matched)",
-            );
-            *guard = None;
-        } else {
-            tracing::trace!(
-                target: "cirrus::auth",
-                flow = "client-credentials",
-                "invalidate called but cached token differs (concurrent refresh?); no-op",
-            );
-        }
+        self.state
+            .write()
+            .await
+            .invalidate_if_matches("client-credentials", stale_token);
     }
 }
 
@@ -264,6 +234,11 @@ impl ClientCredentialsAuthBuilder {
     /// and refuses to follow redirects, so a redirect cannot replay the
     /// consumer secret to another host. A client supplied here replaces
     /// those defaults wholesale — configure both on it.
+    ///
+    /// A token request that fails to connect, is lost in transit or is
+    /// answered with a 429 or 5xx is retried up to twice, 250 ms then
+    /// 500 ms later; the grant has no side effect to duplicate. A mint can
+    /// therefore take up to three request timeouts.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -297,7 +272,7 @@ impl ClientCredentialsAuthBuilder {
             instance_url,
             token_ttl,
             http,
-            cached: RwLock::new(None),
+            state: RwLock::new(MintState::default()),
         })
     }
 }
@@ -407,6 +382,116 @@ mod tests {
         let t2 = auth.access_token().await.unwrap();
         assert_eq!(&*t2, "00DXX!ACCESS");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_failed_mint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({
+                        "error": "invalid_client",
+                        "error_description": "invalid client credentials"
+                    }))
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .build()
+                .unwrap(),
+        );
+        let callers: Vec<_> = (0..6)
+            .map(|_| {
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+            })
+            .collect();
+        for caller in callers {
+            let outcome = caller.await.unwrap();
+            assert!(
+                matches!(outcome, Err(AuthError::OAuth { ref error, .. }) if error == "invalid_client"),
+                "every caller shares the failed mint's outcome, got {outcome:?}"
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_failure_inside_the_margin_falls_back_to_the_cached_token() {
+        // A token_ttl equal to the refresh margin puts the cached token
+        // inside the margin the moment it is minted: still valid at
+        // Salesforce, but due for a proactive refresh. When that refresh
+        // hits a 503, the request must go out with the token Salesforce
+        // would still accept rather than fail on a token-endpoint blip.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!FIRST",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
+            .build()
+            .unwrap();
+        assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");
+        let fallback = auth.access_token().await;
+        assert!(
+            matches!(fallback.as_deref(), Ok("00DXX!FIRST")),
+            "expected the still-valid cached token, got {fallback:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_failure_inside_the_margin_is_not_masked_by_the_cached_token() {
+        // A revoked credential has to surface even while a cached token
+        // is still technically valid; only transient failures fall back.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!FIRST",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_client",
+                "error_description": "invalid client credentials"
+            })))
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
+            .build()
+            .unwrap();
+        assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");
+        let err = auth.access_token().await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::OAuth { ref error, .. } if error == "invalid_client"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

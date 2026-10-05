@@ -118,6 +118,61 @@ pub enum AuthError {
     Url(#[from] url::ParseError),
 }
 
+impl AuthError {
+    /// Whether a later attempt could clear this failure: a transport
+    /// error other than a request that could not be built, or a 429 or
+    /// 5xx from the token endpoint. An OAuth error such as
+    /// `invalid_grant`, a mismatched instance URL and every
+    /// configuration error are permanent until something changes on the
+    /// caller's side, so they are never transient.
+    ///
+    /// The caching flows use this to decide whether a still-valid cached
+    /// token may stand in for a failed refresh.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(e) => !e.is_builder(),
+            Self::UnexpectedResponse { status } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
+
+    /// A copy of this error for a caller that shares the outcome of a
+    /// mint another caller performed.
+    ///
+    /// Every variant that owns only strings is copied exactly, so a
+    /// waiter matching on [`AuthError::OAuth`] sees the same code. The
+    /// transport and JSON sources cannot be cloned, so those two variants
+    /// become [`AuthError::Other`] carrying the original `Display` text.
+    pub(crate) fn clone_for_waiter(&self) -> Self {
+        match self {
+            Self::MissingField(field) => Self::MissingField(field),
+            Self::OAuth {
+                error,
+                error_description,
+            } => Self::OAuth {
+                error: error.clone(),
+                error_description: error_description.clone(),
+            },
+            Self::StateMismatch => Self::StateMismatch,
+            Self::InstanceUrlMismatch {
+                configured,
+                returned,
+            } => Self::InstanceUrlMismatch {
+                configured: configured.clone(),
+                returned: returned.clone(),
+            },
+            Self::UnexpectedResponse { status } => Self::UnexpectedResponse { status: *status },
+            Self::InsecureLoginUrl { url } => Self::InsecureLoginUrl { url: url.clone() },
+            Self::Signing(msg) => Self::Signing(msg.clone()),
+            Self::Randomness(msg) => Self::Randomness(msg.clone()),
+            Self::Other(msg) => Self::Other(msg.clone()),
+            Self::Http(e) => Self::Other(format!("HTTP request failed: {e}")),
+            Self::Serialization(e) => Self::Other(format!("serialization error: {e}")),
+            Self::Url(e) => Self::Url(*e),
+        }
+    }
+}
+
 // Hand-written so `OAuth.error_description` is redacted in `{:?}` output —
 // a derived `Debug` would print the raw description verbatim, defeating the
 // redaction applied at every other layer. The `error` code and all other
@@ -201,6 +256,48 @@ mod tests {
             } => assert!(error_description.is_some()),
             other => panic!("expected OAuth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn only_transport_failures_and_server_side_statuses_are_transient() {
+        assert!(AuthError::UnexpectedResponse { status: 503 }.is_transient());
+        assert!(AuthError::UnexpectedResponse { status: 429 }.is_transient());
+        assert!(!AuthError::UnexpectedResponse { status: 404 }.is_transient());
+        assert!(
+            !AuthError::OAuth {
+                error: "invalid_grant".into(),
+                error_description: None,
+            }
+            .is_transient()
+        );
+        assert!(
+            !AuthError::InstanceUrlMismatch {
+                configured: "a".into(),
+                returned: "b".into(),
+            }
+            .is_transient()
+        );
+        assert!(!AuthError::Other("token mint task panicked".into()).is_transient());
+    }
+
+    #[test]
+    fn waiter_clone_keeps_the_oauth_code_and_describes_unclonable_sources() {
+        let oauth = AuthError::OAuth {
+            error: "invalid_grant".into(),
+            error_description: Some("expired access/refresh token".into()),
+        };
+        assert!(matches!(
+            oauth.clone_for_waiter(),
+            AuthError::OAuth { ref error, ref error_description }
+                if error == "invalid_grant" && error_description.is_some()
+        ));
+        let json: AuthError = serde_json::from_str::<serde_json::Value>("not json")
+            .unwrap_err()
+            .into();
+        let cloned = json.clone_for_waiter();
+        assert!(
+            matches!(cloned, AuthError::Other(ref msg) if msg.starts_with("serialization error: "))
+        );
     }
 
     #[test]

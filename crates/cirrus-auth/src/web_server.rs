@@ -58,7 +58,7 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
-    default_http_client, exchange, normalize_url, require_secure_login_url,
+    GrantReplay, default_http_client, exchange, normalize_url, require_secure_login_url,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -208,7 +208,7 @@ impl WebServerFlow {
             body.push(("client_secret", secret));
         }
 
-        let token = exchange(&self.http, &self.login_url, &body).await?;
+        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
         Ok(CompletedSession {
             access_token: token.access_token,
             refresh_token: token.refresh_token,

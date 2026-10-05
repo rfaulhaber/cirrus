@@ -20,15 +20,36 @@
 //! shorter of the two. After that window elapses, the next call mints a
 //! new token regardless of whether the previous one would still have
 //! worked.
+//!
+//! Minting is single-flight: callers that arrive while a mint is in
+//! flight wait for it and share its outcome, success or failure, so a slow
+//! or failing token endpoint costs one grant per window rather than one
+//! per caller. If the mint fails transiently — a transport failure or a
+//! 429 / 5xx — while the cached token is inside its refresh margin but not
+//! yet expired, that token is returned and a warning is logged; an OAuth
+//! error such as `invalid_grant` is never masked that way. The token
+//! request itself is retried a bounded number of times, see
+//! [`JwtAuthBuilder::http_client`].
+//!
+//! ## Signing backend
+//!
+//! The assertion is signed through jsonwebtoken's aws-lc-rs backend
+//! directly rather than through its process-global crypto provider, so a
+//! build that also enables jsonwebtoken's `rust_crypto` feature for its
+//! own purposes does not affect token minting here.
 
 use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
+use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
-    check_instance_url, default_http_client, exchange, normalize_url, require_secure_login_url,
-    token_is_fresh,
+    GrantReplay, check_instance_url, default_http_client, exchange, normalize_url,
+    require_secure_login_url,
 };
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use camino::Utf8PathBuf;
+use jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use std::borrow::Cow;
@@ -83,21 +104,6 @@ impl std::fmt::Debug for JwtClaims {
     }
 }
 
-#[derive(Clone)]
-struct CachedToken {
-    access_token: String,
-    expires_at: Instant,
-}
-
-impl std::fmt::Debug for CachedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedToken")
-            .field("access_token", &"[redacted]")
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
-}
-
 /// JWT Bearer flow auth session.
 ///
 /// Construct via [`JwtAuth::builder`].
@@ -109,7 +115,7 @@ pub struct JwtAuth {
     instance_url: String,
     token_ttl: Duration,
     http: reqwest::Client,
-    cached: RwLock<Option<CachedToken>>,
+    state: RwLock<MintState>,
 }
 
 impl std::fmt::Debug for JwtAuth {
@@ -174,16 +180,14 @@ impl JwtAuth {
             exp: now_secs + JWT_VALIDITY_SECS,
         };
 
-        let header = Header::new(Algorithm::RS256);
-        let assertion = jsonwebtoken::encode(&header, &claims, &self.encoding_key)
-            .map_err(|e| AuthError::Signing(e.to_string()))?;
+        let assertion = sign_assertion(&claims, &self.encoding_key)?;
 
         let body = [
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
             ("assertion", assertion.as_str()),
         ];
 
-        let token = exchange(&self.http, &self.login_url, &body).await?;
+        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Safe).await?;
         check_instance_url(&self.instance_url, &token)?;
 
         let expires_at = token.cache_expiry(self.token_ttl);
@@ -194,30 +198,50 @@ impl JwtAuth {
     }
 }
 
+/// Produces the compact JWS for `claims` with the aws-lc-rs backend
+/// directly.
+///
+/// `jsonwebtoken::encode` resolves the process-global `CryptoProvider`,
+/// and a downstream build that enables both of jsonwebtoken's backend
+/// features leaves that provider unusable: its signer panics instead of
+/// erroring, which would unwind out of `access_token`. Binding to the one
+/// backend this crate compiles against keeps the mint independent of the
+/// host application's feature set and of any provider it installs.
+fn sign_assertion(claims: &JwtClaims, key: &EncodingKey) -> AuthResult<String> {
+    let signer = (DEFAULT_PROVIDER.signer_factory)(&Algorithm::RS256, key)
+        .map_err(|e| AuthError::Signing(e.to_string()))?;
+    let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Header::new(Algorithm::RS256))?);
+    let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let message = format!("{header}.{claims}");
+    let signature = signer
+        .try_sign(message.as_bytes())
+        .map_err(|e| AuthError::Signing(e.to_string()))?;
+    Ok(format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature)))
+}
+
 #[async_trait]
 impl AuthSession for JwtAuth {
     async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
-        // Fast path — read lock, return clone of cached token if still valid.
-        {
-            let guard = self.cached.read().await;
-            if let Some(cached) = guard.as_ref()
-                && token_is_fresh(cached.expires_at)
-            {
-                return Ok(Cow::Owned(cached.access_token.clone()));
-            }
+        // Taken before any lock: the read lock below queues behind an
+        // in-flight mint, so the start time is what tells a caller, under
+        // the write lock, that a completed mint was concurrent with it and
+        // that its outcome is this caller's too.
+        let started = Instant::now();
+
+        // Fast path — read lock, return the cached token while it is fresh.
+        if let Some(token) = self.state.read().await.fresh_token() {
+            return Ok(Cow::Owned(token));
         }
 
-        // Slow path — write lock, double-check, mint.
-        let mut guard = self.cached.write().await;
-        if let Some(cached) = guard.as_ref()
-            && token_is_fresh(cached.expires_at)
-        {
-            return Ok(Cow::Owned(cached.access_token.clone()));
+        // Slow path — write lock, then share rather than repeat: a mint
+        // that finished while this caller waited decides this caller's
+        // outcome too, whether it produced a token or a failure.
+        let mut guard = self.state.write().await;
+        if let Some(outcome) = guard.shared_outcome(started) {
+            return outcome.map(Cow::Owned);
         }
-        let new_token = self.mint_token().await?;
-        let token_str = new_token.access_token.clone();
-        *guard = Some(new_token);
-        Ok(Cow::Owned(token_str))
+        let minted = self.mint_token().await;
+        guard.record("jwt-bearer", minted).map(Cow::Owned)
     }
 
     fn instance_url(&self) -> &str {
@@ -225,26 +249,10 @@ impl AuthSession for JwtAuth {
     }
 
     async fn invalidate(&self, stale_token: &str) {
-        // Compare-and-swap: only clear the cached token if it still
-        // matches what the failing request used. Avoids racing with a
-        // concurrent task that already refreshed.
-        let mut guard = self.cached.write().await;
-        if let Some(cached) = guard.as_ref()
-            && cached.access_token == stale_token
-        {
-            tracing::debug!(
-                target: "cirrus::auth",
-                flow = "jwt-bearer",
-                "invalidating cached token (CAS matched)",
-            );
-            *guard = None;
-        } else {
-            tracing::trace!(
-                target: "cirrus::auth",
-                flow = "jwt-bearer",
-                "invalidate called but cached token differs (concurrent refresh?); no-op",
-            );
-        }
+        self.state
+            .write()
+            .await
+            .invalidate_if_matches("jwt-bearer", stale_token);
     }
 }
 
@@ -357,6 +365,12 @@ impl JwtAuthBuilder {
     /// and refuses to follow redirects, so a redirect cannot replay the
     /// signed assertion to another host. A client supplied here replaces
     /// those defaults wholesale — configure both on it.
+    ///
+    /// A token request that fails to connect, is lost in transit or is
+    /// answered with a 429 or 5xx is retried up to twice, 250 ms then
+    /// 500 ms later: the assertion stays valid for the whole window and
+    /// Salesforce does not bind it to a single use. A mint can therefore
+    /// take up to three request timeouts.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -396,7 +410,7 @@ impl JwtAuthBuilder {
             instance_url,
             token_ttl,
             http,
-            cached: RwLock::new(None),
+            state: RwLock::new(MintState::default()),
         })
     }
 }
@@ -525,6 +539,79 @@ mod tests {
 
         // Second call must reuse the cached token, not call the endpoint again.
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_failed_mint() {
+        // Six callers arrive while the cache is empty. The first mint
+        // takes the lock and fails; the other five are queued behind it
+        // and must get that outcome, not five more trips to the token
+        // endpoint, each one a separate login attempt against the org.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({
+                        "error": "invalid_grant",
+                        "error_description": "user hasn't approved this consumer"
+                    }))
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .build()
+                .unwrap(),
+        );
+        let callers: Vec<_> = (0..6)
+            .map(|_| {
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+            })
+            .collect();
+        for caller in callers {
+            let outcome = caller.await.unwrap();
+            assert!(
+                matches!(outcome, Err(AuthError::OAuth { ref error, .. }) if error == "invalid_grant"),
+                "every caller shares the failed mint's outcome, got {outcome:?}"
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_503_from_the_token_endpoint_is_retried_for_the_jwt_grant() {
+        // The signed assertion is valid for the whole retry window and
+        // Salesforce does not bind it to a single use, so a 503 from the
+        // login host is as safe to retry as the same 503 on an API call.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!ACCESS",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let token = auth.access_token().await.unwrap();
+        assert_eq!(&*token, "00DXX!ACCESS");
     }
 
     #[tokio::test]

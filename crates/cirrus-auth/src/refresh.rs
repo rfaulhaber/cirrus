@@ -17,10 +17,18 @@
 //! being superseded.
 //!
 //! All of those surface identically: the grant fails with
-//! [`AuthError::OAuth`] carrying `invalid_grant`. This session records no
-//! terminal state, so the next call retries the same doomed grant. Treat a
-//! persistent `invalid_grant` here as "the user must re-authorize" rather
-//! than as a transient fault, and alert on it.
+//! [`AuthError::OAuth`] carrying `invalid_grant`. Callers that were queued
+//! behind the failing grant share that outcome instead of presenting the
+//! dead token in turn, but the session records no terminal state, so a
+//! later call retries the same doomed grant. Treat a persistent
+//! `invalid_grant` here as "the user must re-authorize" rather than as a
+//! transient fault, and alert on it.
+//!
+//! A transient failure — a transport error or a 429 / 5xx — while the
+//! cached access token is inside its refresh margin but not yet expired
+//! returns that token with a warning instead of failing the call. The
+//! grant itself is re-sent only when the request never left the client;
+//! see [`RefreshTokenAuthBuilder::http_client`].
 //!
 //! ## Usage
 //!
@@ -66,11 +74,14 @@
 //! The flip side is that a detached mint holds the session's write lock
 //! until it finishes, and abandoning the caller's future does not shorten
 //! that. What bounds it is the token-endpoint client's own timeout, which
-//! the default client sets. A client supplied through
-//! [`RefreshTokenAuthBuilder::http_client`] with no timeouts of its own
-//! reintroduces the unbounded case: against an endpoint that accepts the
-//! connection and never answers, every concurrent `access_token` and
-//! `invalidate` on this session blocks for as long as the stall lasts.
+//! the default client sets, times the three attempts a connect failure
+//! may take; callers queued behind the mint share its outcome rather than
+//! minting again, so the queue adds no further grants. A client supplied
+//! through [`RefreshTokenAuthBuilder::http_client`] with no timeouts of
+//! its own reintroduces the unbounded case: against an endpoint that
+//! accepts the connection and never answers, every concurrent
+//! `access_token` and `invalidate` on this session blocks for as long as
+//! the stall lasts.
 //!
 //! Because reusing a rotated-away token revokes the whole family, one
 //! stored token must back exactly one session: share a single
@@ -79,9 +90,10 @@
 
 use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
+use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
-    check_instance_url, default_http_client, exchange, normalize_url, require_secure_login_url,
-    token_is_fresh,
+    GrantReplay, check_instance_url, default_http_client, exchange, normalize_url,
+    require_secure_login_url,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -98,29 +110,15 @@ pub const SANDBOX_LOGIN_URL: &str = "https://test.salesforce.com";
 /// Default cache TTL for an access token after it's issued.
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Clone)]
-struct CachedToken {
-    access_token: String,
-    expires_at: Instant,
-}
-
-impl std::fmt::Debug for CachedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedToken")
-            .field("access_token", &"[redacted]")
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
-}
-
 /// Interior state guarded by a single lock: the live refresh token (which
-/// rotation may replace) and the cached access token. Folding both into one
-/// lock makes rotation serialize against minting — every mint reads and
-/// writes the pair through the same write guard, so two refreshes can never
-/// race to rotate, and a rotated-away token is never reused.
+/// rotation may replace) and the cached access token with its mint
+/// bookkeeping. Folding both into one lock makes rotation serialize
+/// against minting — every mint reads and writes the pair through the
+/// same write guard, so two refreshes can never race to rotate, and a
+/// rotated-away token is never reused.
 struct AuthState {
     refresh_token: String,
-    cached: Option<CachedToken>,
+    mint: MintState,
 }
 
 /// Callback invoked when the session adopts a rotated refresh token.
@@ -257,7 +255,7 @@ impl MintConfig {
             body.push(("client_secret", secret));
         }
 
-        let token = exchange(&self.http, &self.login_url, &body).await?;
+        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
 
         // Adopt a rotated refresh token before any post-exchange failure
         // path (e.g. the instance_url check below). Once `exchange` returns
@@ -291,20 +289,21 @@ impl MintConfig {
 #[async_trait]
 impl AuthSession for RefreshTokenAuth {
     async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
-        // Fast path — read lock, return clone of cached token if still valid.
-        {
-            let guard = self.state.read().await;
-            if let Some(cached) = guard.cached.as_ref()
-                && token_is_fresh(cached.expires_at)
-            {
-                return Ok(Cow::Owned(cached.access_token.clone()));
-            }
+        // Taken before any lock: the read lock below queues behind an
+        // in-flight mint, so the start time is what tells a caller, under
+        // the write lock, that a completed mint was concurrent with it and
+        // that its outcome is this caller's too.
+        let started = Instant::now();
+
+        // Fast path — read lock, return the cached token while it is fresh.
+        if let Some(token) = self.state.read().await.mint.fresh_token() {
+            return Ok(Cow::Owned(token));
         }
 
-        // Slow path — take an owned write guard, double-check, mint. The
-        // write lock serializes refresh-token rotation: `mint_token` reads
-        // and replaces the token through this guard, so no two mints can
-        // race.
+        // Slow path — take an owned write guard, share a mint that
+        // completed while waiting, otherwise mint. The write lock
+        // serializes refresh-token rotation: `mint_token` reads and
+        // replaces the token through this guard, so no two mints can race.
         //
         // The mint runs in a detached task because it is not cancellation-
         // safe: once the refresh grant reaches a Refresh Token Rotation org,
@@ -314,19 +313,16 @@ impl AuthSession for RefreshTokenAuth {
         // timeout, `select!`). Awaiting the JoinHandle abandons only the
         // result, never the mint; the moved guard is released when the task
         // finishes, and the cache write stays inside the task so a cancelled
-        // caller still leaves the fresh token behind.
+        // caller still leaves the outcome behind for the callers queued
+        // after it.
         let mut guard = Arc::clone(&self.state).write_owned().await;
-        if let Some(cached) = guard.cached.as_ref()
-            && token_is_fresh(cached.expires_at)
-        {
-            return Ok(Cow::Owned(cached.access_token.clone()));
+        if let Some(outcome) = guard.mint.shared_outcome(started) {
+            return outcome.map(Cow::Owned);
         }
         let config = Arc::clone(&self.config);
         let task = tokio::spawn(async move {
-            let minted = config.mint_token(&mut guard).await?;
-            let token = minted.access_token.clone();
-            guard.cached = Some(minted);
-            Ok::<_, AuthError>(token)
+            let minted = config.mint_token(&mut guard).await;
+            guard.mint.record("refresh-token", minted)
         });
         match task.await {
             Ok(result) => result.map(Cow::Owned),
@@ -351,27 +347,13 @@ impl AuthSession for RefreshTokenAuth {
     }
 
     async fn invalidate(&self, stale_token: &str) {
-        // Compare-and-swap: only clear the cached access token if it
-        // still matches what the failing request used. The underlying
-        // refresh_token isn't affected — we only ever want the
-        // *short-lived* access token re-minted.
-        let mut guard = self.state.write().await;
-        if let Some(cached) = guard.cached.as_ref()
-            && cached.access_token == stale_token
-        {
-            tracing::debug!(
-                target: "cirrus::auth",
-                flow = "refresh-token",
-                "invalidating cached token (CAS matched)",
-            );
-            guard.cached = None;
-        } else {
-            tracing::trace!(
-                target: "cirrus::auth",
-                flow = "refresh-token",
-                "invalidate called but cached token differs (concurrent refresh?); no-op",
-            );
-        }
+        // Only the short-lived access token is cleared; the refresh token
+        // is unaffected and the next call mints through it again.
+        self.state
+            .write()
+            .await
+            .mint
+            .invalidate_if_matches("refresh-token", stale_token);
     }
 }
 
@@ -477,6 +459,13 @@ impl RefreshTokenAuthBuilder {
     /// [`access_token`](crate::AuthSession::access_token) and
     /// [`invalidate`](crate::AuthSession::invalidate) call on this session
     /// for as long as it stalls.
+    ///
+    /// A refresh grant is re-sent only when the request never left the
+    /// client (up to twice, 250 ms then 500 ms later). After an ambiguous
+    /// failure — a lost response, a 5xx from an intermediary — it is not
+    /// replayed: under Refresh Token Rotation the attempt whose answer was
+    /// lost may already have rotated the token, and presenting the old one
+    /// again would revoke the whole family.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -519,7 +508,7 @@ impl RefreshTokenAuthBuilder {
             }),
             state: Arc::new(RwLock::new(AuthState {
                 refresh_token,
-                cached: None,
+                mint: MintState::default(),
             })),
         })
     }
@@ -680,6 +669,111 @@ mod tests {
         assert!(
             !body.contains("client_secret"),
             "public client should not send client_secret, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_failed_refresh() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=005316711&type=1
+        // On "expired access/refresh token" the client "should catch
+        // this specific error and initiate a fresh authentication flow
+        // rather than repeatedly retrying with the same invalid token."
+        // Callers queued behind the failing grant must share its outcome
+        // instead of each presenting the dead token in turn. A later,
+        // separate call does try the grant again: the session records
+        // no terminal state.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({
+                        "error": "invalid_grant",
+                        "error_description": "expired access/refresh token"
+                    }))
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .build()
+                .unwrap(),
+        );
+        let callers: Vec<_> = (0..6)
+            .map(|_| {
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+            })
+            .collect();
+        for caller in callers {
+            let outcome = caller.await.unwrap();
+            assert!(
+                matches!(outcome, Err(AuthError::OAuth { ref error, .. }) if error == "invalid_grant"),
+                "every caller shares the failed grant's outcome, got {outcome:?}"
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        let later = auth.access_token().await;
+        assert!(matches!(later, Err(AuthError::OAuth { .. })), "{later:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_503_on_the_refresh_grant_is_not_replayed() {
+        // Under Refresh Token Rotation the attempt whose answer was a 5xx
+        // from an intermediary may already have rotated the token at the
+        // org; presenting the old one again would revoke the family.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let err = auth.access_token().await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnexpectedResponse { status: 503 }),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_failure_inside_the_margin_falls_back_to_the_cached_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!FIRST",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
+            .build()
+            .unwrap();
+        assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");
+        let fallback = auth.access_token().await;
+        assert!(
+            matches!(fallback.as_deref(), Ok("00DXX!FIRST")),
+            "expected the still-valid cached token, got {fallback:?}"
         );
     }
 
