@@ -55,6 +55,13 @@ impl SoapFault {
 ///
 /// Marked `#[non_exhaustive]`: match on the variants you handle and keep
 /// a `_` arm, so a new variant in a later release is an additive change.
+///
+/// Variants that wrap another error ([`HttpClient`](Self::HttpClient),
+/// [`Http`](Self::Http)) expose it through
+/// [`source()`](std::error::Error::source) and do not repeat its text in
+/// their own `Display`, so a reporter that walks the chain prints each
+/// message once. Print the chain (anyhow's `{:#}`, for example) to see
+/// the underlying cause; `{}` alone names only the category.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MetadataError {
@@ -63,11 +70,11 @@ pub enum MetadataError {
     MissingField(&'static str),
 
     /// Failed to construct the underlying HTTP client.
-    #[error("failed to construct HTTP client: {0}")]
+    #[error("failed to construct HTTP client")]
     HttpClient(#[source] reqwest::Error),
 
     /// Network or transport-level HTTP failure.
-    #[error("HTTP request failed: {0}")]
+    #[error("HTTP request failed")]
     Http(#[from] reqwest::Error),
 
     /// The server returned a SOAP fault (`<soapenv:Fault>`).
@@ -390,5 +397,31 @@ mod tests {
         assert!(msg.contains("500"));
         assert!(msg.contains("INVALID_TYPE"));
         assert!(msg.contains("no such metadata type"));
+    }
+
+    /// A `reqwest::Error` produced without any network: an invalid default
+    /// header value is reported when the client is built.
+    fn client_build_error() -> reqwest::Error {
+        reqwest::Client::builder()
+            .user_agent("line\nbreak")
+            .build()
+            .unwrap_err()
+    }
+
+    #[test]
+    fn display_does_not_repeat_the_text_of_the_source() {
+        use std::error::Error as _;
+        let errors = [
+            MetadataError::HttpClient(client_build_error()),
+            MetadataError::Http(client_build_error()),
+        ];
+        for err in errors {
+            let source = err.source().expect("variant carries a source").to_string();
+            let display = err.to_string();
+            assert!(
+                !display.contains(&source),
+                "{display:?} repeats its source {source:?}"
+            );
+        }
     }
 }

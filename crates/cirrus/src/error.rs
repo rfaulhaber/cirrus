@@ -43,6 +43,14 @@ pub struct SalesforceError {
 ///
 /// Marked `#[non_exhaustive]`: match on the variants you handle and keep
 /// a `_` arm, so a new variant in a later release is an additive change.
+///
+/// Variants that wrap another error ([`HttpClient`](Self::HttpClient),
+/// [`Http`](Self::Http), [`Serialization`](Self::Serialization),
+/// [`Url`](Self::Url)) expose it through
+/// [`source()`](std::error::Error::source) and do not repeat its text in
+/// their own `Display`, so a reporter that walks the chain prints each
+/// message once. Print the chain (anyhow's `{:#}`, for example) to see
+/// the underlying cause; `{}` alone names only the category.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CirrusError {
@@ -51,11 +59,11 @@ pub enum CirrusError {
     MissingField(&'static str),
 
     /// Failed to construct the underlying HTTP client.
-    #[error("failed to construct HTTP client: {0}")]
+    #[error("failed to construct HTTP client")]
     HttpClient(#[source] reqwest::Error),
 
     /// Network or transport-level HTTP failure.
-    #[error("HTTP request failed: {0}")]
+    #[error("HTTP request failed")]
     Http(#[from] reqwest::Error),
 
     /// Salesforce returned a non-2xx response. `errors` holds the parsed
@@ -90,11 +98,11 @@ pub enum CirrusError {
     /// or blob-field metadata part of a multipart upload. Response
     /// bodies that don't match the shape the SDK asked for surface as
     /// [`CirrusError::InvalidResponse`] instead.
-    #[error("serialization error: {0}")]
+    #[error("serialization error")]
     Serialization(#[from] serde_json::Error),
 
     /// URL parsing failure (instance URL, redirect URI, etc.).
-    #[error("invalid URL: {0}")]
+    #[error("invalid URL")]
     Url(#[from] url::ParseError),
 
     /// Header value rejected by reqwest (invalid bytes, etc.).
@@ -369,5 +377,33 @@ mod tests {
         let parsed: Vec<SalesforceError> = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].fields.is_empty());
+    }
+
+    /// A `reqwest::Error` produced without any network: an invalid default
+    /// header value is reported when the client is built.
+    fn client_build_error() -> reqwest::Error {
+        reqwest::Client::builder()
+            .user_agent("line\nbreak")
+            .build()
+            .unwrap_err()
+    }
+
+    #[test]
+    fn display_does_not_repeat_the_text_of_the_source() {
+        use std::error::Error as _;
+        let errors = [
+            CirrusError::HttpClient(client_build_error()),
+            CirrusError::Http(client_build_error()),
+            CirrusError::Serialization(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+            CirrusError::Url(url::Url::parse("not a url").unwrap_err()),
+        ];
+        for err in errors {
+            let source = err.source().expect("variant carries a source").to_string();
+            let display = err.to_string();
+            assert!(
+                !display.contains(&source),
+                "{display:?} repeats its source {source:?}"
+            );
+        }
     }
 }

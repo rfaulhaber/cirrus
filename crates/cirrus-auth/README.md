@@ -31,7 +31,8 @@ REST client.
 - **Web Server with PKCE** (RFC 6749 §4.1 + RFC 7636) — `WebServerFlow::builder()`
 - **Token Exchange** (RFC 8693) — `TokenExchangeFlow::builder()`
 - **Static token** — `StaticTokenAuth::new(token, instance_url)` for
-  paste-from-`sf-org-display` workflows or tests
+  paste-from-`sf-org-display` workflows or tests; surrounding whitespace on
+  the token is trimmed
 
 Flows Salesforce labels legacy or deprecated (username-password OAuth,
 SOAP login, etc.) are intentionally not supported.
@@ -91,16 +92,24 @@ token-endpoint errors, missing builder fields, transport failures, and
 malformed responses. Failures a caller usually wants to branch on have
 their own variants — `StateMismatch` (a forged or replayed callback),
 `InstanceUrlMismatch` (wrong org), `UnexpectedResponse` (a non-OAuth
-error body), `InsecureLoginUrl`, `Signing`, `Randomness` — so no one has
-to match on message text. It's `#[non_exhaustive]` so future variants
-don't break downstream `match` arms.
+error body), `InsecureLoginUrl`, `Signing`, `Randomness`, `HttpClient` (a
+client that could not be built, as distinct from `Http`, a request that
+failed) — so no one has to match on message text. Variants that wrap
+another error expose it through `source()` and don't repeat it in
+`Display`; print the chain (anyhow's `{:#}`) to see the cause. It's
+`#[non_exhaustive]` so future variants don't break downstream `match` arms.
 
 ## Transport defaults
 
 When a flow builder isn't given an `http_client`, the client it builds
-applies connect and request timeouts and refuses to follow redirects: the
-grants here carry their credential in the request body, which reqwest
-replays on a 307/308. Login URLs must be `https`; exact `localhost` and the
+applies a 10 s connect timeout and a 30 s request deadline
+(`DEFAULT_TOKEN_CONNECT_TIMEOUT` and `DEFAULT_TOKEN_REQUEST_TIMEOUT`; every
+builder has `connect_timeout` and `request_timeout` setters) and refuses to
+follow redirects: the grants here carry their credential in the request
+body, which reqwest replays on a 307/308. `token_client_builder()` returns
+a `reqwest::ClientBuilder` with the same settings, for adding a private
+root CA, a proxy or a shared connection pool without losing them. Login
+URLs must be `https`; exact `localhost` and the
 loopback literals are excepted for local test servers, and `*.localhost`
 names are not. The same rule, `cirrus_auth::transport::is_secure_transport`,
 governs instance URLs in `cirrus` and `cirrus-metadata`.
@@ -123,6 +132,17 @@ proactive refresh inside the 60 s expiry margin fails transiently, the
 still-valid cached token is returned with a warning; an OAuth error such as
 `invalid_grant` is never masked. `AuthError::is_transient` is the same
 classification, exposed for callers.
+
+## Logging
+
+Events are emitted under three `tracing` targets: `cirrus_auth::mint`
+(token caching, minting and compare-and-swap invalidation),
+`cirrus_auth::token_endpoint` (the HTTP exchange, retries included) and
+`cirrus_auth::rotation` (adopting a rotated refresh token). A filter such
+as `RUST_LOG=cirrus_auth=debug` covers all three. No event carries a
+token, a credential or a response body; a non-OAuth error body from the
+token endpoint is recorded only as its status, content type and length,
+at `TRACE`.
 
 ## Crypto backend
 

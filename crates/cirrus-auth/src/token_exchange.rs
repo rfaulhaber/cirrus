@@ -52,8 +52,9 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
-    GrantReplay, default_http_client, exchange, normalize_url, require_secure_login_url,
+    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
 };
+use std::time::Duration;
 
 /// RFC 8693 grant-type URN — the only `grant_type` Salesforce's token
 /// exchange flow accepts.
@@ -246,7 +247,7 @@ pub struct TokenExchangeFlowBuilder {
     subject_token_type: Option<SubjectTokenType>,
     scopes: Vec<String>,
     token_handler: Option<String>,
-    http_client: Option<reqwest::Client>,
+    http: HttpClientConfig,
 }
 
 impl std::fmt::Debug for TokenExchangeFlowBuilder {
@@ -333,9 +334,36 @@ impl TokenExchangeFlowBuilder {
     /// The client built by default applies connect and request timeouts
     /// and refuses to follow redirects, so a redirect cannot replay the
     /// IdP-issued `subject_token` to another host. A client supplied here
-    /// replaces those defaults wholesale — configure both on it.
+    /// replaces those defaults wholesale, the timeout setters included;
+    /// start from [`token_client_builder`](crate::token_client_builder) to
+    /// keep them while adding settings.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
+        self.http.client = Some(client);
+        self
+    }
+
+    /// Sets the connect-phase timeout of the token-endpoint client this
+    /// builder creates. Defaults to
+    /// [`DEFAULT_TOKEN_CONNECT_TIMEOUT`](crate::DEFAULT_TOKEN_CONNECT_TIMEOUT);
+    /// `None` waits indefinitely for a connection.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.connect_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Sets the deadline for each token request the client this builder
+    /// creates sends, from dispatch until the whole response has arrived.
+    /// Defaults to
+    /// [`DEFAULT_TOKEN_REQUEST_TIMEOUT`](crate::DEFAULT_TOKEN_REQUEST_TIMEOUT);
+    /// `None` removes the bound, and a token endpoint that accepts the
+    /// connection and never answers then stalls the call indefinitely.
+    /// Each retry of the request gets its own deadline.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn request_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.http.request_timeout = Some(timeout.into());
         self
     }
 
@@ -352,10 +380,7 @@ impl TokenExchangeFlowBuilder {
             .ok_or(AuthError::MissingField("subject_token_type"))?;
         let login_url = normalize_url(&self.login_url.ok_or(AuthError::MissingField("login_url"))?);
         require_secure_login_url(&login_url)?;
-        let http = match self.http_client {
-            Some(client) => client,
-            None => default_http_client()?,
-        };
+        let http = self.http.into_client()?;
         Ok(TokenExchangeFlow {
             consumer_key,
             consumer_secret: self.consumer_secret,
