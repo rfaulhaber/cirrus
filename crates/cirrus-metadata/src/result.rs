@@ -22,6 +22,7 @@
 //!
 //! [Metadata API Developer Guide]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/
 
+use crate::error::{MetadataError, MetadataResult};
 use serde::Deserialize;
 
 /// Adapter that maps blank strings to `None`.
@@ -174,6 +175,10 @@ impl TestLevel {
 
 /// Returned by `check_deploy_status`. The headline summary of a
 /// deployment.
+///
+/// A finished deployment is returned as a value whatever its outcome;
+/// [`Self::into_result`] converts one that did not succeed into
+/// [`MetadataError::DeployFailed`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployResult {
@@ -250,6 +255,161 @@ pub struct DeployResult {
     /// `check_deploy_status` was called with `include_details: true`.
     #[serde(default)]
     pub details: Option<DeployDetails>,
+}
+
+impl DeployResult {
+    /// Converts a finished deployment into a `Result`.
+    ///
+    /// Returns `Ok(self)` when [`success`](Self::success) is `true`,
+    /// and otherwise [`MetadataError::DeployFailed`] carrying the whole
+    /// result, so a `?` after
+    /// [`wait_for_deploy`](crate::MetadataClient::wait_for_deploy)
+    /// fails the caller on a `Failed`, `Canceled` or
+    /// `FinalizingDeployFailed` deployment while
+    /// [`details`](Self::details) stays reachable through the error.
+    ///
+    /// Salesforce sets `success` only once a deployment has finished
+    /// successfully, so a result that is still in progress is returned
+    /// as `Err` too: call this on a terminal result. Whether a
+    /// `SucceededPartial` deployment counts as a success is decided by
+    /// the flag Salesforce sets; match on [`status`](Self::status) to
+    /// treat it differently.
+    ///
+    /// The error's `Display` names the status, the component and test
+    /// error counts, `error_status_code` / `error_message`, and the
+    /// first few component failures, test failures and coverage
+    /// warnings from `details`.
+    pub fn into_result(self) -> MetadataResult<Self> {
+        if self.success {
+            Ok(self)
+        } else {
+            Err(MetadataError::DeployFailed(Box::new(self)))
+        }
+    }
+
+    /// One-line account of why the deployment is not a success, for
+    /// the `Display` of [`MetadataError::DeployFailed`].
+    pub(crate) fn failure_summary(&self) -> String {
+        let mut summary = format!(
+            "{} {}: status {}; {} component error(s), {} test error(s)",
+            job_label("deployment", &self.id),
+            outcome_phrase(self.done),
+            status_label(self.status.as_ref()),
+            self.number_component_errors,
+            self.number_test_errors,
+        );
+        push_error_fields(
+            &mut summary,
+            self.error_status_code.as_deref(),
+            self.error_message.as_deref(),
+        );
+        if let Some(details) = &self.details {
+            let tests = details.run_test_result.as_ref();
+            let problems = details
+                .component_failures
+                .iter()
+                .map(component_failure_line)
+                .chain(
+                    tests
+                        .into_iter()
+                        .flat_map(|t| t.failures.iter().map(test_failure_line)),
+                )
+                .chain(
+                    tests
+                        .into_iter()
+                        .flat_map(|t| t.code_coverage_warnings.iter().map(coverage_warning_line)),
+                );
+            push_problems(&mut summary, problems);
+        }
+        summary
+    }
+}
+
+/// Upper bound on the individual problems a failure summary lists. The
+/// boxed result inside the error carries every one of them; the message
+/// only has to say what went wrong.
+const FAILURE_SUMMARY_PROBLEM_CAP: usize = 5;
+
+fn job_label(kind: &str, id: &str) -> String {
+    if id.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} {id}")
+    }
+}
+
+fn outcome_phrase(done: bool) -> &'static str {
+    if done {
+        "did not succeed"
+    } else {
+        "has not finished"
+    }
+}
+
+fn status_label<S: std::fmt::Debug>(status: Option<&S>) -> String {
+    status.map_or_else(|| "not reported".to_string(), |s| format!("{s:?}"))
+}
+
+fn push_error_fields(summary: &mut String, code: Option<&str>, message: Option<&str>) {
+    match (code, message) {
+        (Some(code), Some(message)) => summary.push_str(&format!("; {code}: {message}")),
+        (Some(text), None) | (None, Some(text)) => summary.push_str(&format!("; {text}")),
+        (None, None) => {}
+    }
+}
+
+fn push_problems(summary: &mut String, problems: impl Iterator<Item = String>) {
+    let mut seen = 0usize;
+    for problem in problems {
+        seen += 1;
+        if seen <= FAILURE_SUMMARY_PROBLEM_CAP {
+            summary.push_str("; ");
+            summary.push_str(&problem);
+        }
+    }
+    if seen > FAILURE_SUMMARY_PROBLEM_CAP {
+        summary.push_str(&format!(
+            "; and {} more",
+            seen - FAILURE_SUMMARY_PROBLEM_CAP
+        ));
+    }
+}
+
+fn component_failure_line(message: &DeployMessage) -> String {
+    let name = message
+        .full_name
+        .as_deref()
+        .or(message.file_name.as_deref())
+        .unwrap_or("(unnamed component)");
+    let problem = message.problem.as_deref().unwrap_or("(no problem text)");
+    match message.component_type.as_deref() {
+        Some(kind) => format!("{kind} {name}: {problem}"),
+        None => format!("{name}: {problem}"),
+    }
+}
+
+fn test_failure_line(failure: &RunTestFailure) -> String {
+    let class = failure.name.as_deref().unwrap_or("(unnamed test)");
+    let message = failure.message.as_deref().unwrap_or("(no message)");
+    match failure.method_name.as_deref() {
+        Some(method) => format!("test {class}.{method}: {message}"),
+        None => format!("test {class}: {message}"),
+    }
+}
+
+fn coverage_warning_line(warning: &CodeCoverageWarning) -> String {
+    let message = warning.message.as_deref().unwrap_or("(no message)");
+    match warning.name.as_deref() {
+        Some(name) => format!("coverage {name}: {message}"),
+        None => format!("coverage: {message}"),
+    }
+}
+
+fn retrieve_message_line(message: &RetrieveMessage) -> String {
+    match message.file_name.as_deref() {
+        Some(file) => format!("{file}: {}", message.problem),
+        None => message.problem.clone(),
+    }
 }
 
 /// State of a deployment job. See [`DeployResult::status`].
@@ -512,6 +672,10 @@ pub struct RetrieveRequest {
 
 /// Returned by `check_retrieve_status`. Once `done == true` and
 /// `success == true`, `zip_file` contains the retrieved zip bytes.
+///
+/// A finished retrieve is returned as a value whatever its outcome;
+/// [`Self::into_result`] converts one that did not succeed into
+/// [`MetadataError::RetrieveFailed`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveResult {
@@ -558,6 +722,50 @@ impl RetrieveResult {
                 .decode(b64)
                 .map(|v| Some(bytes::Bytes::from(v))),
         }
+    }
+
+    /// Converts a finished retrieve into a `Result`.
+    ///
+    /// Returns `Ok(self)` when [`success`](Self::success) is `true`,
+    /// and otherwise [`MetadataError::RetrieveFailed`] carrying the
+    /// whole result, so a `?` after
+    /// [`wait_for_retrieve`](crate::MetadataClient::wait_for_retrieve)
+    /// fails the caller on a `Failed` retrieve while
+    /// [`error_status_code`](Self::error_status_code),
+    /// [`error_message`](Self::error_message) and
+    /// [`messages`](Self::messages) stay reachable through the error.
+    /// A result that is still in progress has `success == false` as
+    /// well and is returned as `Err`: call this on a terminal result.
+    ///
+    /// The error's `Display` names the status, `error_status_code` /
+    /// `error_message`, and the first few per-file problems.
+    pub fn into_result(self) -> MetadataResult<Self> {
+        if self.success {
+            Ok(self)
+        } else {
+            Err(MetadataError::RetrieveFailed(Box::new(self)))
+        }
+    }
+
+    /// One-line account of why the retrieve is not a success, for the
+    /// `Display` of [`MetadataError::RetrieveFailed`].
+    pub(crate) fn failure_summary(&self) -> String {
+        let mut summary = format!(
+            "{} {}: status {}",
+            job_label("retrieve", &self.id),
+            outcome_phrase(self.done),
+            status_label(self.status.as_ref()),
+        );
+        push_error_fields(
+            &mut summary,
+            self.error_status_code.as_deref(),
+            self.error_message.as_deref(),
+        );
+        push_problems(
+            &mut summary,
+            self.messages.iter().map(retrieve_message_line),
+        );
+        summary
     }
 }
 
@@ -895,7 +1103,7 @@ pub struct DeleteResult {
 
 /// One error entry inside a CRUD result.
 ///
-/// Distinct from [`MetadataError`](crate::MetadataError) — that's the
+/// Distinct from [`MetadataError`] — that's the
 /// transport-level enum; this is the per-component validation /
 /// permission failure Salesforce attaches to a SaveResult /
 /// UpsertResult / DeleteResult.
@@ -1082,5 +1290,185 @@ mod tests {
             zip_file: None,
         };
         assert!(r.zip_bytes().unwrap().is_none());
+    }
+
+    fn deploy_result(xml: &str) -> DeployResult {
+        quick_xml::de::from_str(xml).unwrap()
+    }
+
+    fn retrieve_result(xml: &str) -> RetrieveResult {
+        quick_xml::de::from_str(xml).unwrap()
+    }
+
+    #[test]
+    fn into_result_passes_a_successful_deploy_through() {
+        let r = deploy_result(
+            "<result><id>0Af1</id><done>true</done><success>true</success>\
+             <status>Succeeded</status></result>",
+        );
+        assert_eq!(r.into_result().unwrap().id, "0Af1");
+    }
+
+    #[test]
+    fn into_result_defers_to_the_success_flag_for_a_partial_deploy() {
+        // Salesforce decides whether a partial deploy counts as success;
+        // the method reads the flag, not the status.
+        let flagged = deploy_result(
+            "<result><id>0Af1</id><done>true</done><success>true</success>\
+             <status>SucceededPartial</status></result>",
+        );
+        assert!(flagged.into_result().is_ok());
+        let unflagged = deploy_result(
+            "<result><id>0Af1</id><done>true</done><success>false</success>\
+             <status>SucceededPartial</status></result>",
+        );
+        assert!(matches!(
+            unflagged.into_result(),
+            Err(MetadataError::DeployFailed(_))
+        ));
+    }
+
+    #[test]
+    fn into_result_treats_an_unfinished_deploy_as_not_succeeded() {
+        let r = deploy_result(
+            "<result><id>0Af1</id><done>false</done><success>false</success>\
+             <status>InProgress</status></result>",
+        );
+        let err = r.into_result().unwrap_err();
+        assert!(matches!(err, MetadataError::DeployFailed(_)));
+        assert_eq!(
+            err.to_string(),
+            "deployment 0Af1 has not finished: status InProgress; \
+             0 component error(s), 0 test error(s)"
+        );
+    }
+
+    #[test]
+    fn deploy_failure_summary_reports_the_error_fields_and_an_unreported_status() {
+        let r = deploy_result(
+            "<result><id>0Af1</id><done>true</done><success>false</success>\
+             <errorStatusCode>UNKNOWN_EXCEPTION</errorStatusCode>\
+             <errorMessage>An unexpected error occurred.</errorMessage></result>",
+        );
+        assert_eq!(
+            r.into_result().unwrap_err().to_string(),
+            "deployment 0Af1 did not succeed: status not reported; \
+             0 component error(s), 0 test error(s); \
+             UNKNOWN_EXCEPTION: An unexpected error occurred."
+        );
+    }
+
+    #[test]
+    fn deploy_failure_summary_lists_component_test_and_coverage_problems() {
+        let r = deploy_result(
+            "<result><id>0Af1</id><done>true</done><success>false</success>\
+             <status>Failed</status>\
+             <numberComponentErrors>1</numberComponentErrors>\
+             <numberTestErrors>1</numberTestErrors>\
+             <details>\
+               <componentFailures>\
+                 <componentType>ApexClass</componentType>\
+                 <fullName>Broken</fullName>\
+                 <problem>Unexpected token.</problem>\
+                 <success>false</success>\
+               </componentFailures>\
+               <componentFailures>\
+                 <fileName>objects/Thing__c.object</fileName>\
+                 <problem>Invalid field.</problem>\
+                 <success>false</success>\
+               </componentFailures>\
+               <componentSuccesses>\
+                 <componentType>ApexClass</componentType>\
+                 <fullName>Fine</fullName>\
+                 <success>true</success>\
+               </componentSuccesses>\
+               <runTestResult>\
+                 <numTestsRun>2</numTestsRun>\
+                 <numFailures>1</numFailures>\
+                 <failures>\
+                   <name>BrokenTest</name>\
+                   <methodName>testIt</methodName>\
+                   <message>Assertion Failed</message>\
+                 </failures>\
+                 <codeCoverageWarnings>\
+                   <message>Average test coverage is 61%, at least 75% is required.</message>\
+                 </codeCoverageWarnings>\
+               </runTestResult>\
+             </details></result>",
+        );
+        assert_eq!(
+            r.into_result().unwrap_err().to_string(),
+            "deployment 0Af1 did not succeed: status Failed; \
+             1 component error(s), 1 test error(s); \
+             ApexClass Broken: Unexpected token.; \
+             objects/Thing__c.object: Invalid field.; \
+             test BrokenTest.testIt: Assertion Failed; \
+             coverage: Average test coverage is 61%, at least 75% is required."
+        );
+    }
+
+    #[test]
+    fn deploy_failure_summary_caps_the_listed_problems() {
+        let failures: String = (1..=7)
+            .map(|n| {
+                format!(
+                    "<componentFailures><componentType>ApexClass</componentType>\
+                     <fullName>C{n}</fullName><problem>p{n}</problem>\
+                     <success>false</success></componentFailures>"
+                )
+            })
+            .collect();
+        let r = deploy_result(&format!(
+            "<result><id>0Af1</id><done>true</done><success>false</success>\
+             <status>Failed</status><numberComponentErrors>7</numberComponentErrors>\
+             <details>{failures}</details></result>"
+        ));
+        let msg = r.into_result().unwrap_err().to_string();
+        assert!(msg.contains("ApexClass C5: p5"), "{msg}");
+        assert!(!msg.contains("C6"), "{msg}");
+        assert!(msg.ends_with("; and 2 more"), "{msg}");
+    }
+
+    #[test]
+    fn into_result_passes_a_successful_retrieve_through() {
+        let r = retrieve_result(
+            "<result><id>09S1</id><done>true</done><success>true</success>\
+             <status>Succeeded</status><zipFile>aGVsbG8=</zipFile></result>",
+        );
+        let r = r.into_result().unwrap();
+        assert_eq!(&r.zip_bytes().unwrap().unwrap()[..], b"hello");
+    }
+
+    #[test]
+    fn retrieve_failure_summary_reports_the_error_fields_and_problems() {
+        let r = retrieve_result(
+            "<result><id>09S1</id><done>true</done><success>false</success>\
+             <status>Failed</status>\
+             <errorStatusCode>INVALID_CROSS_REFERENCE_KEY</errorStatusCode>\
+             <errorMessage>An error occurred during the retrieve.</errorMessage>\
+             <messages><fileName>unpackaged/package.xml</fileName>\
+               <problem>No package.xml found</problem></messages>\
+             <messages><problem>Something unlocated</problem></messages>\
+             </result>",
+        );
+        let err = r.into_result().unwrap_err();
+        assert!(matches!(err, MetadataError::RetrieveFailed(_)));
+        assert_eq!(
+            err.to_string(),
+            "retrieve 09S1 did not succeed: status Failed; \
+             INVALID_CROSS_REFERENCE_KEY: An error occurred during the retrieve.; \
+             unpackaged/package.xml: No package.xml found; \
+             Something unlocated"
+        );
+    }
+
+    #[test]
+    fn retrieve_failure_summary_copes_with_a_result_that_carries_no_id() {
+        // `done` is the only field Salesforce documents as required.
+        let r = retrieve_result("<result><done>true</done><success>false</success></result>");
+        assert_eq!(
+            r.into_result().unwrap_err().to_string(),
+            "retrieve did not succeed: status not reported"
+        );
     }
 }

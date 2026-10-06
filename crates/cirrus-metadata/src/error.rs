@@ -11,6 +11,7 @@
 //! wrapped by [`MetadataError::Auth`]; the `From` impl lets handlers
 //! propagate them via `?`.
 
+use crate::result::{DeployResult, RetrieveResult};
 use cirrus_auth::AuthError;
 use thiserror::Error;
 
@@ -62,6 +63,10 @@ impl SoapFault {
 /// their own `Display`, so a reporter that walks the chain prints each
 /// message once. Print the chain (anyhow's `{:#}`, for example) to see
 /// the underlying cause; `{}` alone names only the category.
+///
+/// [`DeployFailed`](Self::DeployFailed) and
+/// [`RetrieveFailed`](Self::RetrieveFailed) carry a job's result rather
+/// than another error, and their `Display` summarizes it.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MetadataError {
@@ -138,6 +143,26 @@ pub enum MetadataError {
     /// observing it.
     #[error("polling timed out: {0}")]
     PollTimeout(String),
+
+    /// A deployment finished without succeeding.
+    ///
+    /// Produced by [`DeployResult::into_result`]; the whole result,
+    /// `details` included, rides along so the component and test
+    /// failures stay reachable after `?`. The `Display` names the
+    /// status, the error counts and the first few failures. Boxed
+    /// because the result is far larger than any other variant and
+    /// every call returns this enum.
+    #[error("{}", .0.failure_summary())]
+    DeployFailed(Box<DeployResult>),
+
+    /// A retrieve finished without succeeding.
+    ///
+    /// Produced by [`RetrieveResult::into_result`]; the whole result
+    /// rides along so `error_status_code`, `error_message` and
+    /// `messages` stay reachable after `?`. The `Display` names the
+    /// status, the error fields and the first few per-file problems.
+    #[error("{}", .0.failure_summary())]
+    RetrieveFailed(Box<RetrieveResult>),
 }
 
 /// Ceiling on how much of a non-SOAP error body is preserved in

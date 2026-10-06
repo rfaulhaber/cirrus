@@ -1230,6 +1230,244 @@ async fn wait_for_retrieve_skips_the_zip_fetch_when_the_retrieve_failed() {
 }
 
 #[tokio::test]
+async fn wait_for_retrieve_done_polls_without_ever_fetching_the_zip() {
+    let server = MockServer::start().await;
+    let polls = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with({
+            let polls = polls.clone();
+            move |_: &wiremock::Request| {
+                let n = polls.fetch_add(1, Ordering::SeqCst);
+                let body = retrieve_status_body(n > 0, n > 0, None);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/xml; charset=UTF-8")
+                    .set_body_string(body)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // The one-shot fetch is the caller's to make, at a moment of its
+    // choosing; the poll-only helper must never spend it.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>true</met:includeZip>",
+        ))
+        .respond_with(xml_response(&retrieve_status_body(
+            true,
+            true,
+            Some("UEt6aXA="),
+        )))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .wait_for_retrieve_done_with("09S00000poll", fast_wait())
+        .await
+        .unwrap();
+    assert!(result.done);
+    assert!(result.success);
+    assert!(result.zip_file.is_none());
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}
+
+/// A retrieve that ended `Failed` is `Ok` from the wait helpers, as
+/// `checkRetrieveStatus` reports it; `into_result` is what makes `?`
+/// fail on it, and the error names the id, the error fields and the
+/// per-file problems while carrying the whole result.
+///
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+/// RetrieveMessage: `fileName` ("The name of the file in the retrieved
+/// .zip file where a problem occurred") and `problem` ("A description
+/// of the problem that occurred").
+#[tokio::test]
+async fn into_result_turns_a_failed_retrieve_into_retrieve_failed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkRetrieveStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>09S00000failed</id>
+        <done>true</done>
+        <success>false</success>
+        <status>Failed</status>
+        <errorStatusCode>INVALID_CROSS_REFERENCE_KEY</errorStatusCode>
+        <errorMessage>An error occurred during the retrieve.</errorMessage>
+        <messages>
+          <fileName>unpackaged/classes/Missing.cls</fileName>
+          <problem>Entity of type 'ApexClass' named 'Missing' cannot be found</problem>
+        </messages>
+      </result>
+    </checkRetrieveStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let err = md
+        .wait_for_retrieve_with("09S00000failed", fast_wait())
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap_err();
+    let MetadataError::RetrieveFailed(result) = &err else {
+        panic!("expected RetrieveFailed, got {err:?}");
+    };
+    assert_eq!(result.status, Some(RetrieveStatus::Failed));
+    assert_eq!(result.messages.len(), 1);
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("retrieve 09S00000failed did not succeed"),
+        "{msg}"
+    );
+    assert!(msg.contains("status Failed"), "{msg}");
+    assert!(
+        msg.contains("INVALID_CROSS_REFERENCE_KEY: An error occurred during the retrieve."),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(
+            "unpackaged/classes/Missing.cls: Entity of type 'ApexClass' named 'Missing' cannot be found"
+        ),
+        "{msg}"
+    );
+}
+
+/// A deploy that ended `Failed` is `Ok` from `wait_for_deploy`, with
+/// the details the final fetch collected; `into_result` turns it into
+/// `DeployFailed`, whose message names the first component and test
+/// failures so `?` alone says why.
+///
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+/// DeployMessage: `componentType` ("The metadata type of the component
+/// in this deployment"), `fullName` ("The full name of the component"),
+/// `problem` ("If an error or warning occurred, this field contains a
+/// description of the problem that caused the compile to fail"),
+/// `problemType` (Warning | Error). RunTestFailure: `name` ("The name
+/// of the class that failed"), `methodName`, `message` ("The failure
+/// message").
+#[tokio::test]
+async fn into_result_turns_a_failed_deploy_into_deploy_failed_naming_the_failures() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000failed</id>
+        <done>true</done>
+        <success>false</success>
+        <status>Failed</status>
+        <checkOnly>true</checkOnly>
+        <rollbackOnError>true</rollbackOnError>
+        <numberComponentsDeployed>0</numberComponentsDeployed>
+        <numberComponentsTotal>2</numberComponentsTotal>
+        <numberComponentErrors>1</numberComponentErrors>
+        <numberTestsCompleted>3</numberTestsCompleted>
+        <numberTestsTotal>3</numberTestsTotal>
+        <numberTestErrors>1</numberTestErrors>
+        <details>
+          <componentFailures>
+            <componentType>ApexClass</componentType>
+            <fileName>classes/CirrusItBroken.cls</fileName>
+            <fullName>CirrusItBroken</fullName>
+            <problem>Unexpected token 'intentionally'.</problem>
+            <problemType>Error</problemType>
+            <success>false</success>
+            <changed>false</changed>
+            <created>false</created>
+            <deleted>false</deleted>
+            <lineNumber>1</lineNumber>
+            <columnNumber>31</columnNumber>
+          </componentFailures>
+          <componentSuccesses>
+            <componentType>ApexClass</componentType>
+            <fullName>CirrusItFine</fullName>
+            <success>true</success>
+            <changed>true</changed>
+            <created>false</created>
+            <deleted>false</deleted>
+          </componentSuccesses>
+          <runTestResult>
+            <numTestsRun>3</numTestsRun>
+            <numFailures>1</numFailures>
+            <totalTime>812.0</totalTime>
+            <failures>
+              <name>CirrusItBrokenTest</name>
+              <methodName>testIt</methodName>
+              <message>System.AssertException: Assertion Failed</message>
+              <stackTrace>Class.CirrusItBrokenTest.testIt: line 4, column 1</stackTrace>
+              <time>120.0</time>
+              <seeAllData>false</seeAllData>
+            </failures>
+          </runTestResult>
+        </details>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let err = md
+        .wait_for_deploy_with("0Af00000failed", fast_wait())
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap_err();
+    let MetadataError::DeployFailed(result) = &err else {
+        panic!("expected DeployFailed, got {err:?}");
+    };
+    assert_eq!(result.status, Some(DeployStatus::Failed));
+    let details = result
+        .details
+        .as_ref()
+        .expect("final fetch collected details");
+    assert_eq!(details.component_failures.len(), 1);
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("deployment 0Af00000failed did not succeed"),
+        "{msg}"
+    );
+    assert!(msg.contains("status Failed"), "{msg}");
+    assert!(
+        msg.contains("1 component error(s), 1 test error(s)"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("ApexClass CirrusItBroken: Unexpected token 'intentionally'."),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("test CirrusItBrokenTest.testIt: System.AssertException: Assertion Failed"),
+        "{msg}"
+    );
+    // Successes are not failures; they stay out of the message.
+    assert!(!msg.contains("CirrusItFine"), "{msg}");
+}
+
+#[tokio::test]
 async fn check_retrieve_status_with_zip_is_never_replayed() {
     let server = MockServer::start().await;
 

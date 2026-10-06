@@ -459,7 +459,10 @@ impl MetadataClient {
     /// `include_zip == false` until `done`, then make a single call with
     /// `include_zip == true` — which is what [`Self::wait_for_retrieve`]
     /// does. Because that call can't be repeated, the SDK never replays
-    /// it, even when the retry policy would otherwise allow it.
+    /// it, even when the retry policy would otherwise allow it, and the
+    /// future of an `include_zip == true` call must be left to resolve:
+    /// dropping it mid-flight loses a zip the server may already have
+    /// served and deleted.
     pub async fn check_retrieve_status(
         &self,
         retrieve_id: &str,
@@ -481,6 +484,28 @@ impl MetadataClient {
     /// [`Self::wait_for_deploy_with`] with
     /// [`WaitConfig::with_timeout`].
     ///
+    /// # Outcome
+    ///
+    /// Every terminal state is returned as `Ok`, exactly as
+    /// `checkDeployStatus` reports it: `Succeeded`, `SucceededPartial`,
+    /// `Failed`, `Canceled` and `FinalizingDeployFailed` alike, with
+    /// the outcome in [`DeployResult::success`] and
+    /// [`DeployResult::status`]. Chain [`DeployResult::into_result`]
+    /// to turn a deployment that did not succeed into
+    /// [`MetadataError::DeployFailed`], whose message names the
+    /// component and test failures:
+    ///
+    /// ```no_run
+    /// # async fn example(md: cirrus_metadata::MetadataClient, id: &str) -> Result<(), cirrus_metadata::MetadataError> {
+    /// let result = md.wait_for_deploy(id).await?.into_result()?;
+    /// # let _ = result;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// `Err` means the wait itself failed: a poll returned an error, or
+    /// [`MetadataError::PollTimeout`] fired.
+    ///
     /// [`DeployResult::details`] is populated best-effort: it comes
     /// from one final `include_details: true` fetch after the deploy
     /// reaches a terminal state, and if that follow-up call fails the
@@ -491,7 +516,8 @@ impl MetadataClient {
             .await
     }
 
-    /// Polling form with a configurable [`WaitConfig`].
+    /// Polling form of [`Self::wait_for_deploy`] with a configurable
+    /// [`WaitConfig`]; the outcome contract is the same.
     pub async fn wait_for_deploy_with(
         &self,
         deploy_id: &str,
@@ -532,7 +558,7 @@ impl MetadataClient {
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
                     return Err(MetadataError::PollTimeout(format!(
-                        "wait_for_deploy timed out after {timeout:?} (deploy still in progress)"
+                        "deploy {deploy_id} still in progress after {timeout:?}"
                     )));
                 }
                 tokio::time::sleep(delay.min(remaining)).await;
@@ -544,19 +570,108 @@ impl MetadataClient {
     }
 
     /// Polls [`Self::check_retrieve_status`] until `done == true` or
-    /// the configured timeout fires. The returned [`RetrieveResult`]
-    /// has the zip bytes populated when the retrieve succeeded.
+    /// the configured timeout fires, then collects the zip with one
+    /// final `include_zip == true` call once the retrieve has
+    /// succeeded. The returned [`RetrieveResult`] has the zip bytes
+    /// populated in that case.
     ///
-    /// Polling never asks for the zip; it is fetched by one final call
-    /// once the retrieve has succeeded, because the server deletes it
-    /// as soon as it has been served.
+    /// Polling never asks for the zip, because the server deletes it
+    /// as soon as it has been served; the single fetch at the end is
+    /// the one chance to collect it.
+    ///
+    /// Uses [`WaitConfig::default()`] — 2 s initial backoff doubling
+    /// to a 30 s cap, no timeout; [`Self::wait_for_retrieve_with`]
+    /// takes a configuration.
+    ///
+    /// # Outcome
+    ///
+    /// A retrieve that ended `Failed` is returned as `Ok`, exactly as
+    /// `checkRetrieveStatus` reports it: `success == false`, no zip,
+    /// and the cause in [`RetrieveResult::error_status_code`],
+    /// [`error_message`](RetrieveResult::error_message) and
+    /// [`messages`](RetrieveResult::messages). Chain
+    /// [`RetrieveResult::into_result`] to turn it into
+    /// [`MetadataError::RetrieveFailed`]:
+    ///
+    /// ```no_run
+    /// # async fn example(md: cirrus_metadata::MetadataClient, id: &str) -> Result<(), cirrus_metadata::MetadataError> {
+    /// let result = md.wait_for_retrieve(id).await?.into_result()?;
+    /// # let _ = result;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// `Err` means the wait itself failed: a poll or the zip fetch
+    /// returned an error, or [`MetadataError::PollTimeout`] fired.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future while the final `include_zip == true` call
+    /// is in flight — through an outer `tokio::time::timeout`, a losing
+    /// `select!` branch or a shutdown signal — loses the zip: the
+    /// server may already have served and deleted it, a later call
+    /// comes back without one, and the retrieve has to be started over.
+    /// Bound the wait with [`WaitConfig::total_timeout`] instead, which
+    /// is checked only between polls and so never interrupts the
+    /// fetch. Alternatively poll with [`Self::wait_for_retrieve_done`]
+    /// under any cancellation mechanism and make the one-shot
+    /// [`Self::check_retrieve_status`] call yourself once it reports
+    /// success.
     pub async fn wait_for_retrieve(&self, retrieve_id: &str) -> MetadataResult<RetrieveResult> {
         self.wait_for_retrieve_with(retrieve_id, WaitConfig::default())
             .await
     }
 
-    /// Polling form with a configurable [`WaitConfig`].
+    /// Polling form of [`Self::wait_for_retrieve`] with a configurable
+    /// [`WaitConfig`]; the outcome and cancellation contracts are the
+    /// same.
     pub async fn wait_for_retrieve_with(
+        &self,
+        retrieve_id: &str,
+        config: WaitConfig,
+    ) -> MetadataResult<RetrieveResult> {
+        let result = self
+            .wait_for_retrieve_done_with(retrieve_id, config)
+            .await?;
+        if !result.success {
+            // A failed retrieve has no zip to collect; the status result
+            // already carries the error fields.
+            return Ok(result);
+        }
+        // The fetch deletes the zip server-side, so it gets exactly one
+        // chance to happen.
+        self.check_retrieve_status(retrieve_id, true).await
+    }
+
+    /// Polls [`Self::check_retrieve_status`] with `include_zip == false`
+    /// until `done == true` or the configured timeout fires, and
+    /// returns the terminal status without the zip.
+    ///
+    /// Every call this makes is a replayable status read, so the future
+    /// can be dropped at any point — under a `tokio::time::timeout`, in
+    /// a `select!` — without losing anything, which
+    /// [`Self::wait_for_retrieve`] cannot offer for its final fetch.
+    /// Once the result reports `success == true`, collect the zip with
+    /// one `check_retrieve_status(id, true)` call and let that call run
+    /// to completion.
+    ///
+    /// The outcome contract is that of [`Self::wait_for_retrieve`]: a
+    /// `Failed` retrieve is `Ok` with `success == false`, and
+    /// [`RetrieveResult::into_result`] turns it into an error.
+    ///
+    /// Uses [`WaitConfig::default()`];
+    /// [`Self::wait_for_retrieve_done_with`] takes a configuration.
+    pub async fn wait_for_retrieve_done(
+        &self,
+        retrieve_id: &str,
+    ) -> MetadataResult<RetrieveResult> {
+        self.wait_for_retrieve_done_with(retrieve_id, WaitConfig::default())
+            .await
+    }
+
+    /// Polling form of [`Self::wait_for_retrieve_done`] with a
+    /// configurable [`WaitConfig`].
+    pub async fn wait_for_retrieve_done_with(
         &self,
         retrieve_id: &str,
         config: WaitConfig,
@@ -564,18 +679,11 @@ impl MetadataClient {
         let start = tokio::time::Instant::now();
         let mut delay = config.initial_delay;
         loop {
-            // Poll without the zip so each tick stays a replayable
-            // status read, then fetch the payload once the retrieve has
-            // succeeded — the fetch deletes it server-side, so it gets
-            // exactly one chance to happen.
+            // Each tick is a status read without the zip, so it stays
+            // replayable and the future stays safe to drop.
             let result = self.check_retrieve_status(retrieve_id, false).await?;
             if result.done {
-                if !result.success {
-                    // A failed retrieve has no zip to collect; the
-                    // status result already carries the error fields.
-                    return Ok(result);
-                }
-                return self.check_retrieve_status(retrieve_id, true).await;
+                return Ok(result);
             }
             if let Some(timeout) = config.total_timeout {
                 // Clamping the sleep to what's left of the budget is
@@ -585,7 +693,7 @@ impl MetadataClient {
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
                     return Err(MetadataError::PollTimeout(format!(
-                        "wait_for_retrieve timed out after {timeout:?} (retrieve still in progress)"
+                        "retrieve {retrieve_id} still in progress after {timeout:?}"
                     )));
                 }
                 tokio::time::sleep(delay.min(remaining)).await;
