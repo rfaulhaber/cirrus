@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "cirrus"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "cirrus-auth"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "cirrus-metadata"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

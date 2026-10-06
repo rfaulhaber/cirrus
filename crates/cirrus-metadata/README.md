@@ -112,7 +112,7 @@ you need anything beyond `deployRequest`.
 
 ```toml
 [dependencies]
-cirrus-metadata = "0.3.0"
+cirrus-metadata = "0.4.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
