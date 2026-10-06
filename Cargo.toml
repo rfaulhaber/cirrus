@@ -12,8 +12,8 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 authors = ["Ryan Faulhaber <ryf@sent.as>"]
-repository = "https://github.com/cirrus-code/cirrus"
-homepage = "https://github.com/cirrus-code/cirrus"
+repository = "https://github.com/rfaulhaber/cirrus"
+homepage = "https://github.com/rfaulhaber/cirrus"
 
 [workspace.dependencies]
 # Workspace members. The `version` field is required so dependent
