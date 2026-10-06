@@ -676,7 +676,7 @@ pub struct RetrieveRequest {
 /// A finished retrieve is returned as a value whatever its outcome;
 /// [`Self::into_result`] converts one that did not succeed into
 /// [`MetadataError::RetrieveFailed`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveResult {
     /// ID of the retrieve request. `done` is the only field Salesforce
@@ -709,6 +709,25 @@ pub struct RetrieveResult {
     /// `include_zip == true`.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub zip_file: Option<String>,
+}
+
+// Hand-written so `{:?}` prints the size of `zip_file` rather than its
+// content: the field holds a whole base64 archive, up to tens of
+// megabytes, and a log line must not carry it.
+impl std::fmt::Debug for RetrieveResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetrieveResult")
+            .field("id", &self.id)
+            .field("done", &self.done)
+            .field("success", &self.success)
+            .field("status", &self.status)
+            .field("error_status_code", &self.error_status_code)
+            .field("error_message", &self.error_message)
+            .field("file_properties", &self.file_properties)
+            .field("messages", &self.messages)
+            .field("zip_file_len", &self.zip_file.as_ref().map(String::len))
+            .finish()
+    }
 }
 
 impl RetrieveResult {
@@ -1274,6 +1293,35 @@ mod tests {
         };
         let bytes = r.zip_bytes().unwrap().unwrap();
         assert_eq!(&bytes[..], b"hello");
+    }
+
+    #[test]
+    fn retrieve_result_debug_does_not_carry_the_zip() {
+        let with_zip = |zip: String| RetrieveResult {
+            id: "09S000000000001".into(),
+            done: true,
+            success: true,
+            status: Some(RetrieveStatus::Succeeded),
+            error_status_code: None,
+            error_message: None,
+            file_properties: vec![],
+            messages: vec![],
+            zip_file: Some(zip),
+        };
+        let small = format!("{:?}", with_zip("A".repeat(16)));
+        let large = format!("{:?}", with_zip("A".repeat(4 << 20)));
+        // Only the digits of the length differ.
+        assert_eq!(large.len() - small.len(), "4194304".len() - "16".len());
+        assert!(large.contains("zip_file_len: Some(4194304)"), "{large}");
+        assert!(large.len() < 1024, "{} bytes", large.len());
+        assert!(
+            format!(
+                "{:?}",
+                MetadataError::RetrieveFailed(Box::new(with_zip("A".repeat(4 << 20))))
+            )
+            .len()
+                < 1024
+        );
     }
 
     #[test]

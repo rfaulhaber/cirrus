@@ -327,6 +327,46 @@ async fn check_deploy_status_parses_partial_success_and_error_fields() {
     assert_eq!(failure.problem_type, Some(DeployProblemType::Warning));
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+/// `done` is a "boolean"; text that is not one makes the deserializer
+/// quote it, so the error has to cap the quote while still naming the
+/// element. The 100 KB value stands for any long text field a response
+/// can carry.
+#[tokio::test]
+async fn a_long_value_that_fails_to_parse_is_not_quoted_in_full() {
+    let server = MockServer::start().await;
+    let long = "x".repeat(100_000);
+
+    Mock::given(method("POST"))
+        .respond_with(xml_response(&format!(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000long</id>
+        <done>{long}</done>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+        )))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let err = md
+        .check_deploy_status("0Af00000long", false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetadataError::Xml(_)), "{err:?}");
+    let shown = err.to_string();
+    assert!(shown.len() < 1024, "{} bytes: {shown}", shown.len());
+    assert!(shown.contains("result.done"), "{shown}");
+    assert!(shown.contains("… <truncated>"), "{shown}");
+    assert!(format!("{err:?}").len() < 2048);
+}
+
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
 /// "In the returned DeployResult object, check the status field. If
 /// the status is Canceling, the cancellation is still in progress …

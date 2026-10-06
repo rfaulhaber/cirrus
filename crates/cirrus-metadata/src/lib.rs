@@ -41,7 +41,12 @@
 //! is the opt-out for a deliberate plaintext hop. The HTTP client the
 //! builder creates follows no redirects, and a `Retry-After` hint longer
 //! than the policy's `max_delay` ends the retry loop instead of being
-//! shortened.
+//! shortened. Response bodies are read through
+//! [`cirrus_auth::transport::collect_body`] and buffered only up to a
+//! limit on their decoded size: 2xx bodies up to
+//! [`MetadataClientBuilder::max_response_size`]
+//! ([`DEFAULT_MAX_RESPONSE_SIZE`] by default), anything else up to a
+//! fixed 256 KiB.
 //!
 //! ## Quick start
 //!
@@ -158,6 +163,23 @@ pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// which no fixed default covers on an arbitrary connection.
 pub const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Largest response body, in decoded bytes, a successful call buffers
+/// unless [`MetadataClientBuilder::max_response_size`] says otherwise:
+/// 128 MiB.
+///
+/// The Metadata API base64-encodes a zip after compressing it and caps
+/// "the resulting .zip file" at 50 MB (Metadata API Developer Guide,
+/// `retrieve()`), so a retrieve response carries at most about 50 MB of
+/// base64 inside its envelope. The rest of the default leaves room for
+/// `checkDeployStatus` with `includeDetails` on a large deploy. A body
+/// past the limit fails with [`MetadataError::ResponseTooLarge`].
+pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 128 << 20;
+
+/// Largest non-2xx body a call buffers. A SOAP fault is a few hundred
+/// bytes, and at most 2 KiB of a non-SOAP page is kept, so a body past
+/// this came from an intermediary.
+pub(crate) const NON_SUCCESS_BODY_CAP: usize = 256 * 1024;
+
 /// Default User-Agent header sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
     "cirrus-metadata/",
@@ -181,6 +203,7 @@ pub struct MetadataClient {
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) allow_insecure_transport: bool,
     pub(crate) call_options_client: Option<String>,
+    pub(crate) max_response_size: Option<usize>,
 }
 
 impl std::fmt::Debug for MetadataClient {
@@ -193,6 +216,7 @@ impl std::fmt::Debug for MetadataClient {
             .field("retry_policy", &self.retry_policy)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
             .field("call_options_client", &self.call_options_client)
+            .field("max_response_size", &self.max_response_size)
             .finish_non_exhaustive()
     }
 }
@@ -319,6 +343,7 @@ pub struct MetadataClientBuilder {
     // caller asking for no deadline at all.
     connect_timeout: Option<Option<std::time::Duration>>,
     read_timeout: Option<Option<std::time::Duration>>,
+    max_response_size: Option<Option<usize>>,
     allow_insecure_transport: bool,
     call_options_client: Option<String>,
 }
@@ -387,6 +412,27 @@ impl MetadataClientBuilder {
     /// Ignored when [`http_client`](Self::http_client) supplies a client.
     pub fn read_timeout(mut self, timeout: impl Into<Option<std::time::Duration>>) -> Self {
         self.read_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Caps the decoded size of a successful (2xx) response body, in
+    /// bytes. Defaults to [`DEFAULT_MAX_RESPONSE_SIZE`]; pass `None` for
+    /// no cap.
+    ///
+    /// The cap applies to every typed call. The default holds the
+    /// largest response Salesforce documents, a retrieve with its zip.
+    /// Raise it, or pass `None`, only for a client that trusts every
+    /// host it talks to: a compressed body inflates far beyond its size
+    /// on the wire, and the cap is what keeps one from filling memory.
+    /// A larger body fails with [`MetadataError::ResponseTooLarge`]
+    /// without being buffered, unless its status is one the retry
+    /// policy retries, in which case the call is retried.
+    ///
+    /// Bodies of non-2xx responses are capped at a fixed 256 KiB
+    /// regardless of this setting, and a response read through
+    /// [`MetadataClient::request_builder`] is outside any cap.
+    pub fn max_response_size(mut self, limit: impl Into<Option<usize>>) -> Self {
+        self.max_response_size = Some(limit.into());
         self
     }
 
@@ -472,6 +518,9 @@ impl MetadataClientBuilder {
             retry_policy: self.retry_policy.unwrap_or_default(),
             allow_insecure_transport: self.allow_insecure_transport,
             call_options_client: self.call_options_client,
+            max_response_size: self
+                .max_response_size
+                .unwrap_or(Some(DEFAULT_MAX_RESPONSE_SIZE)),
         })
     }
 }

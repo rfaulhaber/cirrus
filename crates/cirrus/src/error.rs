@@ -120,6 +120,23 @@ pub enum CirrusError {
         message: String,
     },
 
+    /// The response body was longer than the client buffers, so it was
+    /// not read.
+    ///
+    /// The limit counts decoded bytes. A successful (2xx) response is
+    /// held to [`CirrusBuilder::max_response_size`](crate::CirrusBuilder::max_response_size);
+    /// every other response is held to a fixed 256 KiB, far above the
+    /// error shapes Salesforce documents. A retryable status whose body
+    /// is oversized is still retried; this error reports the final
+    /// attempt.
+    #[error("HTTP {status} response body exceeded the {limit}-byte limit")]
+    ResponseTooLarge {
+        /// HTTP status of the oversized response.
+        status: u16,
+        /// The limit that was exceeded, in decoded bytes.
+        limit: usize,
+    },
+
     /// Response could not be interpreted as the requested type or
     /// shape. When the message quotes an excerpt of what arrived,
     /// bearer-token material in it is replaced with `[redacted]` first.

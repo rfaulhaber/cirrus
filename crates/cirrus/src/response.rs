@@ -979,7 +979,8 @@ pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
         return serde_json::from_slice(bytes).map_err(|err| {
             CirrusError::InvalidResponse(format!(
                 "endpoint returned {status} but the body did not deserialize into the requested \
-                 type: {err}; body starts: {}",
+                 type: {}; body starts: {}",
+                capped_serde_message(&err),
                 capped_body(bytes, SUCCESS_BODY_EXCERPT_CAP)
             ))
         });
@@ -1000,11 +1001,43 @@ const RAW_ERROR_BODY_CAP: usize = 2048;
 /// raised when a 2xx body doesn't fit `R`.
 ///
 /// Much tighter than [`RAW_ERROR_BODY_CAP`], because a successful body is
-/// normally the org's own record data rather than a gateway's page. Naming
-/// which field disagreed is serde's job and its message is kept in full;
-/// the excerpt only has to be wide enough to recognize an off-contract
-/// body — an HTML login page, a truncated stream — at a glance.
+/// normally the org's own record data rather than a gateway's page. The
+/// excerpt only has to be wide enough to recognize an off-contract body —
+/// an HTML login page, a truncated stream — at a glance; serde's own
+/// message, which names the expected type and the position, is held to
+/// [`SERDE_MESSAGE_CAP`].
 const SUCCESS_BODY_EXCERPT_CAP: usize = 256;
+
+/// Ceiling on the part of a serde_json message that precedes its
+/// position. serde quotes the offending value (`invalid type: string
+/// "…"`, ``unknown variant `…` ``), and a record field can hold 131,072
+/// characters, so the message is as unbounded as the data. The expected
+/// type and the position, which are what locate the mismatch, are short
+/// and survive the cut.
+const SERDE_MESSAGE_CAP: usize = 256;
+
+/// Renders a serde_json error with the quoted value cut at
+/// [`SERDE_MESSAGE_CAP`] bytes, marked when anything was dropped.
+///
+/// serde_json appends ` at line {l} column {c}` to every error that
+/// has a position; that suffix is split off before the cut and put back
+/// after it, so the position is never lost to a long value.
+fn capped_serde_message(err: &serde_json::Error) -> String {
+    let message = err.to_string();
+    let position = format!(" at line {} column {}", err.line(), err.column());
+    let (code, suffix) = match message.strip_suffix(&position) {
+        Some(code) if err.line() != 0 => (code, position.as_str()),
+        _ => (message.as_str(), ""),
+    };
+    if code.len() <= SERDE_MESSAGE_CAP {
+        return message;
+    }
+    let mut end = SERDE_MESSAGE_CAP;
+    while !code.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… <truncated>{suffix}", &code[..end])
+}
 
 /// Parses a non-2xx response body into a [`CirrusError::Api`].
 ///
@@ -1112,6 +1145,84 @@ mod tests {
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
         }
+    }
+
+    /// Deserialization target with a numeric field, so a string in it is
+    /// the wrong-typed value serde quotes in full.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct Numeric {
+        v: f64,
+    }
+
+    /// Deserialization target with a closed set of variants.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    enum Closed {
+        A,
+        B,
+    }
+
+    fn invalid_response_message<R: DeserializeOwned + std::fmt::Debug>(body: &str) -> String {
+        match parse_response_bytes::<R>(200, body.as_bytes()).unwrap_err() {
+            CirrusError::InvalidResponse(msg) => msg,
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wrong_typed_value_is_not_quoted_in_full() {
+        // The offending value can be a 131,072-character Long Text Area;
+        // serde puts it into its message, ahead of the position.
+        let body = format!("{{\"v\":\"{}\"}}", "x".repeat(100_000));
+        let direct = serde_json::from_str::<Numeric>(&body).unwrap_err();
+        let msg = invalid_response_message::<Numeric>(&body);
+        assert!(msg.len() < 1024, "message not capped: {} bytes", msg.len());
+        assert!(
+            msg.contains(&format!(
+                "… <truncated> at line {} column {}; body starts:",
+                direct.line(),
+                direct.column()
+            )),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_variant_is_not_quoted_in_full() {
+        let body = format!("\"{}\"", "v".repeat(10_000));
+        let direct = serde_json::from_str::<Closed>(&body).unwrap_err();
+        let msg = invalid_response_message::<Closed>(&body);
+        assert!(msg.len() < 1024, "message not capped: {} bytes", msg.len());
+        assert!(
+            msg.contains(&format!(
+                "… <truncated> at line {} column {}; body starts:",
+                direct.line(),
+                direct.column()
+            )),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_short_serde_message_is_unchanged() {
+        let body = "{\"v\":\"abc\"}";
+        let direct = serde_json::from_str::<Numeric>(body).unwrap_err();
+        let msg = invalid_response_message::<Numeric>(body);
+        assert!(msg.contains(&direct.to_string()), "{msg}");
+        assert_eq!(capped_serde_message(&direct), direct.to_string());
+    }
+
+    #[test]
+    fn a_serde_message_without_a_position_is_capped_whole() {
+        // `from_value` errors carry no line, so the message has no
+        // position suffix to preserve.
+        let long = "é".repeat(SERDE_MESSAGE_CAP);
+        let err = serde_json::from_value::<Numeric>(json!({ "v": long })).unwrap_err();
+        assert_eq!(err.line(), 0);
+        let msg = capped_serde_message(&err);
+        assert!(msg.ends_with("… <truncated>"), "{msg}");
+        assert!(msg.len() < SERDE_MESSAGE_CAP + 32, "{} bytes", msg.len());
     }
 
     #[test]

@@ -89,6 +89,21 @@ pub enum AuthError {
     #[error("token endpoint returned status {status} with an unrecognized error body")]
     UnexpectedResponse { status: u16 },
 
+    /// The token endpoint's response body was longer than the SDK reads:
+    /// a real token response is a few kilobytes of JSON, so an oversized
+    /// body came from an intermediary.
+    ///
+    /// The cap applies to the decoded body, so a compressed response
+    /// that inflates past it is refused too. Nothing past the limit was
+    /// buffered, and the body is neither carried nor logged.
+    #[error("token endpoint answered HTTP {status} with a body over {limit} bytes")]
+    ResponseTooLarge {
+        /// HTTP status of the oversized response.
+        status: u16,
+        /// The cap that was exceeded, in decoded bytes.
+        limit: usize,
+    },
+
     /// A configured login URL would carry credentials over cleartext
     /// HTTP. Salesforce serves every OAuth endpoint over HTTPS; loopback
     /// hosts are the only exception the SDK accepts.
@@ -177,6 +192,10 @@ impl AuthError {
                 returned: returned.clone(),
             },
             Self::UnexpectedResponse { status } => Self::UnexpectedResponse { status: *status },
+            Self::ResponseTooLarge { status, limit } => Self::ResponseTooLarge {
+                status: *status,
+                limit: *limit,
+            },
             Self::InsecureLoginUrl { url } => Self::InsecureLoginUrl { url: url.clone() },
             Self::Signing(msg) => Self::Signing(msg.clone()),
             Self::Randomness(msg) => Self::Randomness(msg.clone()),
@@ -220,6 +239,11 @@ impl std::fmt::Debug for AuthError {
             Self::UnexpectedResponse { status } => f
                 .debug_struct("UnexpectedResponse")
                 .field("status", status)
+                .finish(),
+            Self::ResponseTooLarge { status, limit } => f
+                .debug_struct("ResponseTooLarge")
+                .field("status", status)
+                .field("limit", limit)
                 .finish(),
             Self::InsecureLoginUrl { url } => f
                 .debug_struct("InsecureLoginUrl")

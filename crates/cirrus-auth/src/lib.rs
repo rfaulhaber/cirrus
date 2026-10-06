@@ -36,7 +36,9 @@
 //! - [`token_exchange`] — OAuth 2.0 Token Exchange (RFC 8693).
 //!
 //! [`transport`] holds the https-or-loopback rule that every Cirrus
-//! client applies before sending a bearer token anywhere.
+//! client applies before sending a bearer token anywhere, and the
+//! bounded body reader, [`transport::collect_body`], that every client
+//! reads responses through.
 //!
 //! ## Transport and logging
 //!
@@ -46,6 +48,10 @@
 //! `request_timeout` setters, and [`token_client_builder`] hands out the
 //! same configuration as a `reqwest::ClientBuilder` to extend with a
 //! private root CA, a proxy or a shared connection pool.
+//!
+//! A token-endpoint response body is read up to 64 KiB of decoded bytes;
+//! a larger one fails with [`AuthError::ResponseTooLarge`] instead of
+//! being buffered.
 //!
 //! Events are emitted under the `cirrus_auth::mint` (token caching and
 //! minting), `cirrus_auth::token_endpoint` (the HTTP exchange) and

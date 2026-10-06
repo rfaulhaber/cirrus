@@ -14,14 +14,16 @@
 //!    after confirming the instance URL is still `https` or loopback —
 //!    the session id rides in the body, and the URL is re-read from the
 //!    session on every call.
-//! 4. Parses the response envelope into either a typed `O::Response` or
-//!    a [`MetadataError::Soap`] carrying the [`SoapFault`];
+//! 4. Reads the response body under a size limit, then parses the
+//!    envelope in place into either a typed `O::Response` or a
+//!    [`MetadataError::Soap`] carrying the [`SoapFault`];
 //!    [`soap_call_with_headers`] also deserializes the `DebuggingInfo`
 //!    output header.
 //! 5. Retries transient failures per the client's [`RetryPolicy`]. The
 //!    envelope is parsed first, so an application-level fault is
 //!    surfaced immediately instead of being replayed under the 5xx
-//!    rule.
+//!    rule. A body over the size limit is treated like a retryable
+//!    status whose body was dropped.
 //! 6. On `INVALID_SESSION_ID` faults, invalidates the cached token and
 //!    retries the entire call once with a freshly-minted token.
 //! 7. Scrubs the attempt's session id from any error that retains body
@@ -30,13 +32,15 @@
 //! [`AuthSession`]: cirrus_auth::AuthSession
 //! [`SoapFault`]: crate::error::SoapFault
 
-use crate::MetadataClient;
-use crate::envelope::{self, EnvelopeBody, ResponseHeaders};
-use crate::error::{MetadataError, MetadataResult};
+use crate::envelope::{self, EnvelopeBody, ParsedEnvelope};
+use crate::error::{MetadataError, MetadataResult, PARSE_MESSAGE_CAP, cap_text};
 use crate::headers::{self, DebuggingInfo, SoapResponseHeaders};
 use crate::retry;
+use crate::{MetadataClient, NON_SUCCESS_BODY_CAP};
 use bytes::Bytes;
+use cirrus_auth::transport::{CollectBodyError, collect_body};
 use serde::de::DeserializeOwned;
+use std::ops::Range;
 
 /// A typed SOAP operation against the Metadata API.
 ///
@@ -143,11 +147,14 @@ pub(crate) async fn soap_call_with_headers<O: SoapOperation>(
     let (response, raw_headers) = dispatch(client, op).await?;
     let debugging_info = raw_headers
         .debugging_info
-        .as_deref()
-        .map(|xml| {
-            let mut de = quick_xml::de::Deserializer::from_str(xml);
+        .map(|range| {
+            let mut de = quick_xml::de::Deserializer::from_str(&raw_headers.text[range]);
             serde_path_to_error::deserialize::<_, DebuggingInfo>(&mut de).map_err(|e| {
-                MetadataError::Xml(format!("DebuggingInfo: {} at `{}`", e.inner(), e.path()))
+                MetadataError::Xml(format!(
+                    "DebuggingInfo: {} at `{}`",
+                    cap_text(&e.inner().to_string(), PARSE_MESSAGE_CAP),
+                    e.path()
+                ))
             })
         })
         .transpose()?;
@@ -171,14 +178,32 @@ fn render_request_headers<O: SoapOperation>(
     Ok(out)
 }
 
+/// A successful response: the text of the whole envelope and where in it
+/// the response element and the `DebuggingInfo` header sit. The envelope
+/// is kept whole and located in place, because copying the response
+/// element out would duplicate a retrieve's base64 zip, which can run to
+/// tens of megabytes.
+struct SoapResponse {
+    text: String,
+    body: Range<usize>,
+    debugging_info: Option<Range<usize>>,
+}
+
+/// The output headers of a response, still inside the envelope text they
+/// were located in.
+struct OutputHeaders {
+    text: String,
+    debugging_info: Option<Range<usize>>,
+}
+
 async fn dispatch<O: SoapOperation>(
     client: &MetadataClient,
     op: &O,
-) -> MetadataResult<(O::Response, ResponseHeaders)> {
+) -> MetadataResult<(O::Response, OutputHeaders)> {
     let response_local = format!("{}Response", O::NAME);
     let body_xml = op.render_body()?;
     let headers_xml = render_request_headers(client, op)?;
-    let (inner, response_headers) = call_with_auth_retry(
+    let response = call_with_auth_retry(
         client,
         O::NAME,
         op.idempotent(),
@@ -187,17 +212,28 @@ async fn dispatch<O: SoapOperation>(
         &response_local,
     )
     .await?;
-    // `from_str` borrows text nodes straight out of `inner`; the
-    // `from_reader` path would copy every event — including the
+    // `from_str` borrows text nodes straight out of the envelope text;
+    // the `from_reader` path would copy every event — including the
     // multi-megabyte base64 `<zipFile>` — through an internal buffer
     // first. The path wrapper names the element that failed, so a
     // field Salesforce changes in a release is diagnosable without a
-    // traffic capture.
-    let mut de = quick_xml::de::Deserializer::from_str(&inner);
+    // traffic capture; the message it wraps is capped because serde
+    // quotes the value it rejected.
+    let mut de = quick_xml::de::Deserializer::from_str(&response.text[response.body]);
     let parsed: O::Response = serde_path_to_error::deserialize(&mut de).map_err(|e| {
-        MetadataError::Xml(format!("{response_local}: {} at `{}`", e.inner(), e.path()))
+        MetadataError::Xml(format!(
+            "{response_local}: {} at `{}`",
+            cap_text(&e.inner().to_string(), PARSE_MESSAGE_CAP),
+            e.path()
+        ))
     })?;
-    Ok((parsed, response_headers))
+    Ok((
+        parsed,
+        OutputHeaders {
+            text: response.text,
+            debugging_info: response.debugging_info,
+        },
+    ))
 }
 
 /// Outer loop: handles INVALID_SESSION_ID auto-refresh (at most once).
@@ -210,7 +246,7 @@ async fn call_with_auth_retry(
     headers_xml: &str,
     body_xml: &str,
     response_local: &str,
-) -> MetadataResult<(String, ResponseHeaders)> {
+) -> MetadataResult<SoapResponse> {
     // First iteration fetches a token from the auth session. On a
     // refresh-after-INVALID_SESSION_ID we thread the *already-fetched*
     // fresh token in here, instead of calling access_token() a second
@@ -268,14 +304,15 @@ async fn call_with_auth_retry(
 }
 
 /// Inner loop: retries transient failures per [`RetryPolicy`]. Returns
-/// the response envelope's `<{NAME}Response>...</{NAME}Response>`
-/// element and its output headers on success.
+/// the response envelope's text with the locations of its
+/// `<{NAME}Response>...</{NAME}Response>` element and output headers on
+/// success.
 async fn send_with_retries(
     client: &MetadataClient,
     idempotent: bool,
     envelope_bytes: Bytes,
     response_local: &str,
-) -> MetadataResult<(String, ResponseHeaders)> {
+) -> MetadataResult<SoapResponse> {
     crate::check_transport_security(client.auth.instance_url(), client.allow_insecure_transport)?;
     let url = client.endpoint_url();
     let mut attempt: u32 = 0;
@@ -298,9 +335,25 @@ async fn send_with_retries(
                 let status_retryable =
                     retry::should_retry_status(&client.retry_policy, idempotent, status, attempt);
 
-                let bytes = match response.bytes().await {
+                let cap = if (200..300).contains(&status) {
+                    client.max_response_size.unwrap_or(usize::MAX)
+                } else {
+                    NON_SUCCESS_BODY_CAP
+                };
+                let bytes = match collect_body(response, cap).await {
                     Ok(b) => b,
-                    Err(e) => {
+                    Err(CollectBodyError::TooLarge { limit }) => {
+                        // An oversized body is dropped unread, like the
+                        // body of any other retryable status.
+                        if status_retryable && let Some(delay) = backoff(client, attempt, &headers)
+                        {
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(MetadataError::ResponseTooLarge { status, limit });
+                    }
+                    Err(CollectBodyError::Transport(e)) => {
                         // The response died mid-body — as ambiguous as
                         // a failed send, so it follows the same replay
                         // rules.
@@ -319,6 +372,8 @@ async fn send_with_retries(
                         }
                         return Err(err);
                     }
+                    // `CollectBodyError` is `non_exhaustive`.
+                    Err(other) => return Err(MetadataError::InvalidResponse(other.to_string())),
                 };
 
                 // SOAP faults can arrive with HTTP 500 or (uncommonly)
@@ -328,13 +383,47 @@ async fn send_with_retries(
                 // REQUEST_LIMIT_EXCEEDED, INVALID_SESSION_ID) from being
                 // replayed under the 5xx rule and surfaced only after
                 // the whole retry budget is spent.
-                match envelope::parse_envelope(&bytes, response_local)
-                    .map(|parsed| (parsed.body, parsed.headers))
-                {
-                    Ok((EnvelopeBody::Success(inner), response_headers)) => {
-                        return Ok((inner, response_headers));
+                //
+                // The text is validated as UTF-8 once, here, and the
+                // envelope is then parsed in place. `Vec::from` reuses
+                // the buffer of a uniquely owned `Bytes`, which the
+                // reader builds for any multi-chunk body. A body that
+                // fails either step keeps its bytes for the excerpt.
+                let parsed: Result<(String, ParsedEnvelope), (MetadataError, Vec<u8>)> =
+                    match String::from_utf8(Vec::from(bytes)) {
+                        Ok(text) => match envelope::parse_envelope(&text, response_local) {
+                            Ok(parsed) => Ok((text, parsed)),
+                            Err(e) => Err((e, text.into_bytes())),
+                        },
+                        Err(e) => Err((
+                            MetadataError::InvalidResponse(format!(
+                                "response is not valid UTF-8: {}",
+                                e.utf8_error()
+                            )),
+                            e.into_bytes(),
+                        )),
+                    };
+                match parsed {
+                    Ok((
+                        text,
+                        ParsedEnvelope {
+                            headers: response_headers,
+                            body: EnvelopeBody::Success(body),
+                        },
+                    )) => {
+                        return Ok(SoapResponse {
+                            text,
+                            body,
+                            debugging_info: response_headers.debugging_info,
+                        });
                     }
-                    Ok((EnvelopeBody::Fault(fault), _)) => {
+                    Ok((
+                        _,
+                        ParsedEnvelope {
+                            body: EnvelopeBody::Fault(fault),
+                            ..
+                        },
+                    )) => {
                         if status_retryable
                             && retry::is_transient_fault(&fault)
                             && let Some(delay) = backoff(client, attempt, &headers)
@@ -345,7 +434,7 @@ async fn send_with_retries(
                         }
                         return Err(MetadataError::Soap { status, fault });
                     }
-                    Err(parse_err) => {
+                    Err((parse_err, raw)) => {
                         // No SOAP envelope means the response came from
                         // an intermediary rather than the org, so the
                         // status is all we have to go on.
@@ -364,12 +453,12 @@ async fn send_with_retries(
                         if (200..300).contains(&status) {
                             return Err(MetadataError::InvalidResponse(format!(
                                 "HTTP {status} with non-SOAP body: {parse_err}; body starts: {}",
-                                crate::error::cap_body_excerpt(&bytes)
+                                crate::error::cap_body_excerpt(&raw)
                             )));
                         }
                         return Err(MetadataError::Http4xx5xx {
                             status,
-                            raw: crate::error::cap_raw_body(&bytes),
+                            raw: crate::error::cap_raw_body(&raw),
                         });
                     }
                 }

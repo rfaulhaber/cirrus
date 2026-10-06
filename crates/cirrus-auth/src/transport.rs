@@ -1,12 +1,21 @@
-//! Transport-security rules for bearer tokens, shared by every Cirrus
-//! crate that sends one: the OAuth flows in this crate, the REST client
-//! and the SOAP Metadata client.
+//! Transport rules shared by every Cirrus crate that talks to
+//! Salesforce: the security rule for bearer tokens and the bound on how
+//! much of a response body a client buffers. The crates are the OAuth
+//! flows in this crate, the REST client and the SOAP Metadata client.
 //!
 //! RFC 6750 §5.3 requires TLS for every request that carries a bearer
 //! token. The one exemption is a loopback host, where the hop never
 //! leaves the machine, so local mock servers work without certificates.
 //! Defining the rule once keeps the clients from disagreeing about which
 //! URLs qualify.
+//!
+//! Every client the workspace builds decodes gzip responses, so a body's
+//! size on the wire says nothing about the memory it needs: a few
+//! megabytes of gzip inflate a thousandfold. [`collect_body`] reads a
+//! body under a limit on its decoded size, and every client reads
+//! responses through it for the same reason the loopback rule is shared.
+
+use bytes::{Bytes, BytesMut};
 
 /// Whether `url` names a loopback host: the exact name `localhost` in any
 /// case, or an IPv4 / IPv6 loopback literal.
@@ -28,6 +37,66 @@ pub fn is_loopback_host(url: &url::Url) -> bool {
 /// or the host is loopback (see [`is_loopback_host`]).
 pub fn is_secure_transport(url: &url::Url) -> bool {
     url.scheme() == "https" || is_loopback_host(url)
+}
+
+/// Why [`collect_body`] did not return a body.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CollectBodyError {
+    /// The body failed in transport: a connection reset, a timeout
+    /// between chunks, or content that does not decode. The cause is the
+    /// [`source()`](std::error::Error::source).
+    #[error("failed to read the response body")]
+    Transport(#[source] reqwest::Error),
+
+    /// The decoded body is longer than the limit. Nothing past the limit
+    /// was buffered.
+    #[error("response body exceeded the {limit}-byte limit")]
+    TooLarge {
+        /// The limit that was exceeded, in decoded bytes.
+        limit: usize,
+    },
+}
+
+/// Collects a response body, refusing to buffer more than `limit` bytes
+/// of the decoded stream.
+///
+/// The limit counts decoded bytes, not bytes on the wire. The clients
+/// the SDK builds decode gzip transparently, and a small compressed body
+/// can inflate a thousandfold, so a limit on the encoded size would not
+/// bound memory. A body is refused as soon as the chunk that would push
+/// it past `limit` arrives, without storing that chunk; a body of
+/// exactly `limit` bytes is accepted. Pass `usize::MAX` for no limit.
+///
+/// The chunks are joined once at the end into a buffer of the exact
+/// size, so a collected body costs one copy of its length and no
+/// growth-doubling. A body that arrives as a single chunk is returned
+/// without a copy.
+pub async fn collect_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, CollectBodyError> {
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut total: usize = 0;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(CollectBodyError::Transport)?
+    {
+        total = match total.checked_add(chunk.len()) {
+            Some(next) if next <= limit => next,
+            _ => return Err(CollectBodyError::TooLarge { limit }),
+        };
+        chunks.push(chunk);
+    }
+    if chunks.len() <= 1 {
+        return Ok(chunks.pop().unwrap_or_default());
+    }
+    let mut body = BytesMut::with_capacity(total);
+    for chunk in &chunks {
+        body.extend_from_slice(chunk);
+    }
+    Ok(body.freeze())
 }
 
 #[cfg(test)]
@@ -82,5 +151,85 @@ mod tests {
     fn a_url_without_a_host_is_not_loopback() {
         assert!(!is_loopback_host(&parse("mailto:someone@example.com")));
         assert!(!is_secure_transport(&parse("mailto:someone@example.com")));
+    }
+
+    mod collect {
+        use super::super::*;
+        use std::io::Write;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn fetch(template: ResponseTemplate) -> (MockServer, reqwest::Response) {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            // The default client decodes gzip, like every client the SDK
+            // builds.
+            let response = reqwest::Client::new()
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap();
+            (server, response)
+        }
+
+        #[tokio::test]
+        async fn a_body_one_byte_over_the_limit_is_refused() {
+            let (_server, response) =
+                fetch(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 1025])).await;
+            let err = collect_body(response, 1024).await.unwrap_err();
+            assert!(
+                matches!(err, CollectBodyError::TooLarge { limit: 1024 }),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_body_of_exactly_the_limit_is_returned_whole() {
+            let (_server, response) =
+                fetch(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 1024])).await;
+            let body = collect_body(response, 1024).await.unwrap();
+            assert_eq!(body.as_ref(), vec![b'x'; 1024].as_slice());
+        }
+
+        #[tokio::test]
+        async fn a_gzip_body_is_limited_by_its_decoded_size() {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(&vec![0u8; 8 << 20]).unwrap();
+            let wire = encoder.finish().unwrap();
+            assert!(wire.len() < 64 * 1024, "wire size {}", wire.len());
+
+            let (_server, response) = fetch(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(wire),
+            )
+            .await;
+            let err = collect_body(response, 64 * 1024).await.unwrap_err();
+            assert!(
+                matches!(err, CollectBodyError::TooLarge { limit } if limit == 64 * 1024),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_multi_chunk_body_round_trips_byte_exact() {
+            // Large enough that the transport delivers it in several
+            // chunks, with content that makes a misordered join visible.
+            let expected: Vec<u8> = (0..(2 << 20)).map(|i: usize| (i % 251) as u8).collect();
+            let (_server, response) =
+                fetch(ResponseTemplate::new(200).set_body_bytes(expected.clone())).await;
+            let body = collect_body(response, usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), expected.as_slice());
+        }
+
+        #[tokio::test]
+        async fn an_empty_body_is_an_empty_buffer() {
+            let (_server, response) = fetch(ResponseTemplate::new(204)).await;
+            assert!(collect_body(response, 0).await.unwrap().is_empty());
+        }
     }
 }
