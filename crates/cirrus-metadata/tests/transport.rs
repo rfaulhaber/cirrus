@@ -17,12 +17,15 @@
 
 use async_trait::async_trait;
 use cirrus_metadata::auth::{AuthResult, AuthSession, StaticTokenAuth};
-use cirrus_metadata::{MetadataClient, MetadataError, MetadataResult, RetryPolicy, SoapOperation};
+use cirrus_metadata::{
+    ListMetadataQuery, MetadataClient, MetadataError, MetadataResult, RetryPolicy, SoapOperation,
+    xml_escape,
+};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 // -- Test operation ----------------------------------------------------------
@@ -1067,4 +1070,379 @@ async fn retry_read_timeouts_restores_replay_of_idempotent_operations() {
         "{err:?}"
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+// -- Request headers ---------------------------------------------------------
+
+const CALL_OPTIONS_AFTER_SESSION: &str = "</met:SessionHeader>\
+     <met:CallOptions><met:client>cirrus-tests/1.0</met:client></met:CallOptions>\
+     </soapenv:Header>";
+
+fn empty_list_metadata_response() -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/xml; charset=UTF-8")
+        .set_body_string(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <listMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata"/>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        )
+}
+
+fn apex_class_query() -> Vec<ListMetadataQuery> {
+    vec![ListMetadataQuery {
+        type_name: "ApexClass".into(),
+        folder: None,
+    }]
+}
+
+fn client_with_call_options(server: &MockServer, client: &str) -> MetadataClient {
+    MetadataClient::builder()
+        .auth(Arc::new(StaticTokenAuth::new("tok", server.uri())))
+        .call_options_client(client)
+        .build()
+        .unwrap()
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_calloptions.htm
+/// CallOptions: "client | string | A value that identifies an API
+/// client."; the header applies to all calls.
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl): the
+/// `CallOptions{client: string}` element, bound as an input header of
+/// every operation except describeValueType.
+#[tokio::test]
+async fn call_options_client_rides_on_a_call_after_the_session_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:listMetadata>"))
+        .and(body_string_contains(CALL_OPTIONS_AFTER_SESSION))
+        .respond_with(empty_list_metadata_response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_with_call_options(&server, "cirrus-tests/1.0");
+    md.list_metadata(apex_class_query(), "66.0").await.unwrap();
+}
+
+#[tokio::test]
+async fn call_options_client_is_xml_escaped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:CallOptions><met:client>a&lt;b</met:client></met:CallOptions>",
+        ))
+        .respond_with(empty_list_metadata_response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_with_call_options(&server, "a<b");
+    md.list_metadata(apex_class_query(), "66.0").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_client_without_call_options_sends_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("CallOptions"))
+        .respond_with(empty_list_metadata_response())
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "</met:SessionHeader></soapenv:Header><soapenv:Body><met:listMetadata>",
+        ))
+        .respond_with(empty_list_metadata_response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    md.list_metadata(apex_class_query(), "66.0").await.unwrap();
+}
+
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl): the
+/// binding of describeValueType lists only SessionHeader as an input
+/// header; CallOptions is bound on every other operation.
+#[tokio::test]
+async fn describe_value_type_sends_no_call_options() {
+    let server = MockServer::start().await;
+    // Mounted first: a request carrying CallOptions would reach this
+    // mock, not the one below, and fail its expectation.
+    Mock::given(method("POST"))
+        .and(body_string_contains("CallOptions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:describeValueType>"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(
+                    r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <describeValueTypeResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <apiCreatable>true</apiCreatable>
+        <apiDeletable>true</apiDeletable>
+        <apiReadable>true</apiReadable>
+        <apiUpdatable>true</apiUpdatable>
+      </result>
+    </describeValueTypeResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_with_call_options(&server, "cirrus-tests/1.0");
+    md.describe_value_type("{http://soap.sforce.com/2006/04/metadata}ApexClass")
+        .await
+        .unwrap();
+}
+
+/// A custom operation that contributes its own header element.
+struct PingWithHeaders {
+    client_tag: &'static str,
+}
+
+impl SoapOperation for PingWithHeaders {
+    const NAME: &'static str = "ping";
+    const IDEMPOTENT: bool = true;
+    type Response = PingResponse;
+    fn render_body(&self) -> MetadataResult<String> {
+        Ok(String::new())
+    }
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(format!(
+            "<met:AllOrNoneHeader><met:allOrNone>true</met:allOrNone></met:AllOrNoneHeader>\
+             <met:Custom>{}</met:Custom>",
+            xml_escape(self.client_tag),
+        ))
+    }
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_headers.htm
+/// Lists AllOrNoneHeader, CallOptions, DebuggingHeader and
+/// SessionHeader as the Metadata API's SOAP headers.
+#[tokio::test]
+async fn a_custom_operations_headers_follow_the_clients_call_options() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "</met:SessionHeader>\
+             <met:CallOptions><met:client>cirrus-tests/1.0</met:client></met:CallOptions>\
+             <met:AllOrNoneHeader><met:allOrNone>true</met:allOrNone></met:AllOrNoneHeader>\
+             <met:Custom>a&amp;b</met:Custom>\
+             </soapenv:Header>",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body("ok")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_with_call_options(&server, "cirrus-tests/1.0");
+    md.call(&PingWithHeaders { client_tag: "a&b" })
+        .await
+        .unwrap();
+}
+
+/// A custom operation can opt out of the client's CallOptions.
+struct PingWithoutCallOptions;
+
+impl SoapOperation for PingWithoutCallOptions {
+    const NAME: &'static str = "ping";
+    const ACCEPTS_CALL_OPTIONS: bool = false;
+    type Response = PingResponse;
+    fn render_body(&self) -> MetadataResult<String> {
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn an_operation_can_decline_the_clients_call_options() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("CallOptions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body("ok")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_with_call_options(&server, "cirrus-tests/1.0");
+    md.call(&PingWithoutCallOptions).await.unwrap();
+}
+
+/// A failing `render_headers` surfaces before anything is sent.
+struct PingWithBrokenHeaders;
+
+impl SoapOperation for PingWithBrokenHeaders {
+    const NAME: &'static str = "ping";
+    type Response = PingResponse;
+    fn render_body(&self) -> MetadataResult<String> {
+        Ok(String::new())
+    }
+    fn render_headers(&self) -> MetadataResult<String> {
+        Err(MetadataError::InvalidArgument("no header".into()))
+    }
+}
+
+#[tokio::test]
+async fn a_failing_render_headers_is_returned_without_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    let err = md.call(&PingWithBrokenHeaders).await.unwrap_err();
+    assert!(matches!(err, MetadataError::InvalidArgument(_)));
+}
+
+// -- Response headers --------------------------------------------------------
+
+fn success_body_with_header(header_xml: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>{header_xml}</soapenv:Header>
+  <soapenv:Body>
+    <pingResponse>
+      <result><msg>ok</msg></result>
+    </pingResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+    )
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_debuggingheader.htm
+/// "After the deployment finishes, and if tests were run, the response
+/// of checkDeployStatus() contains the debug log output in the
+/// debugLog field of a DebuggingInfo output header."
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl): the
+/// `DebuggingInfo{debugLog: string}` element, an output header of
+/// checkDeployStatus. The guide publishes no response envelope, so the
+/// header's placement under `<soapenv:Header>` follows the WSDL's
+/// binding, with the default metadata namespace on its children.
+#[tokio::test]
+async fn call_with_response_headers_returns_the_debugging_info_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body_with_header(
+                    "<DebuggingInfo><debugLog>USER_DEBUG a &amp; b</debugLog></DebuggingInfo>",
+                )),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    let (resp, headers) = md.call_with_response_headers(&Ping).await.unwrap();
+    assert_eq!(resp.result.msg, "ok");
+    assert_eq!(
+        headers.debugging_info.unwrap().debug_log,
+        "USER_DEBUG a & b"
+    );
+}
+
+#[tokio::test]
+async fn call_with_response_headers_has_no_debugging_info_without_the_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body("ok")),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    let (_, headers) = md.call_with_response_headers(&Ping).await.unwrap();
+    assert!(headers.debugging_info.is_none());
+}
+
+#[tokio::test]
+async fn a_malformed_debugging_info_names_the_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body_with_header(
+                    "<DebuggingInfo><other>x</other></DebuggingInfo>",
+                )),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    let err = md.call_with_response_headers(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Xml(msg) => assert!(msg.contains("DebuggingInfo"), "{msg}"),
+        other => panic!("expected Xml, got {other:?}"),
+    }
+}
+
+/// `call` discards the headers without failing on them.
+#[tokio::test]
+async fn call_ignores_response_headers() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body_with_header(
+                    "<DebuggingInfo><debugLog>log</debugLog></DebuggingInfo>",
+                )),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    md.call(&Ping).await.unwrap();
+}
+
+#[tokio::test]
+async fn call_does_not_parse_a_response_header_it_discards() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(success_body_with_header(
+                    "<DebuggingInfo><other>x</other></DebuggingInfo>",
+                )),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
+    md.call(&Ping).await.unwrap();
 }

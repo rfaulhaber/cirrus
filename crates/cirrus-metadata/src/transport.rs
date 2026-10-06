@@ -1,18 +1,23 @@
 //! SOAP transport — request dispatch, retry, and auth-refresh.
 //!
 //! [`SoapOperation`] is the trait every handler implements; it specifies
-//! the operation's name and response shape, and renders the body XML.
-//! [`soap_call`] is the dispatcher that:
+//! the operation's name and response shape, and renders the body XML
+//! (and, optionally, extra SOAP headers). [`soap_call`] is the
+//! dispatcher that:
 //!
 //! 1. Asks [`AuthSession`] for a bearer token.
-//! 2. Builds the envelope around the rendered body.
+//! 2. Builds the envelope around the rendered body, with the client's
+//!    `CallOptions` and the operation's own headers after the
+//!    `SessionHeader`.
 //! 3. POSTs to `/services/Soap/m/{api_version}` with the SOAP-required
 //!    headers (`Content-Type: text/xml; charset=UTF-8`, `SOAPAction: ""`),
 //!    after confirming the instance URL is still `https` or loopback —
 //!    the session id rides in the body, and the URL is re-read from the
 //!    session on every call.
 //! 4. Parses the response envelope into either a typed `O::Response` or
-//!    a [`MetadataError::Soap`] carrying the [`SoapFault`].
+//!    a [`MetadataError::Soap`] carrying the [`SoapFault`];
+//!    [`soap_call_with_headers`] also deserializes the `DebuggingInfo`
+//!    output header.
 //! 5. Retries transient failures per the client's [`RetryPolicy`]. The
 //!    envelope is parsed first, so an application-level fault is
 //!    surfaced immediately instead of being replayed under the 5xx
@@ -26,8 +31,9 @@
 //! [`SoapFault`]: crate::error::SoapFault
 
 use crate::MetadataClient;
-use crate::envelope::{self, EnvelopeBody};
+use crate::envelope::{self, EnvelopeBody, ResponseHeaders};
 use crate::error::{MetadataError, MetadataResult};
+use crate::headers::{self, DebuggingInfo, SoapResponseHeaders};
 use crate::retry;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -74,6 +80,12 @@ pub trait SoapOperation {
     /// [`idempotent()`](Self::idempotent) instead of setting this.
     const IDEMPOTENT: bool = false;
 
+    /// Whether the client's `CallOptions` header is sent with this
+    /// operation. Defaults to `true`: the Metadata WSDL binds
+    /// `CallOptions` on every operation except `describeValueType`,
+    /// which opts out.
+    const ACCEPTS_CALL_OPTIONS: bool = true;
+
     /// The typed response shape. Deserialized via `quick-xml`'s serde
     /// implementation from the full
     /// `<{NAME}Response>...</{NAME}Response>` element.
@@ -86,6 +98,19 @@ pub trait SoapOperation {
     /// The renderer is responsible for any inner XML namespaces; the
     /// outer `met:` prefix is added by the transport.
     fn render_body(&self) -> MetadataResult<String>;
+
+    /// Render extra elements for `<soapenv:Header>`, such as
+    /// `<met:AllOrNoneHeader>`. Defaults to none.
+    ///
+    /// Render them with the `met:` prefix and escape text with
+    /// [`xml_escape`](crate::xml_escape). The transport adds the
+    /// `SessionHeader` and the client's `CallOptions` itself; the
+    /// elements returned here follow them. Called once per
+    /// [`MetadataClient::call`], so a retry or an
+    /// `INVALID_SESSION_ID` refresh resends the same headers.
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(String::new())
+    }
 
     /// Whether *this* request is safe to replay. Defaults to
     /// [`IDEMPOTENT`](Self::IDEMPOTENT).
@@ -104,10 +129,64 @@ pub(crate) async fn soap_call<O: SoapOperation>(
     client: &MetadataClient,
     op: &O,
 ) -> MetadataResult<O::Response> {
+    // The output headers are dropped unparsed, so a header a caller
+    // never asked for cannot fail the call.
+    dispatch(client, op).await.map(|(response, _)| response)
+}
+
+/// Dispatch one SOAP operation and return the output headers next to
+/// the typed response.
+pub(crate) async fn soap_call_with_headers<O: SoapOperation>(
+    client: &MetadataClient,
+    op: &O,
+) -> MetadataResult<(O::Response, SoapResponseHeaders)> {
+    let (response, raw_headers) = dispatch(client, op).await?;
+    let debugging_info = raw_headers
+        .debugging_info
+        .as_deref()
+        .map(|xml| {
+            let mut de = quick_xml::de::Deserializer::from_str(xml);
+            serde_path_to_error::deserialize::<_, DebuggingInfo>(&mut de).map_err(|e| {
+                MetadataError::Xml(format!("DebuggingInfo: {} at `{}`", e.inner(), e.path()))
+            })
+        })
+        .transpose()?;
+    Ok((response, SoapResponseHeaders { debugging_info }))
+}
+
+/// Renders the request headers that follow the `SessionHeader`: the
+/// client's `CallOptions` when the operation takes it, then the
+/// operation's own.
+fn render_request_headers<O: SoapOperation>(
+    client: &MetadataClient,
+    op: &O,
+) -> MetadataResult<String> {
+    let mut out = String::new();
+    if O::ACCEPTS_CALL_OPTIONS
+        && let Some(call_options_client) = &client.call_options_client
+    {
+        headers::render_call_options(call_options_client, &mut out);
+    }
+    out.push_str(&op.render_headers()?);
+    Ok(out)
+}
+
+async fn dispatch<O: SoapOperation>(
+    client: &MetadataClient,
+    op: &O,
+) -> MetadataResult<(O::Response, ResponseHeaders)> {
     let response_local = format!("{}Response", O::NAME);
     let body_xml = op.render_body()?;
-    let inner =
-        call_with_auth_retry(client, O::NAME, op.idempotent(), &body_xml, &response_local).await?;
+    let headers_xml = render_request_headers(client, op)?;
+    let (inner, response_headers) = call_with_auth_retry(
+        client,
+        O::NAME,
+        op.idempotent(),
+        &headers_xml,
+        &body_xml,
+        &response_local,
+    )
+    .await?;
     // `from_str` borrows text nodes straight out of `inner`; the
     // `from_reader` path would copy every event — including the
     // multi-megabyte base64 `<zipFile>` — through an internal buffer
@@ -118,7 +197,7 @@ pub(crate) async fn soap_call<O: SoapOperation>(
     let parsed: O::Response = serde_path_to_error::deserialize(&mut de).map_err(|e| {
         MetadataError::Xml(format!("{response_local}: {} at `{}`", e.inner(), e.path()))
     })?;
-    Ok(parsed)
+    Ok((parsed, response_headers))
 }
 
 /// Outer loop: handles INVALID_SESSION_ID auto-refresh (at most once).
@@ -128,9 +207,10 @@ async fn call_with_auth_retry(
     client: &MetadataClient,
     op_name: &str,
     idempotent: bool,
+    headers_xml: &str,
     body_xml: &str,
     response_local: &str,
-) -> MetadataResult<String> {
+) -> MetadataResult<(String, ResponseHeaders)> {
     // First iteration fetches a token from the auth session. On a
     // refresh-after-INVALID_SESSION_ID we thread the *already-fetched*
     // fresh token in here, instead of calling access_token() a second
@@ -147,7 +227,7 @@ async fn call_with_auth_retry(
             }
         };
 
-        let envelope = envelope::build_envelope(&token_str, op_name, body_xml);
+        let envelope = envelope::build_envelope(&token_str, op_name, headers_xml, body_xml);
         // Bytes is Arc-backed — clones on retry are cheap.
         let body = Bytes::from(envelope.into_bytes());
         // An intermediary's error page may echo the envelope, token
@@ -189,13 +269,13 @@ async fn call_with_auth_retry(
 
 /// Inner loop: retries transient failures per [`RetryPolicy`]. Returns
 /// the response envelope's `<{NAME}Response>...</{NAME}Response>`
-/// element on success.
+/// element and its output headers on success.
 async fn send_with_retries(
     client: &MetadataClient,
     idempotent: bool,
     envelope_bytes: Bytes,
     response_local: &str,
-) -> MetadataResult<String> {
+) -> MetadataResult<(String, ResponseHeaders)> {
     crate::check_transport_security(client.auth.instance_url(), client.allow_insecure_transport)?;
     let url = client.endpoint_url();
     let mut attempt: u32 = 0;
@@ -248,9 +328,13 @@ async fn send_with_retries(
                 // REQUEST_LIMIT_EXCEEDED, INVALID_SESSION_ID) from being
                 // replayed under the 5xx rule and surfaced only after
                 // the whole retry budget is spent.
-                match envelope::parse_envelope(&bytes, response_local) {
-                    Ok(EnvelopeBody::Success(inner)) => return Ok(inner),
-                    Ok(EnvelopeBody::Fault(fault)) => {
+                match envelope::parse_envelope(&bytes, response_local)
+                    .map(|parsed| (parsed.body, parsed.headers))
+                {
+                    Ok((EnvelopeBody::Success(inner), response_headers)) => {
+                        return Ok((inner, response_headers));
+                    }
+                    Ok((EnvelopeBody::Fault(fault), _)) => {
                         if status_retryable
                             && retry::is_transient_fault(&fault)
                             && let Some(delay) = backoff(client, attempt, &headers)

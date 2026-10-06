@@ -21,13 +21,18 @@
 //!
 //! [`parse_envelope`] walks the response with a pull parser, tracking
 //! element depth manually to be robust against unknown namespace prefixes
-//! and arbitrary nesting inside the response body. It returns either a
-//! parsed [`SoapFault`] or the re-emitted text of the full
-//! `<{Operation}Response>...</{Operation}Response>` element. Handlers then
-//! deserialize that via quick-xml's serde implementation into their
+//! and arbitrary nesting inside the response body. It returns a
+//! [`ParsedEnvelope`]: the body — either a parsed [`SoapFault`] or the
+//! re-emitted text of the full `<{Operation}Response>...</{Operation}Response>`
+//! element — and the output headers found in `<Header>`. Handlers then
+//! deserialize the body via quick-xml's serde implementation into their
 //! typed response shape. Keeping the outer wrapper lets response structs
 //! be named after the wire element and handle multi-`<result>` shapes
 //! (e.g. `listMetadata`) without a synthetic root.
+//!
+//! The only output header the Metadata API documents is
+//! `DebuggingInfo`; it is re-emitted the same way as the body element.
+//! Any other `<Header>` child is skipped.
 //!
 //! The re-emitted element reproduces the server's character data
 //! verbatim — text is never trimmed and entity references are written
@@ -50,7 +55,23 @@ const METADATA_NS: &str = "http://soap.sforce.com/2006/04/metadata";
 /// individual handlers don't have to repeat the declaration.
 const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
-/// Outcome of parsing a SOAP response envelope.
+/// A parsed SOAP response: the body outcome plus the output headers
+/// carried in `<Header>`.
+#[derive(Debug)]
+pub(crate) struct ParsedEnvelope {
+    pub(crate) headers: ResponseHeaders,
+    pub(crate) body: EnvelopeBody,
+}
+
+/// Output headers of a response, as re-emitted element text awaiting
+/// deserialization.
+#[derive(Debug, Default)]
+pub(crate) struct ResponseHeaders {
+    /// The full `<DebuggingInfo>...</DebuggingInfo>` element.
+    pub(crate) debugging_info: Option<String>,
+}
+
+/// Outcome of parsing a SOAP response envelope body.
 #[derive(Debug)]
 pub(crate) enum EnvelopeBody {
     /// Operation succeeded. The string is the full
@@ -86,11 +107,18 @@ const ENVELOPE_WRAPPER_HEADROOM: usize = 512;
 /// `session_token` is the bearer token from the [`AuthSession`]; it goes
 /// into `<met:SessionHeader><met:sessionId>`. `operation_name` becomes the
 /// body element (e.g. `"deploy"` → `<met:deploy>...</met:deploy>`).
+/// `headers_xml` is spliced into `<soapenv:Header>` right after the
+/// `SessionHeader`; empty yields the session-header-only envelope.
 /// `body_xml` is the already-rendered inner body content — it may
 /// reference the `met:` prefix or declare its own namespaces.
 ///
 /// [`AuthSession`]: cirrus_auth::AuthSession
-pub(crate) fn build_envelope(session_token: &str, operation_name: &str, body_xml: &str) -> String {
+pub(crate) fn build_envelope(
+    session_token: &str,
+    operation_name: &str,
+    headers_xml: &str,
+    body_xml: &str,
+) -> String {
     // XML-escape the token. Salesforce tokens are alphanumeric + `!.`,
     // but escaping is cheap insurance against future format changes.
     let token = xml_escape(session_token);
@@ -100,6 +128,7 @@ pub(crate) fn build_envelope(session_token: &str, operation_name: &str, body_xml
     // final growth step would otherwise overshoot to twice the
     // envelope's size.
     let capacity = body_xml.len()
+        + headers_xml.len()
         + token.len()
         + SOAP_NS.len()
         + METADATA_NS.len()
@@ -116,7 +145,9 @@ pub(crate) fn build_envelope(session_token: &str, operation_name: &str, body_xml
     out.push_str(XSI_NS);
     out.push_str(r#""><soapenv:Header><met:SessionHeader><met:sessionId>"#);
     out.push_str(&token);
-    out.push_str("</met:sessionId></met:SessionHeader></soapenv:Header><soapenv:Body><met:");
+    out.push_str("</met:sessionId></met:SessionHeader>");
+    out.push_str(headers_xml);
+    out.push_str("</soapenv:Header><soapenv:Body><met:");
     out.push_str(operation_name);
     out.push('>');
     out.push_str(body_xml);
@@ -128,8 +159,9 @@ pub(crate) fn build_envelope(session_token: &str, operation_name: &str, body_xml
 
 /// Parse a SOAP 1.1 response envelope.
 ///
-/// Walks the input with a pull parser, looking for a `<Body>` child that
-/// is either `<Fault>` or an element whose local name equals
+/// Walks the input with a pull parser, collecting the output headers of
+/// a `<Header>` that precedes the body, then looking for a `<Body>`
+/// child that is either `<Fault>` or an element whose local name equals
 /// `expected_response_local_name` (typically `"{Operation}Response"`).
 /// Namespace prefixes are not consulted — we match on local names only
 /// so the parser is robust against `S:` / `soap:` / `soapenv:` variants
@@ -137,7 +169,7 @@ pub(crate) fn build_envelope(session_token: &str, operation_name: &str, body_xml
 pub(crate) fn parse_envelope(
     xml: &[u8],
     expected_response_local_name: &str,
-) -> MetadataResult<EnvelopeBody> {
+) -> MetadataResult<ParsedEnvelope> {
     // `Reader::from_str` is the slice-backed (allocation-free) variant —
     // its `read_event()` returns events that borrow from the input.
     // The generic `Reader<R: BufRead>` only exposes `read_event_into(&mut buf)`,
@@ -152,15 +184,62 @@ pub(crate) fn parse_envelope(
     // metadata values the org stores verbatim.
     let mut reader = Reader::from_str(s);
 
+    let mut headers = ResponseHeaders::default();
+
     // Walk until we enter <Body>.
     loop {
         match reader.read_event()? {
+            Event::Start(e) if e.name().local_name().as_ref() == b"Header" => {
+                headers = parse_header(&mut reader)?;
+            }
             Event::Start(e) if e.name().local_name().as_ref() == b"Body" => {
-                return parse_body(&mut reader, expected_response_local_name);
+                let body = parse_body(&mut reader, expected_response_local_name)?;
+                return Ok(ParsedEnvelope { headers, body });
             }
             Event::Eof => {
                 return Err(MetadataError::InvalidResponse(
                     "SOAP envelope missing <Body>".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse a `<Header>` element. Collects a direct `<DebuggingInfo>` child
+/// (matched on local name, like [`parse_body`]) and skips every other
+/// child, nesting-capped at [`MAX_RESPONSE_DEPTH`]. Returns at the
+/// closing `</Header>`.
+fn parse_header(reader: &mut Reader<&[u8]>) -> MetadataResult<ResponseHeaders> {
+    let mut headers = ResponseHeaders::default();
+    // Depth below <Header> while skipping a child; 0 between children.
+    let mut skipped_depth: i32 = 0;
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) => {
+                if skipped_depth == 0 && e.name().local_name().as_ref() == b"DebuggingInfo" {
+                    let owned = e.into_owned();
+                    let mut buf = Vec::new();
+                    collect_element(reader, owned, &mut buf)?;
+                    headers.debugging_info = Some(into_utf8(buf)?);
+                } else {
+                    skipped_depth += 1;
+                    if skipped_depth > MAX_RESPONSE_DEPTH {
+                        return Err(MetadataError::InvalidResponse(format!(
+                            "response nesting exceeds {MAX_RESPONSE_DEPTH} levels"
+                        )));
+                    }
+                }
+            }
+            Event::End(_) => {
+                if skipped_depth == 0 {
+                    return Ok(headers);
+                }
+                skipped_depth -= 1;
+            }
+            Event::Eof => {
+                return Err(MetadataError::InvalidResponse(
+                    "truncated <Header>: EOF before closing tag".into(),
                 ));
             }
             _ => {}
@@ -425,13 +504,16 @@ fn resolve_ref(r: &BytesRef<'_>) -> MetadataResult<String> {
         .into_owned())
 }
 
-/// Minimal XML escape — only the five mandatory entities. Used for the
-/// session token before splicing it into the envelope, and by handlers
-/// rendering body XML by hand. Production tokens and most metadata
-/// names never contain these characters, so we scan first and return a
-/// borrow when no escape is needed — saves one allocation per token /
-/// fullName / type name on the SOAP envelope hot path.
-pub(crate) fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
+/// Escapes the five XML entities (`<`, `>`, `&`, `'`, `"`) so `s` can be
+/// spliced into element text or an attribute value.
+///
+/// Implementors of [`SoapOperation`](crate::SoapOperation) use it when
+/// rendering body or header XML by hand. Returns a borrow when `s` needs
+/// no escaping.
+// Production tokens and most metadata names never contain these
+// characters, so we scan first and borrow — saves one allocation per
+// token / fullName / type name on the SOAP envelope hot path.
+pub fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
     // Fast path: byte scan. All five escapable chars are single-byte
     // ASCII, so checking the byte stream is correct for UTF-8 input
     // (multibyte UTF-8 bytes all have the high bit set; we never
@@ -463,7 +545,7 @@ mod tests {
 
     #[test]
     fn build_envelope_round_trip_shape() {
-        let env = build_envelope("TOKEN", "ping", "<inner/>");
+        let env = build_envelope("TOKEN", "ping", "", "<inner/>");
         assert!(env.contains("xmlns:soapenv="));
         assert!(env.contains("xmlns:met="));
         assert!(env.contains("xmlns:xsi="));
@@ -475,9 +557,149 @@ mod tests {
     fn build_envelope_escapes_token() {
         // Defensive — real tokens never have these chars, but make
         // sure the escape is wired.
-        let env = build_envelope("a<b&c", "ping", "");
+        let env = build_envelope("a<b&c", "ping", "", "");
         assert!(env.contains("a&lt;b&amp;c"));
         assert!(!env.contains("a<b&c</"));
+    }
+
+    #[test]
+    fn build_envelope_with_no_headers_keeps_the_session_header_only_shape() {
+        let env = build_envelope("TOKEN", "ping", "", "<inner/>");
+        assert_eq!(
+            env,
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" "#,
+                r#"xmlns:met="http://soap.sforce.com/2006/04/metadata" "#,
+                r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+                "<soapenv:Header><met:SessionHeader><met:sessionId>TOKEN</met:sessionId>",
+                "</met:SessionHeader></soapenv:Header>",
+                "<soapenv:Body><met:ping><inner/></met:ping></soapenv:Body></soapenv:Envelope>",
+            )
+        );
+    }
+
+    #[test]
+    fn build_envelope_places_extra_headers_after_the_session_header() {
+        let env = build_envelope(
+            "TOKEN",
+            "ping",
+            "<met:CallOptions><met:client>c</met:client></met:CallOptions>",
+            "<inner/>",
+        );
+        assert!(env.contains(
+            "</met:SessionHeader><met:CallOptions><met:client>c</met:client></met:CallOptions>\
+             </soapenv:Header><soapenv:Body>"
+        ));
+    }
+
+    #[test]
+    fn build_envelope_sizes_the_buffer_for_the_headers() {
+        let headers = "<met:H>".repeat(2048);
+        let env = build_envelope("TOKEN", "ping", &headers, "<inner/>");
+        assert!(env.len() > headers.len());
+        assert!(env.capacity() >= env.len());
+    }
+
+    #[test]
+    fn parse_envelope_returns_the_debugging_info_header() {
+        // Wire-shape provenance: the WSDL (API 66.0 Metadata WSDL) binds
+        // `DebuggingInfo{debugLog}` as an output header of
+        // checkDeployStatus; children carry the default metadata
+        // namespace like body content does.
+        let xml = br#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <DebuggingInfo><debugLog>47.0 APEX_CODE,FINE
+Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
+  </soapenv:Header>
+  <soapenv:Body>
+    <pingResponse><result><msg>ok</msg></result></pingResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#;
+        let parsed = parse_envelope(xml, "pingResponse").unwrap();
+        let info = parsed.headers.debugging_info.unwrap();
+        assert!(info.starts_with("<DebuggingInfo>"), "{info}");
+        assert!(info.ends_with("</DebuggingInfo>"), "{info}");
+        assert!(
+            info.contains("<debugLog>47.0 APEX_CODE,FINE\nExecute Anonymous: a &amp; b</debugLog>")
+        );
+        assert!(matches!(parsed.body, EnvelopeBody::Success(_)));
+    }
+
+    #[test]
+    fn parse_envelope_skips_unknown_header_children() {
+        let xml = br#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Header>
+    <LimitInfoHeader><limitInfo><type>API REQUESTS</type><current>1</current></limitInfo></LimitInfoHeader>
+    <DebuggingInfo><debugLog>log</debugLog></DebuggingInfo>
+    <Other/>
+  </soapenv:Header>
+  <soapenv:Body><pingResponse/></soapenv:Body>
+</soapenv:Envelope>"#;
+        let parsed = parse_envelope(xml, "pingResponse").unwrap();
+        assert_eq!(
+            parsed.headers.debugging_info.as_deref(),
+            Some("<DebuggingInfo><debugLog>log</debugLog></DebuggingInfo>")
+        );
+    }
+
+    #[test]
+    fn parse_envelope_accepts_a_prefixed_debugging_info() {
+        let xml = br#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header><met:DebuggingInfo><met:debugLog>log</met:debugLog></met:DebuggingInfo></soapenv:Header>
+  <soapenv:Body><pingResponse/></soapenv:Body>
+</soapenv:Envelope>"#;
+        let parsed = parse_envelope(xml, "pingResponse").unwrap();
+        let info = parsed.headers.debugging_info.unwrap();
+        assert!(info.contains("<met:debugLog>log</met:debugLog>"), "{info}");
+    }
+
+    #[test]
+    fn parse_envelope_without_a_header_has_no_debugging_info() {
+        let xml = br#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body><pingResponse/></soapenv:Body>
+</soapenv:Envelope>"#;
+        let parsed = parse_envelope(xml, "pingResponse").unwrap();
+        assert!(parsed.headers.debugging_info.is_none());
+    }
+
+    #[test]
+    fn parse_envelope_reads_headers_of_a_fault_response() {
+        let xml = br#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Header><DebuggingInfo><debugLog>log</debugLog></DebuggingInfo></soapenv:Header>
+  <soapenv:Body><soapenv:Fault><faultcode>sf:X</faultcode><faultstring>x</faultstring></soapenv:Fault></soapenv:Body>
+</soapenv:Envelope>"#;
+        let parsed = parse_envelope(xml, "pingResponse").unwrap();
+        assert!(matches!(parsed.body, EnvelopeBody::Fault(_)));
+        assert!(parsed.headers.debugging_info.is_some());
+    }
+
+    #[test]
+    fn parse_envelope_rejects_a_truncated_header() {
+        let xml = br#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Header><Other><a>"#;
+        let err = parse_envelope(xml, "pingResponse").unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn parse_envelope_rejects_excessive_nesting_in_a_skipped_header_child() {
+        let depth = (MAX_RESPONSE_DEPTH as usize) + 8;
+        let mut xml =
+            String::from(r#"<E xmlns="http://schemas.xmlsoap.org/soap/envelope/"><Header><Other>"#);
+        for _ in 0..depth {
+            xml.push_str("<a>");
+        }
+        for _ in 0..depth {
+            xml.push_str("</a>");
+        }
+        xml.push_str("</Other></Header><Body><pingResponse/></Body></E>");
+        let err = parse_envelope(xml.as_bytes(), "pingResponse").unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidResponse(_)));
+        assert!(err.to_string().contains("nesting"));
     }
 
     #[test]
@@ -490,7 +712,7 @@ mod tests {
     </pingResponse>
   </soapenv:Body>
 </soapenv:Envelope>"#;
-        let body = parse_envelope(xml, "pingResponse").unwrap();
+        let body = parse_envelope(xml, "pingResponse").unwrap().body;
         let EnvelopeBody::Success(s) = body else {
             panic!("expected Success, got {body:?}");
         };
@@ -513,7 +735,7 @@ mod tests {
     </soapenv:Fault>
   </soapenv:Body>
 </soapenv:Envelope>"#;
-        let body = parse_envelope(xml, "pingResponse").unwrap();
+        let body = parse_envelope(xml, "pingResponse").unwrap().body;
         let EnvelopeBody::Fault(f) = body else {
             panic!("expected Fault, got {body:?}");
         };
@@ -542,7 +764,7 @@ mod tests {
     </soapenv:Fault>
   </soapenv:Body>
 </soapenv:Envelope>"#;
-        let body = parse_envelope(xml, "anything").unwrap();
+        let body = parse_envelope(xml, "anything").unwrap().body;
         let EnvelopeBody::Fault(f) = body else {
             panic!("expected Fault");
         };
@@ -565,7 +787,7 @@ mod tests {
     </soapenv:Fault>
   </soapenv:Body>
 </soapenv:Envelope>"#;
-        let body = parse_envelope(xml, "anything").unwrap();
+        let body = parse_envelope(xml, "anything").unwrap().body;
         let EnvelopeBody::Fault(f) = body else {
             panic!("expected Fault, got {body:?}");
         };
@@ -616,7 +838,7 @@ mod tests {
     </listMetadataResponse>
   </Body>
 </E>"#;
-        let body = parse_envelope(xml, "listMetadataResponse").unwrap();
+        let body = parse_envelope(xml, "listMetadataResponse").unwrap().body;
         let EnvelopeBody::Success(s) = body else {
             panic!("expected Success");
         };
@@ -641,7 +863,7 @@ mod tests {
     </readMetadataResponse>
   </Body>
 </E>"#;
-        let body = parse_envelope(xml, "readMetadataResponse").unwrap();
+        let body = parse_envelope(xml, "readMetadataResponse").unwrap().body;
         let EnvelopeBody::Success(s) = body else {
             panic!("expected Success, got {body:?}");
         };
@@ -673,7 +895,7 @@ mod tests {
     </soapenv:Fault>
   </soapenv:Body>
 </soapenv:Envelope>"#;
-        let body = parse_envelope(xml, "anything").unwrap();
+        let body = parse_envelope(xml, "anything").unwrap().body;
         let EnvelopeBody::Fault(f) = body else {
             panic!("expected Fault, got {body:?}");
         };
@@ -722,7 +944,9 @@ mod tests {
         }
         xml.push_str("</describeValueTypeResponse></Body></E>");
 
-        let body = parse_envelope(xml.as_bytes(), "describeValueTypeResponse").unwrap();
+        let body = parse_envelope(xml.as_bytes(), "describeValueTypeResponse")
+            .unwrap()
+            .body;
         assert!(matches!(body, EnvelopeBody::Success(_)));
     }
 }
@@ -856,7 +1080,7 @@ mod property_tests {
   </soapenv:Body>
 </soapenv:Envelope>"#
             );
-            match parse_envelope(envelope.as_bytes(), "anyResponse") {
+            match parse_envelope(envelope.as_bytes(), "anyResponse").map(|parsed| parsed.body) {
                 Ok(EnvelopeBody::Fault(_)) => {} // expected
                 Ok(EnvelopeBody::Success(_)) => {
                     prop_assert!(false, "Fault body parsed as Success: {body}");

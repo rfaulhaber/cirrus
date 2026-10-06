@@ -54,9 +54,16 @@ you need anything beyond `deployRequest`.
   XML serialization. `MetadataType` carries constants for the common
   types and `MetadataType::new` accepts any other Salesforce-defined
   type name.
+- **SOAP headers** — `MetadataClientBuilder::call_options_client` sends the
+  `CallOptions` header, the `_with` CRUD methods take `CrudOptions` for the
+  `AllOrNoneHeader`, and `deploy_with_debugging` sends a `DebuggingHeader`
+  whose `DebuggingInfo` log comes back from `wait_for_deploy_with_debugging`.
 - **Open-ended escape hatch** — `MetadataClient::request_builder()` for
   hand-rolling envelopes against operations the typed surface hasn't
-  modeled, with `SoapOperation` carrying the typed call path.
+  modeled, with `SoapOperation` carrying the typed call path:
+  `render_headers` adds request headers (text escaped with the public
+  `xml_escape`), and `MetadataClient::call_with_response_headers` returns
+  the response's `DebuggingInfo` header next to the typed response.
 - **Cross-cutting** — retry/backoff via `RetryPolicy`, automatic
   `INVALID_SESSION_ID` refresh against the configured `AuthSession`, SOAP
   fault parsing into a typed `MetadataError::Soap`.
@@ -161,6 +168,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `zip_bytes()` decodes it into the actual archive.
     if let Some(zip) = result.zip_bytes()? {
         std::fs::write("retrieved.zip", zip)?;
+    }
+
+    Ok(())
+}
+```
+
+## SOAP headers
+
+The Metadata API's SOAP headers are typed. A write is partial by default;
+`CrudOptions { all_or_none: true }` rolls the whole call back when any
+record fails. `call_options_client` identifies your client in the
+`CallOptions` header of every call that takes one. `deploy_with_debugging`
+asks for an Apex debug log, which the status check returns in the
+`DebuggingInfo` header once the deployment has finished and ran tests.
+
+```rust,no_run
+use cirrus_metadata::auth::StaticTokenAuth;
+use cirrus_metadata::{
+    Bytes, CrudOptions, DebuggingHeader, DeployOptions, LogCategory, LogCategoryLevel, LogInfo,
+    MetadataClient, TestLevel, WaitConfig,
+};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let auth = Arc::new(StaticTokenAuth::new(
+        std::env::var("SF_ACCESS_TOKEN")?,
+        std::env::var("SF_INSTANCE_URL")?,
+    ));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .call_options_client("my-tool/1.0")
+        .build()?;
+
+    // Either both classes are created or neither is.
+    let results = md
+        .create_metadata_with(
+            "ApexClass",
+            &[
+                "<fullName>One</fullName><apiVersion>66.0</apiVersion><status>Active</status>\
+                 <content>cHVibGljIGNsYXNzIE9uZSB7fQ==</content>",
+                "<fullName>Two</fullName><apiVersion>66.0</apiVersion><status>Active</status>\
+                 <content>cHVibGljIGNsYXNzIFR3byB7fQ==</content>",
+            ],
+            CrudOptions { all_or_none: true },
+        )
+        .await?;
+    assert!(results.iter().all(|r| r.success));
+
+    // Deploy with an Apex debug log, then read it back from the wait.
+    let zip = Bytes::from(std::fs::read("deploy.zip")?);
+    let job = md
+        .deploy_with_debugging(
+            zip,
+            DeployOptions {
+                test_level: Some(TestLevel::RunLocalTests),
+                ..Default::default()
+            },
+            DebuggingHeader {
+                categories: vec![LogInfo {
+                    category: LogCategory::ApexCode,
+                    level: LogCategoryLevel::Fine,
+                }],
+            },
+        )
+        .await?;
+    let (result, debugging) = md
+        .wait_for_deploy_with_debugging(&job.id, WaitConfig::default())
+        .await?;
+    result.into_result()?;
+    if let Some(info) = debugging {
+        println!("{}", info.debug_log);
     }
 
     Ok(())

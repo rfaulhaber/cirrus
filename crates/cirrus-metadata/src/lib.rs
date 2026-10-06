@@ -8,7 +8,9 @@
 //! (`createMetadata` / `readMetadata` / `updateMetadata` /
 //! `upsertMetadata` / `deleteMetadata` / `renameMetadata`), the utility
 //! surface (`listMetadata` / `describeMetadata` / `describeValueType`),
-//! and a typed [`PackageManifest`] builder.
+//! the SOAP headers (`CallOptions`, `AllOrNoneHeader`,
+//! `DebuggingHeader` and the `DebuggingInfo` response header), and a
+//! typed [`PackageManifest`] builder.
 //!
 //! ## Why SOAP?
 //!
@@ -67,6 +69,7 @@
 mod envelope;
 mod error;
 pub mod handlers;
+mod headers;
 mod package_manifest;
 pub mod result;
 pub mod retry;
@@ -105,8 +108,13 @@ pub use bytes::Bytes;
 pub use base64::DecodeError as Base64DecodeError;
 
 pub use auth::{AuthError, AuthSession, SharedAuth};
+pub use envelope::xml_escape;
 pub use error::{MetadataError, MetadataResult, SoapFault};
+pub use handlers::crud::CrudOptions;
 pub use handlers::file_based::WaitConfig;
+pub use headers::{
+    DebuggingHeader, DebuggingInfo, LogCategory, LogCategoryLevel, LogInfo, SoapResponseHeaders,
+};
 pub use package_manifest::{MetadataType, PackageManifest};
 pub use result::{
     AsyncRequestState, AsyncResult, CancelDeployResult, CodeCoverageResult, CodeCoverageWarning,
@@ -172,6 +180,7 @@ pub struct MetadataClient {
     pub(crate) api_version: String,
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) allow_insecure_transport: bool,
+    pub(crate) call_options_client: Option<String>,
 }
 
 impl std::fmt::Debug for MetadataClient {
@@ -183,6 +192,7 @@ impl std::fmt::Debug for MetadataClient {
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("call_options_client", &self.call_options_client)
             .finish_non_exhaustive()
     }
 }
@@ -269,8 +279,28 @@ impl MetadataClient {
     /// *body*) — see the security note on
     /// [`request_builder`](Self::request_builder) before wiring
     /// body-logging middleware around this client.
+    ///
+    /// The envelope carries the `SessionHeader`, the client's
+    /// `CallOptions` (see
+    /// [`MetadataClientBuilder::call_options_client`]) and whatever
+    /// [`SoapOperation::render_headers`] adds. Use
+    /// [`call_with_response_headers`](Self::call_with_response_headers)
+    /// to read the response's output headers too.
     pub async fn call<O: SoapOperation>(&self, op: &O) -> MetadataResult<O::Response> {
         transport::soap_call(self, op).await
+    }
+
+    /// Dispatch a typed SOAP operation like [`call`](Self::call), and
+    /// also return the response's output headers.
+    ///
+    /// Today that is the `DebuggingInfo` header of a `checkDeployStatus`
+    /// response; see [`SoapResponseHeaders`]. A header the response
+    /// doesn't carry comes back as `None`.
+    pub async fn call_with_response_headers<O: SoapOperation>(
+        &self,
+        op: &O,
+    ) -> MetadataResult<(O::Response, SoapResponseHeaders)> {
+        transport::soap_call_with_headers(self, op).await
     }
 }
 
@@ -290,6 +320,7 @@ pub struct MetadataClientBuilder {
     connect_timeout: Option<Option<std::time::Duration>>,
     read_timeout: Option<Option<std::time::Duration>>,
     allow_insecure_transport: bool,
+    call_options_client: Option<String>,
 }
 
 impl MetadataClientBuilder {
@@ -377,6 +408,19 @@ impl MetadataClientBuilder {
         self
     }
 
+    /// Identifies this API client to Salesforce in the `CallOptions`
+    /// SOAP header.
+    ///
+    /// The Metadata API Developer Guide describes the header's `client`
+    /// field as "a value that identifies an API client". It is sent on
+    /// every call the Metadata WSDL binds it to, which is every call
+    /// except `describeValueType`. Without this setting no `CallOptions`
+    /// header is sent.
+    pub fn call_options_client(mut self, client: impl Into<String>) -> Self {
+        self.call_options_client = Some(client.into());
+        self
+    }
+
     /// Finalizes the builder.
     ///
     /// Fails when no [`auth`](Self::auth) session was supplied, when
@@ -427,6 +471,7 @@ impl MetadataClientBuilder {
             api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
             allow_insecure_transport: self.allow_insecure_transport,
+            call_options_client: self.call_options_client,
         })
     }
 }

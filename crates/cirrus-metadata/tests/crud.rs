@@ -18,7 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use cirrus_metadata::auth::StaticTokenAuth;
-use cirrus_metadata::{MetadataClient, MetadataError, RetryPolicy};
+use cirrus_metadata::{CrudOptions, MetadataClient, MetadataError, RetryPolicy};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -560,4 +560,190 @@ async fn rename_metadata_propagates_error_in_save_result() {
     assert_eq!(result.errors.len(), 1);
     assert_eq!(result.errors[0].status_code, "INVALID_TYPE");
     assert_eq!(result.errors[0].message, "No such component");
+}
+
+// -- AllOrNoneHeader ---------------------------------------------------------
+
+/// The header element, placed right after the SessionHeader.
+const ALL_OR_NONE_AFTER_SESSION: &str = "</met:SessionHeader>\
+     <met:AllOrNoneHeader><met:allOrNone>true</met:allOrNone></met:AllOrNoneHeader>\
+     </soapenv:Header>";
+
+fn save_results_response(operation: &str) -> ResponseTemplate {
+    xml_response(&format!(
+        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <{operation}Response xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <fullName>Foo</fullName>
+        <success>true</success>
+        <created>true</created>
+      </result>
+    </{operation}Response>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+    ))
+}
+
+/// Mounts a mock for `operation` that, when `with_header` is set, also
+/// requires the header adjacent to the SessionHeader. Without it, a
+/// mock that must never see an AllOrNoneHeader is mounted *first*:
+/// wiremock hands a request to the first mock that matches, so a
+/// request carrying the header would reach it and fail its
+/// `expect(0)`, where a later mock would never be asked.
+async fn mount_all_or_none_expectation(server: &MockServer, operation: &str, with_header: bool) {
+    if !with_header {
+        Mock::given(method("POST"))
+            .and(body_string_contains("AllOrNoneHeader"))
+            .respond_with(save_results_response(operation))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+    let mut positive = Mock::given(method("POST"))
+        .and(path("/services/Soap/m/66.0"))
+        .and(body_string_contains(format!("<met:{operation}>")));
+    if with_header {
+        positive = positive.and(body_string_contains(ALL_OR_NONE_AFTER_SESSION));
+    }
+    positive
+        .respond_with(save_results_response(operation))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_allornoneheader.htm
+/// AllOrNoneHeader (API 34.0 and later): "allOrNone | boolean | Set to
+/// true to roll back all changes if any record in the call fails";
+/// absent is equivalent to false; supported on createMetadata(),
+/// updateMetadata(), upsertMetadata() and deleteMetadata().
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl): the
+/// `AllOrNoneHeader{allOrNone: boolean}` element, bound as an input
+/// header of those four operations.
+#[tokio::test]
+async fn create_metadata_with_all_or_none_sends_the_header_after_the_session_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "createMetadata", true).await;
+
+    let md = client_against(&server);
+    md.create_metadata_with(
+        "ApexClass",
+        &["<fullName>Foo</fullName>"],
+        CrudOptions { all_or_none: true },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn create_metadata_sends_no_all_or_none_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "createMetadata", false).await;
+
+    let md = client_against(&server);
+    md.create_metadata("ApexClass", &["<fullName>Foo</fullName>"])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_metadata_with_default_options_sends_no_all_or_none_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "createMetadata", false).await;
+
+    let md = client_against(&server);
+    md.create_metadata_with(
+        "ApexClass",
+        &["<fullName>Foo</fullName>"],
+        CrudOptions::default(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn update_metadata_with_all_or_none_sends_the_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "updateMetadata", true).await;
+
+    let md = client_against(&server);
+    md.update_metadata_with(
+        "ApexClass",
+        &["<fullName>Foo</fullName>"],
+        CrudOptions { all_or_none: true },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn update_metadata_sends_no_all_or_none_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "updateMetadata", false).await;
+
+    let md = client_against(&server);
+    md.update_metadata("ApexClass", &["<fullName>Foo</fullName>"])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn upsert_metadata_with_all_or_none_sends_the_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "upsertMetadata", true).await;
+
+    let md = client_against(&server);
+    md.upsert_metadata_with(
+        "ApexClass",
+        &["<fullName>Foo</fullName>"],
+        CrudOptions { all_or_none: true },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn upsert_metadata_sends_no_all_or_none_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "upsertMetadata", false).await;
+
+    let md = client_against(&server);
+    md.upsert_metadata("ApexClass", &["<fullName>Foo</fullName>"])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delete_metadata_with_all_or_none_sends_the_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "deleteMetadata", true).await;
+
+    let md = client_against(&server);
+    md.delete_metadata_with("ApexClass", &["Foo"], CrudOptions { all_or_none: true })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delete_metadata_sends_no_all_or_none_header() {
+    let server = MockServer::start().await;
+    mount_all_or_none_expectation(&server, "deleteMetadata", false).await;
+
+    let md = client_against(&server);
+    md.delete_metadata("ApexClass", &["Foo"]).await.unwrap();
+}
+
+/// The `_with` forms keep the per-call component cap.
+#[tokio::test]
+async fn create_metadata_with_still_enforces_the_component_cap() {
+    let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.example.com"));
+    let md = MetadataClient::builder().auth(auth).build().unwrap();
+    let empty: [&str; 0] = [];
+    let err = md
+        .create_metadata_with("ApexClass", &empty, CrudOptions { all_or_none: true })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetadataError::InvalidArgument(_)));
 }
