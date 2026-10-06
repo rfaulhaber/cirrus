@@ -91,6 +91,13 @@ pub use token_exchange::{
 };
 pub use web_server::{CompletedSession, PendingExchange, WebServerFlow, WebServerFlowBuilder};
 
+// The README's Rust code blocks are compiled as doctests, so the quick
+// start cannot drift from the API. The item exists only under
+// `cfg(doctest)` and never reaches the published docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 /// Abstraction over a Salesforce authentication session.
 ///
 /// An implementation holds whatever credentials the chosen flow needs,

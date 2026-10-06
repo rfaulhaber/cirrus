@@ -720,14 +720,63 @@ mod tests {
         assert!(expiry <= Instant::now() + Duration::from_secs(300));
     }
 
-    /// Records every event emitted under a `cirrus_auth` target as one
-    /// line: `target LEVEL field=value ...`.
-    #[derive(Default)]
-    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    /// Records, as `target LEVEL field=value ...` lines, every event the
+    /// recording thread emits under a `cirrus_auth` target while a
+    /// [`Recording`] is alive.
+    ///
+    /// Installed once per process as the global subscriber, never as a
+    /// scoped one: `tracing` caches each callsite's `Interest` process-wide,
+    /// and the cache is filled by whichever thread reaches the callsite
+    /// first. Under a scoped subscriber, a test running concurrently on
+    /// another thread registers the callsite against the no-op dispatcher
+    /// and caches `never`, after which this thread's events are dropped
+    /// before any subscriber sees them. The global subscriber answers
+    /// `Interest::sometimes()`, so every event consults `enabled`, which
+    /// admits only a thread that is recording.
+    struct Capture;
+
+    thread_local! {
+        static RECORDING: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Collects the recording thread's events until it is dropped.
+    struct Recording;
+
+    impl Capture {
+        fn record() -> Recording {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                tracing::subscriber::set_global_default(Capture)
+                    .expect("no other global subscriber is installed in the test binary");
+            });
+            RECORDING.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+            Recording
+        }
+    }
+
+    impl Recording {
+        fn lines(self) -> Vec<String> {
+            RECORDING.with(|lines| lines.borrow_mut().take().unwrap_or_default())
+        }
+    }
+
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            RECORDING.with(|lines| *lines.borrow_mut() = None);
+        }
+    }
 
     impl tracing::Subscriber for Capture {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
             metadata.target().starts_with("cirrus_auth")
+                && RECORDING.with(|lines| lines.borrow().is_some())
         }
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
@@ -748,7 +797,11 @@ mod tests {
             let metadata = event.metadata();
             let mut line = Line(format!("{} {}", metadata.target(), metadata.level()));
             event.record(&mut line);
-            self.0.lock().unwrap().push(line.0);
+            RECORDING.with(|lines| {
+                if let Some(lines) = lines.borrow_mut().as_mut() {
+                    lines.push(line.0);
+                }
+            });
         }
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
@@ -770,9 +823,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let capture = Capture::default();
-        let lines = capture.0.clone();
-        let _guard = tracing::subscriber::set_default(capture);
+        let recording = Capture::record();
 
         let http = token_client_builder().build().unwrap();
         let err = exchange(
@@ -785,7 +836,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AuthError::UnexpectedResponse { status: 502 }));
 
-        let lines = lines.lock().unwrap();
+        let lines = recording.lines();
         let event = lines
             .iter()
             .find(|line| line.starts_with("cirrus_auth::token_endpoint TRACE"))

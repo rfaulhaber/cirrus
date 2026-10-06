@@ -136,8 +136,12 @@ boundary between auth and REST without extra plumbing.
   request-body upload and the org's processing time too, and only then becomes
   a per-chunk deadline; widen it with `CirrusBuilder::read_timeout` for large
   Bulk 2.0 / blob **uploads** and for calls the org takes a long time to
-  answer. Supplying your own client via `CirrusBuilder::http_client` replaces
-  all of it.
+  answer. TLS is verified against the operating system's trust store, which
+  the client loads when it is built: a `FROM scratch` or distroless image
+  without `ca-certificates` fails at `build()` with `CirrusError::HttpClient`,
+  so install a CA bundle or hand over a `reqwest::Client` that carries its own
+  roots (`add_root_certificate`). Supplying your own client via
+  `CirrusBuilder::http_client` replaces all of it.
 
 ### The escape hatch
 

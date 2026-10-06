@@ -52,3 +52,6 @@ push-remote = "origin"
 tag-prefix = "cirrus-metadata-v"
 tag-name = "{{prefix}}{{version}}"
 publish = true
+pre-release-replacements = [
+    { file = "README.md", search = "cirrus-metadata = \"[^\"]+\"", replace = "cirrus-metadata = \"{{version}}\"", min = 1 },
+]

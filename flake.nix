@@ -44,6 +44,9 @@
         formatter = pkgs.alejandra;
 
         packages = {
+          # Every workspace member is a library, so the output holds no
+          # binaries; the build's value is the sandboxed test run, which
+          # `checks` below exposes to `nix flake check`.
           ${projectName} = pkgs.rustPlatform.buildRustPackage {
             pname = projectName;
             # The root manifest is a virtual workspace manifest (no [package]
@@ -51,9 +54,17 @@
             version = let file = builtins.fromTOML (builtins.readFile ./crates/cirrus/Cargo.toml); in file.package.version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            # reqwest's rustls platform verifier loads the OS trust store
+            # when a client is built and fails when it finds no roots. The
+            # sandbox has none, and stdenv points SSL_CERT_FILE at a file
+            # that does not exist; cacert's setup hook repoints it at the
+            # bundled roots, so the tests can build their clients.
+            nativeCheckInputs = [pkgs.cacert];
           };
           default = self'.packages.${projectName};
         };
+
+        checks.${projectName} = self'.packages.${projectName};
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
