@@ -307,9 +307,27 @@ mod tests {
         assert!(AuthError::UnexpectedResponse { status: 503 }.is_transient());
         assert!(AuthError::UnexpectedResponse { status: 429 }.is_transient());
         assert!(!AuthError::UnexpectedResponse { status: 404 }.is_transient());
-        assert!(AuthError::ResponseTooLarge { status: 503, limit: 1 }.is_transient());
-        assert!(AuthError::ResponseTooLarge { status: 429, limit: 1 }.is_transient());
-        assert!(!AuthError::ResponseTooLarge { status: 200, limit: 1 }.is_transient());
+        assert!(
+            AuthError::ResponseTooLarge {
+                status: 503,
+                limit: 1
+            }
+            .is_transient()
+        );
+        assert!(
+            AuthError::ResponseTooLarge {
+                status: 429,
+                limit: 1
+            }
+            .is_transient()
+        );
+        assert!(
+            !AuthError::ResponseTooLarge {
+                status: 200,
+                limit: 1
+            }
+            .is_transient()
+        );
         assert!(
             !AuthError::OAuth {
                 error: "invalid_grant".into(),
