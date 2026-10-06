@@ -151,7 +151,8 @@ pub enum AuthError {
 impl AuthError {
     /// Whether a later attempt could clear this failure: a transport
     /// error other than a request that could not be built, or a 429 or
-    /// 5xx from the token endpoint. An OAuth error such as
+    /// 5xx from the token endpoint, whether its body was read or was
+    /// over the cap. An OAuth error such as
     /// `invalid_grant`, a mismatched instance URL and every
     /// configuration error are permanent until something changes on the
     /// caller's side, so they are never transient.
@@ -161,7 +162,9 @@ impl AuthError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Http(e) => !e.is_builder(),
-            Self::UnexpectedResponse { status } => *status == 429 || (500..600).contains(status),
+            Self::UnexpectedResponse { status } | Self::ResponseTooLarge { status, .. } => {
+                *status == 429 || (500..600).contains(status)
+            }
             _ => false,
         }
     }
@@ -304,6 +307,9 @@ mod tests {
         assert!(AuthError::UnexpectedResponse { status: 503 }.is_transient());
         assert!(AuthError::UnexpectedResponse { status: 429 }.is_transient());
         assert!(!AuthError::UnexpectedResponse { status: 404 }.is_transient());
+        assert!(AuthError::ResponseTooLarge { status: 503, limit: 1 }.is_transient());
+        assert!(AuthError::ResponseTooLarge { status: 429, limit: 1 }.is_transient());
+        assert!(!AuthError::ResponseTooLarge { status: 200, limit: 1 }.is_transient());
         assert!(
             !AuthError::OAuth {
                 error: "invalid_grant".into(),

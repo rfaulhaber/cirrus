@@ -122,7 +122,8 @@ A token-endpoint response body is read through
 `cirrus_auth::transport::collect_body`, which stops at 64 KiB of decoded
 bytes: a real token response is a few kilobytes, and the client decodes
 gzip, so a body that does not fit came from an intermediary and fails with
-`AuthError::ResponseTooLarge` without being buffered. `collect_body` is
+`AuthError::ResponseTooLarge` without being buffered (an oversized 429 or
+5xx is retried first, exactly like the status alone). `collect_body` is
 public so other clients can bound their own response reads the same way.
 
 Token requests are retried a bounded number of times (two retries, 250 ms
