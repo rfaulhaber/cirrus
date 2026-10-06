@@ -1808,6 +1808,91 @@ async fn check_deploy_status_still_returns_just_the_result() {
     assert_eq!(result.status, Some(DeployStatus::Succeeded));
 }
 
+/// A finished checkDeployStatus response whose `DebuggingInfo` header
+/// carries no `debugLog`.
+///
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl):
+/// `DebuggingInfo{debugLog: string}` is the output header of
+/// checkDeployStatus and `debugLog` is schema-required, so this header
+/// is deliberately off-contract: it shows which calls read the header
+/// at all.
+fn deploy_status_response_with_an_empty_debugging_info() -> ResponseTemplate {
+    xml_response(
+        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Header><DebuggingInfo></DebuggingInfo></soapenv:Header>
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000dbg</id>
+        <done>true</done>
+        <success>true</success>
+        <status>Succeeded</status>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+    )
+}
+
+#[tokio::test]
+async fn check_deploy_status_ignores_a_debugging_info_header_it_did_not_ask_for() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response_with_an_empty_debugging_info())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md.check_deploy_status("0Af00000dbg", false).await.unwrap();
+    assert_eq!(result.id, "0Af00000dbg");
+    assert!(result.done);
+    assert!(result.success);
+}
+
+#[tokio::test]
+async fn check_deploy_status_with_debugging_rejects_a_debugging_info_without_a_log() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response_with_an_empty_debugging_info())
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let err = md
+        .check_deploy_status_with_debugging("0Af00000dbg", false)
+        .await
+        .unwrap_err();
+    match err {
+        MetadataError::Xml(msg) => {
+            assert!(msg.contains("DebuggingInfo"), "{msg}");
+            assert!(msg.contains("debugLog"), "{msg}");
+        }
+        other => panic!("expected MetadataError::Xml, got {other:?}"),
+    }
+}
+
+/// The terminal poll and the details fetch both answer with the
+/// off-contract header; neither read of a wait that never asked for the
+/// log looks at it.
+#[tokio::test]
+async fn wait_for_deploy_ignores_a_debugging_info_header_it_did_not_ask_for() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response_with_an_empty_debugging_info())
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .wait_for_deploy_with("0Af00000dbg", fast_wait())
+        .await
+        .unwrap();
+    assert_eq!(result.status, Some(DeployStatus::Succeeded));
+}
+
 /// The debug log of a deploy that ran tests is produced once it has
 /// finished, so the final details fetch is the call whose header the
 /// wait returns.
