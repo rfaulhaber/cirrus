@@ -144,6 +144,12 @@ boundary between auth and REST without extra plumbing.
   so install a CA bundle or hand over a `reqwest::Client` that carries its own
   roots (`add_root_certificate`). Supplying your own client via
   `CirrusBuilder::http_client` replaces all of it.
+- **Response size cap** — a response body is buffered only up to a limit on
+  its decoded size, since a few megabytes of gzip can inflate a thousandfold:
+  2xx bodies up to `CirrusBuilder::max_response_size` (1 GiB by default,
+  above the 1 GB Bulk result file; `None` lifts it), anything else up to
+  256 KiB. A larger body fails with `CirrusError::ResponseTooLarge`.
+  `Cirrus::execute` returns the raw response and is outside the cap.
 
 ### The escape hatch
 

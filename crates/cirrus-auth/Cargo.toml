@@ -17,6 +17,7 @@ homepage.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+bytes.workspace = true
 camino.workspace = true
 fs-err.workspace = true
 getrandom.workspace = true
@@ -35,6 +36,7 @@ url.workspace = true
 
 [dev-dependencies]
 dotenvy.workspace = true
+flate2.workspace = true
 # Test-only: decodes captured form bodies so assertions can read
 # individual request parameters instead of substring-matching.
 serde_urlencoded.workspace = true

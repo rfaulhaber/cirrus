@@ -124,6 +124,23 @@ pub enum MetadataError {
     #[error("invalid header value: {0}")]
     InvalidHeader(String),
 
+    /// The response body was longer than the client buffers, so it was
+    /// not read.
+    ///
+    /// The limit counts decoded bytes. A successful (2xx) response is
+    /// held to
+    /// [`MetadataClientBuilder::max_response_size`](crate::MetadataClientBuilder::max_response_size);
+    /// every other response is held to a fixed 256 KiB, far above a SOAP
+    /// fault. A retryable status whose body is oversized is retried like
+    /// any other; this error reports the final attempt.
+    #[error("HTTP {status} response body exceeded the {limit}-byte limit")]
+    ResponseTooLarge {
+        /// HTTP status of the oversized response.
+        status: u16,
+        /// The limit that was exceeded, in decoded bytes.
+        limit: usize,
+    },
+
     /// Response could not be interpreted as the requested type or shape.
     /// A 2xx body that is not a SOAP envelope carries a short excerpt
     /// here, with the session id redacted as for [`Self::Http4xx5xx`].
@@ -179,6 +196,14 @@ const RAW_ERROR_BODY_CAP: usize = 2048;
 /// [`RAW_ERROR_BODY_CAP`]: the excerpt only has to show what answered.
 const NON_SOAP_BODY_EXCERPT_CAP: usize = 256;
 
+/// Ceiling on the deserializer message carried by a
+/// [`MetadataError::Xml`]. serde's `invalid_type` and `unknown_variant`
+/// errors quote the offending value, and a metadata field can hold
+/// arbitrarily long text, so the message is as unbounded as the data.
+/// The path of the failing element, which locates the mismatch, is
+/// short and is kept outside the cap.
+pub(crate) const PARSE_MESSAGE_CAP: usize = 512;
+
 /// Decodes an error body for inclusion in an error, bounded by
 /// [`RAW_ERROR_BODY_CAP`] bytes and marked when anything was dropped.
 pub(crate) fn cap_raw_body(bytes: &[u8]) -> String {
@@ -189,6 +214,19 @@ pub(crate) fn cap_raw_body(bytes: &[u8]) -> String {
 /// by [`NON_SOAP_BODY_EXCERPT_CAP`] bytes.
 pub(crate) fn cap_body_excerpt(bytes: &[u8]) -> String {
     cap_body(bytes, NON_SOAP_BODY_EXCERPT_CAP)
+}
+
+/// Truncates `text` to at most `cap` bytes at a char boundary, marked
+/// when anything was dropped.
+pub(crate) fn cap_text(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… <truncated>", &text[..end])
 }
 
 /// Only the capped byte prefix is decoded, so a multi-megabyte body never
@@ -287,19 +325,18 @@ fn redact_session_id_elements(body: &str) -> String {
 
 impl From<quick_xml::Error> for MetadataError {
     fn from(e: quick_xml::Error) -> Self {
-        MetadataError::Xml(e.to_string())
+        MetadataError::Xml(cap_text(&e.to_string(), PARSE_MESSAGE_CAP))
     }
 }
 
 impl From<quick_xml::DeError> for MetadataError {
     fn from(e: quick_xml::DeError) -> Self {
-        MetadataError::Xml(e.to_string())
+        MetadataError::Xml(cap_text(&e.to_string(), PARSE_MESSAGE_CAP))
     }
 }
 
-// `quick_xml::Writer::write_event` returns `std::io::Result<()>` even
-// when the underlying buffer is a `Vec<u8>`. Folding that into the XML
-// variant keeps the public error surface small.
+// Folding I/O failures into the XML variant keeps the public error
+// surface small.
 impl From<std::io::Error> for MetadataError {
     fn from(e: std::io::Error) -> Self {
         MetadataError::Xml(e.to_string())
@@ -375,6 +412,36 @@ mod tests {
         let untouched =
             MetadataError::InvalidArgument("tok is fine here".into()).redact_secrets("tok");
         assert_eq!(untouched.to_string(), "invalid argument: tok is fine here");
+    }
+
+    #[test]
+    fn cap_text_keeps_short_text_and_marks_a_cut() {
+        assert_eq!(cap_text("short", 16), "short");
+        assert_eq!(cap_text("exactly16bytes!!", 16), "exactly16bytes!!");
+        assert_eq!(
+            cap_text("0123456789abcdefX", 16),
+            "0123456789abcdef… <truncated>"
+        );
+    }
+
+    #[test]
+    fn cap_text_cuts_at_a_char_boundary() {
+        // Each `é` is two bytes, so a cut at byte 5 would split one.
+        let capped = cap_text("ééééé", 5);
+        assert_eq!(capped, "éé… <truncated>");
+    }
+
+    #[test]
+    fn quick_xml_messages_that_quote_input_are_capped() {
+        let quoted = "v".repeat(PARSE_MESSAGE_CAP * 8);
+        let err: MetadataError =
+            <quick_xml::DeError as serde::de::Error>::custom(format!("unknown variant `{quoted}`"))
+                .into();
+        let MetadataError::Xml(msg) = &err else {
+            panic!("variant changed: {err:?}");
+        };
+        assert!(msg.ends_with("… <truncated>"), "{msg}");
+        assert!(msg.len() < PARSE_MESSAGE_CAP + 32, "{} bytes", msg.len());
     }
 
     #[test]

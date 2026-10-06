@@ -1446,3 +1446,253 @@ async fn call_does_not_parse_a_response_header_it_discards() {
     let md = client_for(&server, Arc::new(StaticTokenAuth::new("tok", server.uri())));
     md.call(&Ping).await.unwrap();
 }
+
+// -- Response size limits ------------------------------------------------------
+//
+// The envelopes are this file's `ping` fixtures; the gzip bodies exercise the
+// transport rather than a Salesforce wire shape. SOURCE for the compressed
+// response a client that sends `Accept-Encoding: gzip` must expect:
+// https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_rest_compression.htm
+// (doc_version 264.0) — "If compressed, the response contains a
+// Content-Encoding header with the compression algorithm so that your client
+// knows to decompress it."
+
+/// The fixed cap on a non-2xx body, mirrored from the crate.
+const NON_SUCCESS_BODY_CAP: usize = 256 * 1024;
+
+fn client_with_cap(
+    server: &MockServer,
+    cap: impl Into<Option<usize>>,
+    policy: RetryPolicy,
+) -> MetadataClient {
+    MetadataClient::builder()
+        .auth(Arc::new(StaticTokenAuth::new("tok", server.uri())))
+        .max_response_size(cap)
+        .retry_policy(policy)
+        .build()
+        .unwrap()
+}
+
+fn fast_retries() -> RetryPolicy {
+    RetryPolicy {
+        base_delay: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::ZERO,
+        jitter: false,
+        ..RetryPolicy::default()
+    }
+}
+
+/// A gzip body a few kilobytes on the wire and `len` bytes decoded.
+fn gzip_of_zeros(len: usize) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&vec![0u8; len]).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn inflating_503() -> ResponseTemplate {
+    ResponseTemplate::new(503)
+        .insert_header("content-encoding", "gzip")
+        .set_body_bytes(gzip_of_zeros(8 << 20))
+}
+
+#[test]
+fn the_default_response_cap_covers_a_retrieve_and_is_reported_in_debug() {
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieve.htm
+    // "The resulting .zip file can't exceed 50 MB."
+    assert_eq!(cirrus_metadata::DEFAULT_MAX_RESPONSE_SIZE, 128 << 20);
+    const { assert!(cirrus_metadata::DEFAULT_MAX_RESPONSE_SIZE > 50 * 1_000_000) };
+    let md = MetadataClient::builder()
+        .auth(Arc::new(StaticTokenAuth::new(
+            "tok",
+            "https://my-org.my.salesforce.com",
+        )))
+        .build()
+        .unwrap();
+    assert!(
+        format!("{md:?}").contains("max_response_size: Some(134217728)"),
+        "{md:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_success_body_over_the_cap_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(success_body(&"x".repeat(4096))),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, 1024, RetryPolicy::none());
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            MetadataError::ResponseTooLarge {
+                status: 200,
+                limit: 1024
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_cap_lets_a_body_through_that_a_cap_refuses() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(success_body(&"x".repeat(2 << 20))),
+        )
+        .mount(&server)
+        .await;
+
+    let capped = client_with_cap(&server, 1 << 20, RetryPolicy::none());
+    let err = capped.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::ResponseTooLarge { status: 200, .. }),
+        "{err:?}"
+    );
+
+    let uncapped = client_with_cap(&server, None, RetryPolicy::none());
+    let resp = uncapped.call(&Ping).await.unwrap();
+    assert_eq!(resp.result.msg.len(), 2 << 20);
+}
+
+#[tokio::test]
+async fn a_gzip_error_body_is_capped_after_decoding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(inflating_503())
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, RetryPolicy::none());
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            MetadataError::ResponseTooLarge {
+                status: 503,
+                limit: NON_SUCCESS_BODY_CAP
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retryable_status_with_an_oversized_body_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(inflating_503())
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(success_body("hello")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, fast_retries());
+    let resp = md.call(&Ping).await.unwrap();
+    assert_eq!(resp.result.msg, "hello");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_reported_once_the_retries_are_spent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(inflating_503())
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, fast_retries());
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::ResponseTooLarge { status: 503, .. }),
+        "{err:?}"
+    );
+    // The first attempt plus the policy's retries.
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1 + RetryPolicy::default().max_retries as usize
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_body_on_a_status_that_is_not_retried_surfaces_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(inflating_503())
+        .mount(&server)
+        .await;
+
+    // `Mutate` is not replay-safe, so a 503 is final.
+    let md = client_with_cap(&server, None, fast_retries());
+    let err = md.call(&Mutate).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::ResponseTooLarge { status: 503, .. }),
+        "{err:?}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+// -- Bodies that are not UTF-8 -------------------------------------------------
+
+#[tokio::test]
+async fn a_non_utf8_error_body_keeps_a_lossy_excerpt() {
+    let server = MockServer::start().await;
+    let mut body = b"<html>bad gateway ".to_vec();
+    body.extend_from_slice(&[0xff, 0xfe]);
+    body.extend_from_slice(b"</html>");
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(502).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, RetryPolicy::none());
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Http4xx5xx { status, raw } => {
+            assert_eq!(status, 502);
+            assert!(raw.contains("bad gateway"), "{raw}");
+            assert!(raw.contains('\u{fffd}'), "{raw}");
+        }
+        other => panic!("expected Http4xx5xx, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_non_utf8_2xx_body_is_an_invalid_response_with_an_excerpt() {
+    let server = MockServer::start().await;
+    let mut body = b"<html>maintenance ".to_vec();
+    body.extend_from_slice(&[0xff, 0xfe]);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, RetryPolicy::none());
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::InvalidResponse(msg) => {
+            assert!(msg.contains("not valid UTF-8"), "{msg}");
+            assert!(msg.contains("maintenance"), "{msg}");
+        }
+        other => panic!("expected InvalidResponse, got {other:?}"),
+    }
+}

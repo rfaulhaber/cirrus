@@ -431,14 +431,20 @@ impl MetadataClient {
     /// per-component success/failure entries and Apex test results.
     /// Costs extra bandwidth, but is required for any meaningful
     /// post-mortem on a failed deploy.
+    ///
+    /// The response's `DebuggingInfo` header is left unread;
+    /// [`Self::check_deploy_status_with_debugging`] returns it.
     pub async fn check_deploy_status(
         &self,
         deploy_id: &str,
         include_details: bool,
     ) -> MetadataResult<DeployResult> {
-        self.check_deploy_status_with_debugging(deploy_id, include_details)
-            .await
-            .map(|(result, _)| result)
+        let op = CheckDeployStatusOp {
+            async_process_id: deploy_id.to_string(),
+            include_details,
+        };
+        let resp = self.call(&op).await?;
+        Ok(resp.result)
     }
 
     /// [`Self::check_deploy_status`] that also returns the
@@ -592,19 +598,23 @@ impl MetadataClient {
     /// reaches a terminal state, and if that follow-up call fails the
     /// terminal result is returned with `details: None` rather than
     /// discarding a completed deploy's outcome behind an error.
+    ///
+    /// The response's `DebuggingInfo` header is left unread;
+    /// [`Self::wait_for_deploy_with_debugging`] returns it.
     pub async fn wait_for_deploy(&self, deploy_id: &str) -> MetadataResult<DeployResult> {
         self.wait_for_deploy_with(deploy_id, WaitConfig::default())
             .await
     }
 
     /// Polling form of [`Self::wait_for_deploy`] with a configurable
-    /// [`WaitConfig`]; the outcome contract is the same.
+    /// [`WaitConfig`]; the outcome contract is the same, and the
+    /// response's `DebuggingInfo` header is likewise left unread.
     pub async fn wait_for_deploy_with(
         &self,
         deploy_id: &str,
         config: WaitConfig,
     ) -> MetadataResult<DeployResult> {
-        self.wait_for_deploy_with_debugging(deploy_id, config)
+        self.poll_deploy_until_done(deploy_id, config, false)
             .await
             .map(|(result, _)| result)
     }
@@ -622,6 +632,36 @@ impl MetadataClient {
         deploy_id: &str,
         config: WaitConfig,
     ) -> MetadataResult<(DeployResult, Option<DebuggingInfo>)> {
+        self.poll_deploy_until_done(deploy_id, config, true).await
+    }
+
+    /// One status read of the deploy poll loop. Only a caller that asked
+    /// for the debug log reads the `DebuggingInfo` header, so a header
+    /// the caller never requested cannot fail its status check.
+    async fn deploy_status(
+        &self,
+        deploy_id: &str,
+        include_details: bool,
+        with_debugging: bool,
+    ) -> MetadataResult<(DeployResult, Option<DebuggingInfo>)> {
+        if with_debugging {
+            self.check_deploy_status_with_debugging(deploy_id, include_details)
+                .await
+        } else {
+            self.check_deploy_status(deploy_id, include_details)
+                .await
+                .map(|result| (result, None))
+        }
+    }
+
+    /// The poll loop behind [`Self::wait_for_deploy_with`] and
+    /// [`Self::wait_for_deploy_with_debugging`].
+    async fn poll_deploy_until_done(
+        &self,
+        deploy_id: &str,
+        config: WaitConfig,
+        with_debugging: bool,
+    ) -> MetadataResult<(DeployResult, Option<DebuggingInfo>)> {
         let start = tokio::time::Instant::now();
         let mut delay = config.initial_delay;
         loop {
@@ -629,18 +669,13 @@ impl MetadataClient {
             // processed component and can balloon into megabytes for
             // large deploys. We fetch the full DeployDetails once after
             // the deploy reaches a terminal state.
-            let (result, info) = self
-                .check_deploy_status_with_debugging(deploy_id, false)
-                .await?;
+            let (result, info) = self.deploy_status(deploy_id, false, with_debugging).await?;
             if result.done {
                 // The terminal result is already in hand; the details
                 // fetch only enriches it. If the follow-up fails (after
                 // its own retries), return what we have — an error here
                 // would discard a completed deploy's outcome.
-                return match self
-                    .check_deploy_status_with_debugging(deploy_id, true)
-                    .await
-                {
+                return match self.deploy_status(deploy_id, true, with_debugging).await {
                     Ok(with_details) => Ok(with_details),
                     Err(e) => {
                         tracing::warn!(

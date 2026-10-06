@@ -91,6 +91,7 @@ pub use response::{
 };
 pub use retry::{Replay, RetryPolicy};
 
+use cirrus_auth::transport::{CollectBodyError, collect_body};
 use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::Serialize;
@@ -128,6 +129,27 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// to answer; no fixed default covers a 100 MB ingest upload over an
 /// arbitrary link.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Largest response body, in decoded bytes, a successful call buffers
+/// unless [`CirrusBuilder::max_response_size`] says otherwise: 1 GiB.
+///
+/// It sits above the 1 GB Bulk API limit on a retrieved query-result
+/// file, so no response Salesforce documents trips it; a body past it
+/// fails with [`CirrusError::ResponseTooLarge`].
+pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 1 << 30;
+
+/// Largest non-2xx body a call buffers. The typed error array of a
+/// 200-record sObject Tree rollback is tens of kilobytes, and at most
+/// 2 KiB of an unparseable body is kept, so a body past this came from
+/// an intermediary.
+pub(crate) const NON_SUCCESS_BODY_CAP: usize = 256 * 1024;
+
+/// How much of a response that is about to be retried is read before its
+/// connection is given up. A prefix is enough: the body is discarded, so
+/// reading it only keeps a healthy connection reusable. A body past the
+/// prefix is dropped together with its connection, which is then not
+/// returned to the pool.
+pub(crate) const RETRY_DRAIN_CAP: usize = 64 * 1024;
 
 /// Default User-Agent header value sent on every request.
 pub(crate) const DEFAULT_USER_AGENT: &str = concat!(
@@ -221,6 +243,7 @@ pub struct Cirrus {
     api_version: String,
     retry_policy: RetryPolicy,
     allow_insecure_transport: bool,
+    max_response_size: Option<usize>,
     /// Most recent `Sforce-Limit-Info` header value, parsed. Wrapped
     /// in `Arc<RwLock<...>>` so updates are visible across cloned
     /// clients (clones share state).
@@ -236,6 +259,7 @@ impl std::fmt::Debug for Cirrus {
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("max_response_size", &self.max_response_size)
             .finish_non_exhaustive()
     }
 }
@@ -912,17 +936,31 @@ impl Cirrus {
                             attempt,
                             retry::parse_retry_after(&headers),
                         ) {
-                            // Drain the body so the connection returns
-                            // to the pool clean.
-                            let _ = response.bytes().await;
+                            // Drain a prefix of the body so the
+                            // connection returns to the pool clean. A
+                            // body past the prefix is dropped with its
+                            // connection, which is then not pooled:
+                            // giving up a connection is cheaper than
+                            // inflating a hostile body to reuse it.
+                            let _ = collect_body(response, RETRY_DRAIN_CAP).await;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         }
 
-                        match response.bytes().await {
+                        let cap = if (200..300).contains(&status) {
+                            self.max_response_size.unwrap_or(usize::MAX)
+                        } else {
+                            NON_SUCCESS_BODY_CAP
+                        };
+                        match collect_body(response, cap).await {
                             Ok(bytes) => break parse(status, headers, bytes),
-                            Err(e) => e.into(),
+                            Err(CollectBodyError::TooLarge { limit }) => {
+                                break Err(CirrusError::ResponseTooLarge { status, limit });
+                            }
+                            Err(CollectBodyError::Transport(e)) => e.into(),
+                            // `CollectBodyError` is `non_exhaustive`.
+                            Err(other) => CirrusError::InvalidResponse(other.to_string()),
                         }
                     }
                     Err(e) => e.into(),
@@ -1260,6 +1298,7 @@ pub struct CirrusBuilder {
     // caller asking for no deadline at all.
     connect_timeout: Option<Option<Duration>>,
     read_timeout: Option<Option<Duration>>,
+    max_response_size: Option<Option<usize>>,
     allow_insecure_transport: bool,
 }
 
@@ -1330,6 +1369,28 @@ impl CirrusBuilder {
     /// Ignored when [`http_client`](Self::http_client) supplies a client.
     pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.read_timeout = Some(timeout.into());
+        self
+    }
+
+    /// Caps the decoded size of a successful (2xx) response body, in
+    /// bytes. Defaults to [`DEFAULT_MAX_RESPONSE_SIZE`]; pass `None` for
+    /// no cap.
+    ///
+    /// The cap applies to every call that reads a response through the
+    /// client: typed JSON calls, Bulk 2.0 result pages, Event Monitoring
+    /// downloads, blob-upload responses and conditional GETs. The
+    /// default sits above the 1 GB Bulk result file, so no documented
+    /// response trips it. Raise it, or pass `None`, only for a client
+    /// that trusts every host it talks to: a compressed body inflates
+    /// far beyond its size on the wire, and the cap is what keeps one
+    /// from filling memory. A larger body fails with
+    /// [`CirrusError::ResponseTooLarge`] without being buffered.
+    ///
+    /// Bodies of non-2xx responses are capped at a fixed 256 KiB
+    /// regardless of this setting, and [`Cirrus::execute`] hands back
+    /// the raw response, outside any cap.
+    pub fn max_response_size(mut self, limit: impl Into<Option<usize>>) -> Self {
+        self.max_response_size = Some(limit.into());
         self
     }
 
@@ -1410,6 +1471,9 @@ impl CirrusBuilder {
             api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
             allow_insecure_transport: self.allow_insecure_transport,
+            max_response_size: self
+                .max_response_size
+                .unwrap_or(Some(DEFAULT_MAX_RESPONSE_SIZE)),
             last_limit_info: Arc::new(RwLock::new(None)),
         })
     }
@@ -2098,6 +2162,199 @@ mod tests {
                 CirrusError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
                 other => panic!("expected a transport error, got {other:?}"),
             }
+        }
+    }
+
+    /// Bounds on how much of a response body the client buffers.
+    mod body_caps {
+        use super::*;
+        use crate::RetryPolicy;
+        use serde_json::{Value, json};
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn fixture(uri: String, max_response_size: impl Into<Option<usize>>) -> Cirrus {
+            let auth = Arc::new(StaticTokenAuth::new("tok", uri));
+            Cirrus::builder()
+                .auth(auth)
+                .max_response_size(max_response_size)
+                .retry_policy(RetryPolicy {
+                    base_delay: Duration::ZERO,
+                    max_delay: Duration::ZERO,
+                    jitter: false,
+                    ..RetryPolicy::default()
+                })
+                .build()
+                .unwrap()
+        }
+
+        /// A gzip body that is a few kilobytes on the wire and `len` bytes
+        /// decoded: the shape a decompression bomb takes.
+        fn gzip_of_zeros(len: usize) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(&vec![0u8; len]).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        fn padded_json(len: usize) -> Value {
+            json!({ "pad": "x".repeat(len) })
+        }
+
+        #[test]
+        fn the_builder_default_is_the_documented_cap() {
+            let sf = fixture("https://my-org.my.salesforce.com".to_string(), None);
+            assert_eq!(sf.max_response_size, None);
+            let auth = Arc::new(StaticTokenAuth::new(
+                "tok",
+                "https://my-org.my.salesforce.com",
+            ));
+            let sf = Cirrus::builder().auth(auth).build().unwrap();
+            assert_eq!(sf.max_response_size, Some(DEFAULT_MAX_RESPONSE_SIZE));
+            assert_eq!(DEFAULT_MAX_RESPONSE_SIZE, 1 << 30);
+        }
+
+        #[tokio::test]
+        async fn a_success_body_over_the_cap_is_refused() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(padded_json(4096)))
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri(), 1024);
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CirrusError::ResponseTooLarge {
+                        status: 200,
+                        limit: 1024
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_gzip_error_body_is_capped_after_decoding() {
+            let server = MockServer::start().await;
+            let wire = gzip_of_zeros(8 << 20);
+            assert!(
+                wire.len() < NON_SUCCESS_BODY_CAP,
+                "wire size {}",
+                wire.len()
+            );
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .insert_header("content-encoding", "gzip")
+                        .set_body_bytes(wire),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CirrusError::ResponseTooLarge {
+                        status: 503,
+                        limit: NON_SUCCESS_BODY_CAP
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_retried_response_with_an_inflating_body_does_not_block_the_retry() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .insert_header("content-encoding", "gzip")
+                        .set_body_bytes(gzip_of_zeros(8 << 20)),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri(), None);
+            let value = sf.get::<Value>("limits").await.unwrap();
+            assert_eq!(value["ok"], true);
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn raw_fetches_honor_the_cap() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/jobs/query/750/results"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; 4096]))
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri(), 1024);
+            let err = sf
+                .fetch_raw(
+                    reqwest::Method::GET,
+                    "jobs/query/750/results",
+                    "text/csv",
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CirrusError::ResponseTooLarge {
+                        status: 200,
+                        limit: 1024
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_cap_lets_a_body_through_that_a_cap_refuses() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(padded_json(2 << 20)))
+                .mount(&server)
+                .await;
+
+            let capped = fixture(server.uri(), 1 << 20);
+            let err = capped.get::<Value>("limits").await.unwrap_err();
+            assert!(
+                matches!(err, CirrusError::ResponseTooLarge { status: 200, .. }),
+                "{err:?}"
+            );
+
+            let uncapped = fixture(server.uri(), None);
+            let value = uncapped.get::<Value>("limits").await.unwrap();
+            assert_eq!(value["pad"].as_str().unwrap().len(), 2 << 20);
         }
     }
 

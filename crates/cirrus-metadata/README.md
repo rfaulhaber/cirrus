@@ -77,7 +77,12 @@ you need anything beyond `deployRequest`.
   re-POSTing the envelope, session token included, to the `Location` host.
   A read timeout is surfaced, not replayed, unless
   `RetryPolicy::retry_read_timeouts` is set, and a `Retry-After` longer than
-  `max_delay` ends the retry loop instead of being shortened. Errors that
+  `max_delay` ends the retry loop instead of being shortened. A response body
+  is buffered only up to a limit on its decoded size: 2xx bodies up to
+  `MetadataClientBuilder::max_response_size` (128 MiB by default, above a
+  retrieve's 50 MB zip in base64; `None` lifts it), anything else up to
+  256 KiB, and a larger body fails with `MetadataError::ResponseTooLarge`
+  (or is retried, when its status is one the retry policy retries). Errors that
   retain a non-SOAP body have the session id replaced with `[redacted]`.
   The read timeout runs until the response head arrives, so it also bounds
   the upload of a deploy's base64 zip, and only then becomes a per-chunk
@@ -251,7 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `MetadataError` covers transport failures (`MetadataError::Http`), SOAP
 faults (`MetadataError::Soap { status, fault }`, where `fault.code()`
 returns the faultcode with its `sf:` prefix stripped), non-SOAP error
-bodies from proxies and gateways (`MetadataError::Http4xx5xx`),
+bodies from proxies and gateways (`MetadataError::Http4xx5xx`), bodies over
+the size limit (`MetadataError::ResponseTooLarge`),
 envelope and response-shape problems (`MetadataError::Xml`,
 `MetadataError::InvalidResponse`), client-side argument validation
 (`MetadataError::InvalidArgument`), jobs that finished without

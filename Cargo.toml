@@ -59,6 +59,8 @@ jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pe
 
 # Dev-only
 dotenvy = "0.15"
+# Test-only: builds gzip response bodies for the size-limit tests.
+flate2 = "1.1"
 proptest = "1.6"
 wiremock = "0.6"
 # `zip` is used only by integration tests that build a minimal deploy

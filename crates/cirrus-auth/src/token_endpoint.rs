@@ -10,6 +10,7 @@
 //! [`exchange`] handles the rest.
 
 use crate::error::{AuthError, AuthResult};
+use crate::transport::{CollectBodyError, collect_body};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -325,6 +326,11 @@ pub(super) enum GrantReplay {
     Never,
 }
 
+/// Largest token-endpoint response body the SDK buffers. A token response
+/// is a few kilobytes of JSON, so a body that does not fit came from an
+/// intermediary rather than Salesforce.
+pub(crate) const TOKEN_RESPONSE_BODY_CAP: usize = 64 * 1024;
+
 /// Retries after the first token request, and the pause before each.
 ///
 /// A mint therefore takes at most three request timeouts plus 750 ms. The
@@ -351,6 +357,12 @@ fn transport_failure_is_retryable(error: &reqwest::Error, replay: GrantReplay) -
     replay == GrantReplay::Safe
 }
 
+/// Whether a token-endpoint status is worth another request: the
+/// endpoint was throttling or failing rather than rejecting the grant.
+fn status_is_retryable(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
 /// POSTs a token-exchange form body to `{login_url}/services/oauth2/token`
 /// and parses the response.
 ///
@@ -362,7 +374,10 @@ fn transport_failure_is_retryable(error: &reqwest::Error, replay: GrantReplay) -
 /// On a terminal non-2xx, the body is parsed as the OAuth error shape if
 /// possible; otherwise only the status is surfaced as
 /// [`AuthError::UnexpectedResponse`]. Such a body is neither carried nor
-/// logged, since non-standard error pages can echo credentials.
+/// logged, since non-standard error pages can echo credentials. A body
+/// over [`TOKEN_RESPONSE_BODY_CAP`] decoded bytes is refused as
+/// [`AuthError::ResponseTooLarge`]; on a 429 or 5xx a replay-safe grant
+/// retries it first, exactly as it would the status alone.
 pub(super) async fn exchange<B>(
     http: &reqwest::Client,
     login_url: &str,
@@ -398,11 +413,35 @@ where
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let bytes = match (response.bytes().await, backoff) {
+        let bytes = match (
+            collect_body(response, TOKEN_RESPONSE_BODY_CAP).await,
+            backoff,
+        ) {
             (Ok(bytes), _) => bytes,
+            // An oversized body on a throttling or failing status is
+            // retried like the status alone: the page came from an
+            // intermediary that may answer differently next time, and
+            // nothing past the cap was read. On any other status the
+            // size is the verdict.
+            (Err(CollectBodyError::TooLarge { .. }), Some(delay))
+                if replay == GrantReplay::Safe && status_is_retryable(status) =>
+            {
+                tracing::warn!(
+                    target: "cirrus_auth::token_endpoint",
+                    attempt = attempt + 1,
+                    status,
+                    "token endpoint answered a retryable status with an oversized body; retrying",
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+            (Err(CollectBodyError::TooLarge { limit }), _) => {
+                return Err(AuthError::ResponseTooLarge { status, limit });
+            }
             // A body that dies mid-stream is as ambiguous as a lost
             // response: the server may already have acted on the grant.
-            (Err(e), Some(delay)) if replay == GrantReplay::Safe => {
+            (Err(CollectBodyError::Transport(e)), Some(delay)) if replay == GrantReplay::Safe => {
                 tracing::warn!(
                     target: "cirrus_auth::token_endpoint",
                     attempt = attempt + 1,
@@ -413,11 +452,11 @@ where
                 attempt += 1;
                 continue;
             }
-            (Err(e), _) => return Err(e.into()),
+            (Err(CollectBodyError::Transport(e)), _) => return Err(e.into()),
         };
         if let Some(delay) = backoff
             && replay == GrantReplay::Safe
-            && (status == 429 || (500..600).contains(&status))
+            && status_is_retryable(status)
         {
             tracing::warn!(
                 target: "cirrus_auth::token_endpoint",
@@ -634,6 +673,143 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_success_body_is_refused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        // A syntactically valid token response padded past the cap: the
+        // size, not the shape, is what the endpoint refuses.
+        let padded = serde_json::json!({
+            "access_token": "00DXX!ACCESS",
+            "instance_url": "https://my-org.my.salesforce.com",
+            "scope": "x".repeat(1 << 20),
+        });
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(padded))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::ResponseTooLarge {
+                    status: 200,
+                    limit: TOKEN_RESPONSE_BODY_CAP
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("00DXX"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_error_body_is_refused_with_its_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_bytes(vec![
+                b'x';
+                TOKEN_RESPONSE_BODY_CAP
+                    + 1
+            ]))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "refresh_token")],
+            GrantReplay::Never,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AuthError::ResponseTooLarge { status: 503, .. }),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// An intermediary's 503 page past the cap, `failures` times, then
+    /// the endpoint's own token response.
+    async fn mount_oversized_then_succeed(server: &wiremock::MockServer, failures: u64) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_bytes(vec![
+                b'x';
+                TOKEN_RESPONSE_BODY_CAP
+                    + 1
+            ]))
+            .up_to_n_times(failures)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!ACCESS",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_on_a_retryable_status_is_retried_for_a_replay_safe_grant() {
+        let server = wiremock::MockServer::start().await;
+        mount_oversized_then_succeed(&server, 1).await;
+        let http = token_client_builder().build().unwrap();
+        let token = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.access_token, "00DXX!ACCESS");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_on_a_retryable_status_surfaces_once_the_budget_is_spent() {
+        let server = wiremock::MockServer::start().await;
+        mount_oversized_then_succeed(&server, 3).await;
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::ResponseTooLarge {
+                    status: 503,
+                    limit: TOKEN_RESPONSE_BODY_CAP
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]

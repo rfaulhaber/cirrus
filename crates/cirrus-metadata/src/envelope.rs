@@ -23,27 +23,31 @@
 //! element depth manually to be robust against unknown namespace prefixes
 //! and arbitrary nesting inside the response body. It returns a
 //! [`ParsedEnvelope`]: the body — either a parsed [`SoapFault`] or the
-//! re-emitted text of the full `<{Operation}Response>...</{Operation}Response>`
+//! byte range of the full `<{Operation}Response>...</{Operation}Response>`
 //! element — and the output headers found in `<Header>`. Handlers then
-//! deserialize the body via quick-xml's serde implementation into their
-//! typed response shape. Keeping the outer wrapper lets response structs
-//! be named after the wire element and handle multi-`<result>` shapes
-//! (e.g. `listMetadata`) without a synthetic root.
+//! deserialize that slice of the response text via quick-xml's serde
+//! implementation into their typed response shape. Keeping the outer
+//! wrapper lets response structs be named after the wire element and
+//! handle multi-`<result>` shapes (e.g. `listMetadata`) without a
+//! synthetic root.
 //!
 //! The only output header the Metadata API documents is
-//! `DebuggingInfo`; it is re-emitted the same way as the body element.
-//! Any other `<Header>` child is skipped.
+//! `DebuggingInfo`; it is returned as a byte range the same way as the
+//! body element. Any other `<Header>` child is skipped.
 //!
-//! The re-emitted element reproduces the server's character data
-//! verbatim — text is never trimmed and entity references are written
-//! back as they arrived — so metadata values reach the caller exactly as
-//! the org stores them.
+//! Elements are located, never copied: a range is the span of the
+//! response text from the `<` of the opening tag to the `>` of the
+//! closing one, so a `<zipFile>` holding tens of megabytes of base64 is
+//! parsed in place. Because the slice is the server's own text, character
+//! data comes out verbatim — text is never trimmed and entity references
+//! stay as they arrived — and metadata values reach the caller exactly
+//! as the org stores them.
 
 use crate::error::{MetadataError, MetadataResult, SoapFault};
 use quick_xml::Reader;
-use quick_xml::Writer;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesRef, BytesText, Event};
+use std::ops::Range;
 
 /// SOAP 1.1 envelope namespace.
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -63,31 +67,32 @@ pub(crate) struct ParsedEnvelope {
     pub(crate) body: EnvelopeBody,
 }
 
-/// Output headers of a response, as re-emitted element text awaiting
-/// deserialization.
+/// Output headers of a response, as locations in the response text
+/// awaiting deserialization.
 #[derive(Debug, Default)]
 pub(crate) struct ResponseHeaders {
-    /// The full `<DebuggingInfo>...</DebuggingInfo>` element.
-    pub(crate) debugging_info: Option<String>,
+    /// Byte range of the full `<DebuggingInfo>...</DebuggingInfo>`
+    /// element.
+    pub(crate) debugging_info: Option<Range<usize>>,
 }
 
 /// Outcome of parsing a SOAP response envelope body.
 #[derive(Debug)]
 pub(crate) enum EnvelopeBody {
-    /// Operation succeeded. The string is the full
-    /// `<{Operation}Response>...</{Operation}Response>` element — the
-    /// caller deserializes it into the typed response. The outer
-    /// element is included so response structs can be named to match
-    /// the wire element and so multi-`<result>` responses work without
-    /// a synthetic root.
-    Success(String),
+    /// Operation succeeded. The range, into the text that was parsed, is
+    /// the full `<{Operation}Response>...</{Operation}Response>` element
+    /// — the caller deserializes that slice into the typed response. The
+    /// outer element is included so response structs can be named to
+    /// match the wire element and so multi-`<result>` responses work
+    /// without a synthetic root.
+    Success(Range<usize>),
     /// Server returned `<soapenv:Fault>`.
     Fault(SoapFault),
 }
 
 /// Ceiling on element nesting inside a response body.
 ///
-/// The collected element is handed to `quick-xml`'s serde deserializer,
+/// The located element is handed to `quick-xml`'s serde deserializer,
 /// whose recursion tracks the document's nesting one stack frame per
 /// level. `describeValueType` returns the self-referential
 /// `ValueTypeField`, so an endpoint that can shape the response body
@@ -159,30 +164,28 @@ pub(crate) fn build_envelope(
 
 /// Parse a SOAP 1.1 response envelope.
 ///
-/// Walks the input with a pull parser, collecting the output headers of
+/// Walks the input with a pull parser, locating the output headers of
 /// a `<Header>` that precedes the body, then looking for a `<Body>`
 /// child that is either `<Fault>` or an element whose local name equals
 /// `expected_response_local_name` (typically `"{Operation}Response"`).
 /// Namespace prefixes are not consulted — we match on local names only
 /// so the parser is robust against `S:` / `soap:` / `soapenv:` variants
-/// that different SOAP servers emit.
+/// that different SOAP servers emit. The ranges in the result index
+/// into `xml`.
 pub(crate) fn parse_envelope(
-    xml: &[u8],
+    xml: &str,
     expected_response_local_name: &str,
 ) -> MetadataResult<ParsedEnvelope> {
     // `Reader::from_str` is the slice-backed (allocation-free) variant —
     // its `read_event()` returns events that borrow from the input.
     // The generic `Reader<R: BufRead>` only exposes `read_event_into(&mut buf)`,
     // which would force every helper to thread a buffer.
-    let s = std::str::from_utf8(xml)
-        .map_err(|e| MetadataError::InvalidResponse(format!("response is not valid UTF-8: {e}")))?;
-    // Text is deliberately left untrimmed. The same reader re-emits the
-    // response element that handlers deserialize, and quick-xml splits
-    // character data around every entity reference into separate
-    // events — trimming would delete the whitespace on either side of
-    // an `&amp;` and strip significant leading/trailing whitespace from
-    // metadata values the org stores verbatim.
-    let mut reader = Reader::from_str(s);
+    //
+    // Text is deliberately left untrimmed. Element ranges are located by
+    // reader offsets, and character data — whitespace between tags
+    // included — arrives as its own event, so the offset before the event
+    // that opens an element is that element's `<`.
+    let mut reader = Reader::from_str(xml);
 
     let mut headers = ResponseHeaders::default();
 
@@ -206,7 +209,15 @@ pub(crate) fn parse_envelope(
     }
 }
 
-/// Parse a `<Header>` element. Collects a direct `<DebuggingInfo>` child
+/// Offset of the first byte the reader has not yet consumed: the start
+/// of the next event, or just past the `>` of the event returned last.
+fn position(reader: &Reader<&[u8]>) -> MetadataResult<usize> {
+    usize::try_from(reader.buffer_position()).map_err(|_| {
+        MetadataError::InvalidResponse("response offset exceeds the addressable range".into())
+    })
+}
+
+/// Parse a `<Header>` element. Locates a direct `<DebuggingInfo>` child
 /// (matched on local name, like [`parse_body`]) and skips every other
 /// child, nesting-capped at [`MAX_RESPONSE_DEPTH`]. Returns at the
 /// closing `</Header>`.
@@ -215,13 +226,12 @@ fn parse_header(reader: &mut Reader<&[u8]>) -> MetadataResult<ResponseHeaders> {
     // Depth below <Header> while skipping a child; 0 between children.
     let mut skipped_depth: i32 = 0;
     loop {
+        let event_start = position(reader)?;
         match reader.read_event()? {
             Event::Start(e) => {
                 if skipped_depth == 0 && e.name().local_name().as_ref() == b"DebuggingInfo" {
-                    let owned = e.into_owned();
-                    let mut buf = Vec::new();
-                    collect_element(reader, owned, &mut buf)?;
-                    headers.debugging_info = Some(into_utf8(buf)?);
+                    skip_element(reader)?;
+                    headers.debugging_info = Some(event_start..position(reader)?);
                 } else {
                     skipped_depth += 1;
                     if skipped_depth > MAX_RESPONSE_DEPTH {
@@ -252,6 +262,7 @@ fn parse_body(
     expected_response_local_name: &str,
 ) -> MetadataResult<EnvelopeBody> {
     loop {
+        let event_start = position(reader)?;
         match reader.read_event()? {
             Event::Start(e) => {
                 let local = e.name().local_name();
@@ -259,10 +270,8 @@ fn parse_body(
                     return parse_fault(reader).map(EnvelopeBody::Fault);
                 }
                 if local.as_ref() == expected_response_local_name.as_bytes() {
-                    let owned = e.into_owned();
-                    let mut buf = Vec::new();
-                    collect_element(reader, owned, &mut buf)?;
-                    return Ok(EnvelopeBody::Success(into_utf8(buf)?));
+                    skip_element(reader)?;
+                    return Ok(EnvelopeBody::Success(event_start..position(reader)?));
                 }
                 return Err(MetadataError::InvalidResponse(format!(
                     "unexpected <Body> child <{}>: expected <{}> or <Fault>",
@@ -278,13 +287,7 @@ fn parse_body(
             Event::Empty(e) => {
                 let local = e.name().local_name();
                 if local.as_ref() == expected_response_local_name.as_bytes() {
-                    let owned = e.into_owned();
-                    let mut buf = Vec::new();
-                    {
-                        let mut writer = Writer::new(&mut buf);
-                        writer.write_event(Event::Empty(owned))?;
-                    }
-                    return Ok(EnvelopeBody::Success(into_utf8(buf)?));
+                    return Ok(EnvelopeBody::Success(event_start..position(reader)?));
                 }
                 return Err(MetadataError::InvalidResponse(format!(
                     "unexpected empty <Body> child <{}/>: expected <{}> or <Fault>",
@@ -300,78 +303,40 @@ fn parse_body(
     }
 }
 
-/// Reinterpret writer output as UTF-8. The writer re-emits slices of an
-/// input that was UTF-8-validated on entry, so this only fails if
-/// `quick-xml` ever hands back a partial code point.
-fn into_utf8(buf: Vec<u8>) -> MetadataResult<String> {
-    String::from_utf8(buf).map_err(|e| {
-        MetadataError::InvalidResponse(format!("response element is not valid UTF-8: {e}"))
-    })
-}
-
-/// Re-emit a complete element (start tag + all children + end tag) into
-/// `out`. `start` is the already-consumed opening tag; the reader is
-/// positioned just inside it.
+/// Advance the reader past the end tag of the element whose start tag it
+/// has just returned, so the caller can read the element's extent off
+/// the reader's offsets.
 ///
 /// Nesting is capped at [`MAX_RESPONSE_DEPTH`] so a pathologically deep
 /// body is rejected here rather than driving unbounded recursion in the
-/// serde deserializer that consumes `out`.
-fn collect_element(
-    reader: &mut Reader<&[u8]>,
-    start: quick_xml::events::BytesStart<'static>,
-    out: &mut Vec<u8>,
-) -> MetadataResult<()> {
-    let mut writer = Writer::new(out);
-    let end = start.to_end().into_owned();
-    writer.write_event(Event::Start(start))?;
+/// serde deserializer that later consumes the element.
+fn skip_element(reader: &mut Reader<&[u8]>) -> MetadataResult<()> {
     let mut depth: i32 = 1;
     loop {
         match reader.read_event()? {
-            Event::Start(e) => {
+            Event::Start(_) => {
                 depth += 1;
                 if depth > MAX_RESPONSE_DEPTH {
                     return Err(MetadataError::InvalidResponse(format!(
                         "response nesting exceeds {MAX_RESPONSE_DEPTH} levels"
                     )));
                 }
-                writer.write_event(Event::Start(e))?;
             }
-            Event::End(e) => {
+            Event::End(_) => {
                 depth -= 1;
                 if depth == 0 {
-                    // Re-emit the captured outer end tag so the
-                    // element name in the output matches the input
-                    // even if the original used a namespace prefix.
-                    writer.write_event(Event::End(end))?;
                     return Ok(());
                 }
-                writer.write_event(Event::End(e))?;
-            }
-            Event::Empty(e) => {
-                writer.write_event(Event::Empty(e))?;
-            }
-            Event::Text(e) => {
-                writer.write_event(Event::Text(e))?;
-            }
-            // Entity/character references (`&amp;`, `&#x30;`, …) arrive
-            // as their own events, not folded into `Text` — dropping
-            // one would silently corrupt the re-emitted element.
-            Event::GeneralRef(e) => {
-                writer.write_event(Event::GeneralRef(e))?;
-            }
-            Event::CData(e) => {
-                writer.write_event(Event::CData(e))?;
-            }
-            Event::Comment(e) => {
-                writer.write_event(Event::Comment(e))?;
             }
             Event::Eof => {
                 return Err(MetadataError::InvalidResponse(
                     "unexpected EOF inside response element".into(),
                 ));
             }
-            // Decl / PI / DocType shouldn't appear inside a SOAP body;
-            // ignore defensively rather than failing.
+            // Text, entity references, CDATA, comments, empty elements:
+            // they are part of the extent and need no handling. A
+            // declaration, PI or doctype shouldn't appear inside a SOAP
+            // body; ignore defensively rather than failing.
             _ => {}
         }
     }
@@ -543,6 +508,15 @@ pub fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
 
+    /// The slice of `xml` that `parse_envelope` locates as the success
+    /// element.
+    fn success_element<'a>(xml: &'a str, expected: &str) -> &'a str {
+        match parse_envelope(xml, expected).unwrap().body {
+            EnvelopeBody::Success(range) => &xml[range],
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
     #[test]
     fn build_envelope_round_trip_shape() {
         let env = build_envelope("TOKEN", "ping", "", "<inner/>");
@@ -607,7 +581,7 @@ mod tests {
         // `DebuggingInfo{debugLog}` as an output header of
         // checkDeployStatus; children carry the default metadata
         // namespace like body content does.
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns="http://soap.sforce.com/2006/04/metadata">
   <soapenv:Header>
     <DebuggingInfo><debugLog>47.0 APEX_CODE,FINE
@@ -618,7 +592,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
   </soapenv:Body>
 </soapenv:Envelope>"#;
         let parsed = parse_envelope(xml, "pingResponse").unwrap();
-        let info = parsed.headers.debugging_info.unwrap();
+        let info = &xml[parsed.headers.debugging_info.unwrap()];
         assert!(info.starts_with("<DebuggingInfo>"), "{info}");
         assert!(info.ends_with("</DebuggingInfo>"), "{info}");
         assert!(
@@ -629,7 +603,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
 
     #[test]
     fn parse_envelope_skips_unknown_header_children() {
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Header>
     <LimitInfoHeader><limitInfo><type>API REQUESTS</type><current>1</current></limitInfo></LimitInfoHeader>
@@ -640,26 +614,29 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
 </soapenv:Envelope>"#;
         let parsed = parse_envelope(xml, "pingResponse").unwrap();
         assert_eq!(
-            parsed.headers.debugging_info.as_deref(),
+            parsed.headers.debugging_info.map(|range| &xml[range]),
             Some("<DebuggingInfo><debugLog>log</debugLog></DebuggingInfo>")
         );
     }
 
     #[test]
     fn parse_envelope_accepts_a_prefixed_debugging_info() {
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="http://soap.sforce.com/2006/04/metadata">
   <soapenv:Header><met:DebuggingInfo><met:debugLog>log</met:debugLog></met:DebuggingInfo></soapenv:Header>
   <soapenv:Body><pingResponse/></soapenv:Body>
 </soapenv:Envelope>"#;
         let parsed = parse_envelope(xml, "pingResponse").unwrap();
-        let info = parsed.headers.debugging_info.unwrap();
-        assert!(info.contains("<met:debugLog>log</met:debugLog>"), "{info}");
+        let info = &xml[parsed.headers.debugging_info.unwrap()];
+        assert_eq!(
+            info,
+            "<met:DebuggingInfo><met:debugLog>log</met:debugLog></met:DebuggingInfo>"
+        );
     }
 
     #[test]
     fn parse_envelope_without_a_header_has_no_debugging_info() {
-        let xml = br#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+        let xml = r#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body><pingResponse/></soapenv:Body>
 </soapenv:Envelope>"#;
         let parsed = parse_envelope(xml, "pingResponse").unwrap();
@@ -668,7 +645,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
 
     #[test]
     fn parse_envelope_reads_headers_of_a_fault_response() {
-        let xml = br#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+        let xml = r#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Header><DebuggingInfo><debugLog>log</debugLog></DebuggingInfo></soapenv:Header>
   <soapenv:Body><soapenv:Fault><faultcode>sf:X</faultcode><faultstring>x</faultstring></soapenv:Fault></soapenv:Body>
 </soapenv:Envelope>"#;
@@ -679,7 +656,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
 
     #[test]
     fn parse_envelope_rejects_a_truncated_header() {
-        let xml = br#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+        let xml = r#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Header><Other><a>"#;
         let err = parse_envelope(xml, "pingResponse").unwrap_err();
         assert!(matches!(err, MetadataError::InvalidResponse(_)));
@@ -697,14 +674,14 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
             xml.push_str("</a>");
         }
         xml.push_str("</Other></Header><Body><pingResponse/></Body></E>");
-        let err = parse_envelope(xml.as_bytes(), "pingResponse").unwrap_err();
+        let err = parse_envelope(&xml, "pingResponse").unwrap_err();
         assert!(matches!(err, MetadataError::InvalidResponse(_)));
         assert!(err.to_string().contains("nesting"));
     }
 
     #[test]
     fn parse_envelope_returns_success_with_wrapper() {
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns="http://soap.sforce.com/2006/04/metadata">
   <soapenv:Body>
     <pingResponse>
@@ -712,21 +689,18 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     </pingResponse>
   </soapenv:Body>
 </soapenv:Envelope>"#;
-        let body = parse_envelope(xml, "pingResponse").unwrap().body;
-        let EnvelopeBody::Success(s) = body else {
-            panic!("expected Success, got {body:?}");
-        };
+        let s = success_element(xml, "pingResponse");
         // The outer wrapper is preserved so callers can deserialize a
         // struct named like the wire element.
-        assert!(s.contains("<pingResponse>"));
-        assert!(s.contains("</pingResponse>"));
-        assert!(s.contains("<result>"));
-        assert!(s.contains("<msg>ok</msg>"));
+        assert_eq!(
+            s,
+            "<pingResponse>\n      <result><msg>ok</msg></result>\n    </pingResponse>"
+        );
     }
 
     #[test]
     fn parse_envelope_returns_fault() {
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <soapenv:Fault>
@@ -749,7 +723,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     fn parse_envelope_ignores_fault_detail_structure() {
         // <detail> contains nested elements; we should still parse
         // faultcode + faultstring correctly.
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <soapenv:Fault>
@@ -778,7 +752,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
         // contains `<`, `>`, or `&`. parse_fault must extract text
         // from both `Event::Text` and `Event::CData` so
         // is_invalid_session() works on real-org fault responses.
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <soapenv:Fault>
@@ -799,7 +773,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
 
     #[test]
     fn parse_envelope_errors_on_unexpected_body_child() {
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">
   <Body><surpriseResponse/></Body>
 </Envelope>"#;
@@ -814,7 +788,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
         // than an Ok with an empty SoapFault — downstream pattern
         // matches depend on truncation being distinguishable from a
         // genuine empty fault.
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <soapenv:Fault>
@@ -827,9 +801,8 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
 
     #[test]
     fn parse_envelope_preserves_nested_response_content() {
-        // Make sure deeply nested success-body content round-trips
-        // through the writer.
-        let xml = br#"<?xml version="1.0"?>
+        // Make sure nested success-body content is located whole.
+        let xml = r#"<?xml version="1.0"?>
 <E xmlns="http://schemas.xmlsoap.org/soap/envelope/">
   <Body>
     <listMetadataResponse>
@@ -838,11 +811,9 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     </listMetadataResponse>
   </Body>
 </E>"#;
-        let body = parse_envelope(xml, "listMetadataResponse").unwrap().body;
-        let EnvelopeBody::Success(s) = body else {
-            panic!("expected Success");
-        };
-        assert!(s.contains("<listMetadataResponse>"));
+        let s = success_element(xml, "listMetadataResponse");
+        assert!(s.starts_with("<listMetadataResponse>"));
+        assert!(s.ends_with("</listMetadataResponse>"));
         assert_eq!(s.matches("<result>").count(), 2);
         assert!(s.contains("<fullName>Foo</fullName>"));
         assert!(s.contains("<fullName>Bar</fullName>"));
@@ -851,11 +822,11 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     #[test]
     fn parse_envelope_preserves_whitespace_around_entities() {
         // quick-xml reports an entity reference as its own event, which
-        // splits the surrounding character data in two. The re-emitted
+        // splits the surrounding character data in two. The located
         // element must carry both halves — spaces included — so a
         // CustomLabel whose value is `Tom & Jerry` doesn't reach the
         // caller as `Tom&Jerry`.
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <E xmlns="http://schemas.xmlsoap.org/soap/envelope/">
   <Body>
     <readMetadataResponse>
@@ -863,10 +834,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     </readMetadataResponse>
   </Body>
 </E>"#;
-        let body = parse_envelope(xml, "readMetadataResponse").unwrap().body;
-        let EnvelopeBody::Success(s) = body else {
-            panic!("expected Success, got {body:?}");
-        };
+        let s = success_element(xml, "readMetadataResponse");
         assert!(
             s.contains("<value>Tom &amp; Jerry</value>"),
             "entity-adjacent whitespace was dropped: {s}"
@@ -882,7 +850,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
         // Pretty-printed faults indent their field content. The
         // surrounding layout must not become part of the value, or
         // `code()` stops matching `INVALID_SESSION_ID`.
-        let xml = br#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <soapenv:Fault>
@@ -925,7 +893,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
         }
         xml.push_str("</describeValueTypeResponse></Body></E>");
 
-        let err = parse_envelope(xml.as_bytes(), "describeValueTypeResponse").unwrap_err();
+        let err = parse_envelope(&xml, "describeValueTypeResponse").unwrap_err();
         assert!(matches!(err, MetadataError::InvalidResponse(_)));
         assert!(err.to_string().contains("nesting"));
     }
@@ -944,10 +912,78 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
         }
         xml.push_str("</describeValueTypeResponse></Body></E>");
 
-        let body = parse_envelope(xml.as_bytes(), "describeValueTypeResponse")
+        let body = parse_envelope(&xml, "describeValueTypeResponse")
             .unwrap()
             .body;
         assert!(matches!(body, EnvelopeBody::Success(_)));
+    }
+
+    #[test]
+    fn parse_envelope_locates_an_empty_response_element() {
+        let xml = r#"<E xmlns="http://schemas.xmlsoap.org/soap/envelope/"><Body>
+  <listMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata"/>
+</Body></E>"#;
+        assert_eq!(
+            success_element(xml, "listMetadataResponse"),
+            r#"<listMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata"/>"#
+        );
+    }
+
+    #[test]
+    fn parse_envelope_locates_a_prefixed_element_with_its_declarations() {
+        let xml = r#"<S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/"><S:Body><ns1:pingResponse xmlns:ns1="http://soap.sforce.com/2006/04/metadata"><ns1:result><!-- c --><ns1:msg><![CDATA[a < b]]></ns1:msg></ns1:result></ns1:pingResponse></S:Body></S:Envelope>"#;
+        assert_eq!(
+            success_element(xml, "pingResponse"),
+            r#"<ns1:pingResponse xmlns:ns1="http://soap.sforce.com/2006/04/metadata"><ns1:result><!-- c --><ns1:msg><![CDATA[a < b]]></ns1:msg></ns1:result></ns1:pingResponse>"#
+        );
+    }
+
+    #[test]
+    fn parse_envelope_ranges_land_on_char_boundaries_after_multibyte_text() {
+        // Offsets are bytes: everything before the element is several
+        // bytes per character, so a character count would slice mid-code
+        // point.
+        let xml = r#"<E xmlns="http://schemas.xmlsoap.org/soap/envelope/"><Header><DebuggingInfo><debugLog>ééé</debugLog></DebuggingInfo></Header>
+<!-- ünïcödé -->
+<Body><pingResponse><result><msg>日本語</msg></result></pingResponse></Body></E>"#;
+        let parsed = parse_envelope(xml, "pingResponse").unwrap();
+        assert_eq!(
+            &xml[parsed.headers.debugging_info.unwrap()],
+            "<DebuggingInfo><debugLog>ééé</debugLog></DebuggingInfo>"
+        );
+        let EnvelopeBody::Success(range) = parsed.body else {
+            panic!("expected Success");
+        };
+        assert_eq!(
+            &xml[range],
+            "<pingResponse><result><msg>日本語</msg></result></pingResponse>"
+        );
+    }
+
+    #[test]
+    fn parse_envelope_range_spans_a_large_element_exactly() {
+        // A response element can hold tens of megabytes of base64, so the
+        // range has to cover the element and nothing around it.
+        let payload = "A".repeat(1 << 20);
+        let xml = format!(
+            r#"<E xmlns="http://schemas.xmlsoap.org/soap/envelope/"><Body><checkRetrieveStatusResponse><result><zipFile>{payload}</zipFile></result></checkRetrieveStatusResponse></Body></E>"#
+        );
+        let EnvelopeBody::Success(range) = parse_envelope(&xml, "checkRetrieveStatusResponse")
+            .unwrap()
+            .body
+        else {
+            panic!("expected Success");
+        };
+        assert_eq!(
+            range.start,
+            xml.find("<checkRetrieveStatusResponse>").unwrap()
+        );
+        assert_eq!(
+            range.end,
+            xml.find("</Body>").unwrap(),
+            "the range ends just past the closing tag"
+        );
+        assert!(range.len() > payload.len());
     }
 }
 
@@ -1080,7 +1116,7 @@ mod property_tests {
   </soapenv:Body>
 </soapenv:Envelope>"#
             );
-            match parse_envelope(envelope.as_bytes(), "anyResponse").map(|parsed| parsed.body) {
+            match parse_envelope(&envelope, "anyResponse").map(|parsed| parsed.body) {
                 Ok(EnvelopeBody::Fault(_)) => {} // expected
                 Ok(EnvelopeBody::Success(_)) => {
                     prop_assert!(false, "Fault body parsed as Success: {body}");
