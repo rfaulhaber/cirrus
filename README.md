@@ -4,11 +4,11 @@ A family of Rust crates for the Salesforce platform. Not affiliated with Salesfo
 
 ## Crates
 
-| Crate                                       | Description                                                                                                                   |
-|---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| [`cirrus`](crates/cirrus/)                  | HTTP client for the Salesforce REST API — sObject CRUD, SOQL/SOSL, Bulk 2.0, composite, Tooling, Apex REST, Event Monitoring. |
-| [`cirrus-auth`](crates/cirrus-auth/)        | Salesforce OAuth 2.0 flows (JWT, Refresh, Client Credentials, Web Server PKCE, Token Exchange) + the `AuthSession` trait.     |
-| [`cirrus-metadata`](crates/cirrus-metadata) | Client for the Salesforce Metadata API (SOAP).                                                                                |
+| Crate                                       | Docs                                       | Description                                                                                                                   |
+|---------------------------------------------|--------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| [`cirrus`](crates/cirrus/)                  | [docs.rs](https://docs.rs/cirrus)          | HTTP client for the Salesforce REST API — sObject CRUD, SOQL/SOSL, Bulk 2.0, composite, Tooling, Apex REST, Event Monitoring. |
+| [`cirrus-auth`](crates/cirrus-auth/)        | [docs.rs](https://docs.rs/cirrus-auth)     | Salesforce OAuth 2.0 flows (JWT, Refresh, Client Credentials, Web Server PKCE, Token Exchange) + the `AuthSession` trait.     |
+| [`cirrus-metadata`](crates/cirrus-metadata) | [docs.rs](https://docs.rs/cirrus-metadata) | Client for the Salesforce Metadata API (SOAP).                                                                                |
 
 Each crate ships and versions independently. They share a workspace so dependency versions, lint config, and tooling stay consistent.
 
