@@ -41,6 +41,13 @@
 //! / [`MAX_CRUD_COMPONENTS_PER_CALL_LARGE`] — passing more returns
 //! [`MetadataError::InvalidArgument`] before hitting the wire.
 //!
+//! ## Atomicity
+//!
+//! `createMetadata`, `updateMetadata`, `upsertMetadata` and
+//! `deleteMetadata` save the components that succeed and report the
+//! rest per entry. [`CrudOptions::all_or_none`], taken by the `_with`
+//! variant of each call, turns that into all-or-nothing.
+//!
 //! [`deploy`]: crate::MetadataClient::deploy
 //! [`retrieve`]: crate::MetadataClient::retrieve
 //! [`MetadataError::InvalidArgument`]: crate::MetadataError::InvalidArgument
@@ -48,6 +55,7 @@
 use crate::MetadataClient;
 use crate::envelope::xml_escape;
 use crate::error::{MetadataError, MetadataResult};
+use crate::headers::render_all_or_none;
 use crate::result::{DeleteResult, SaveResult, UpsertResult};
 use crate::transport::SoapOperation;
 use serde::Deserialize;
@@ -70,6 +78,25 @@ pub const MAX_CRUD_COMPONENTS_PER_CALL: usize = 10;
 /// documented limit is [`MAX_CRUD_COMPONENTS_PER_CALL`] for every
 /// type.
 pub const MAX_CRUD_COMPONENTS_PER_CALL_LARGE: usize = 200;
+
+/// Per-call options for the CRUD writes that accept an
+/// `AllOrNoneHeader`: [`create_metadata_with`], [`update_metadata_with`],
+/// [`upsert_metadata_with`] and [`delete_metadata_with`].
+///
+/// The header is available in API version 34.0 and later. The Metadata
+/// API Developer Guide documents it on its `AllOrNoneHeader` page.
+///
+/// [`create_metadata_with`]: MetadataClient::create_metadata_with
+/// [`update_metadata_with`]: MetadataClient::update_metadata_with
+/// [`upsert_metadata_with`]: MetadataClient::upsert_metadata_with
+/// [`delete_metadata_with`]: MetadataClient::delete_metadata_with
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CrudOptions {
+    /// `false` (the default, and Salesforce's own default) saves the
+    /// records that succeed and reports the others per entry. `true`
+    /// rolls back every change in the call when any record fails.
+    pub all_or_none: bool,
+}
 
 /// One of the five component-array CRUD calls, for resolving the
 /// documented per-call cap and naming the call in errors.
@@ -144,6 +171,16 @@ fn render_type_and_full_names<S: AsRef<str>>(type_name: &str, full_names: &[S], 
     }
 }
 
+/// The `AllOrNoneHeader` for a write, or nothing when the call keeps
+/// Salesforce's default of saving the records that succeed.
+fn render_crud_headers(all_or_none: bool) -> String {
+    let mut out = String::new();
+    if all_or_none {
+        render_all_or_none(&mut out);
+    }
+    out
+}
+
 fn check_component_cap(count: usize, type_name: &str, call: CrudCall) -> MetadataResult<()> {
     let op_label = call.label();
     if count == 0 {
@@ -167,6 +204,7 @@ fn check_component_cap(count: usize, type_name: &str, call: CrudCall) -> Metadat
 struct CreateMetadataOp<'a, S: AsRef<str>> {
     type_name: &'a str,
     components: &'a [S],
+    all_or_none: bool,
 }
 
 #[derive(Deserialize)]
@@ -184,11 +222,16 @@ impl<S: AsRef<str>> SoapOperation for CreateMetadataOp<'_, S> {
         render_metadata_components(self.type_name, self.components, &mut out);
         Ok(out)
     }
+
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(render_crud_headers(self.all_or_none))
+    }
 }
 
 struct UpdateMetadataOp<'a, S: AsRef<str>> {
     type_name: &'a str,
     components: &'a [S],
+    all_or_none: bool,
 }
 
 impl<S: AsRef<str>> SoapOperation for UpdateMetadataOp<'_, S> {
@@ -200,11 +243,16 @@ impl<S: AsRef<str>> SoapOperation for UpdateMetadataOp<'_, S> {
         render_metadata_components(self.type_name, self.components, &mut out);
         Ok(out)
     }
+
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(render_crud_headers(self.all_or_none))
+    }
 }
 
 struct UpsertMetadataOp<'a, S: AsRef<str>> {
     type_name: &'a str,
     components: &'a [S],
+    all_or_none: bool,
 }
 
 #[derive(Deserialize)]
@@ -222,11 +270,16 @@ impl<S: AsRef<str>> SoapOperation for UpsertMetadataOp<'_, S> {
         render_metadata_components(self.type_name, self.components, &mut out);
         Ok(out)
     }
+
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(render_crud_headers(self.all_or_none))
+    }
 }
 
 struct DeleteMetadataOp<'a, S: AsRef<str>> {
     type_name: &'a str,
     full_names: &'a [S],
+    all_or_none: bool,
 }
 
 #[derive(Deserialize)]
@@ -243,6 +296,10 @@ impl<S: AsRef<str>> SoapOperation for DeleteMetadataOp<'_, S> {
         let mut out = String::with_capacity(64 + self.full_names.len() * 64);
         render_type_and_full_names(self.type_name, self.full_names, &mut out);
         Ok(out)
+    }
+
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(render_crud_headers(self.all_or_none))
     }
 }
 
@@ -359,16 +416,30 @@ impl MetadataClient {
     ///
     /// Returns one [`SaveResult`] per component. Partial success is
     /// possible — inspect each entry's `success` field and per-entry
-    /// `errors`.
+    /// `errors`. Use [`Self::create_metadata_with`] with
+    /// [`CrudOptions::all_or_none`] to roll the whole call back instead.
     pub async fn create_metadata<S: AsRef<str>>(
         &self,
         type_name: &str,
         components: &[S],
     ) -> MetadataResult<Vec<SaveResult>> {
+        self.create_metadata_with(type_name, components, CrudOptions::default())
+            .await
+    }
+
+    /// [`Self::create_metadata`] with [`CrudOptions`], such as
+    /// all-or-nothing saving.
+    pub async fn create_metadata_with<S: AsRef<str>>(
+        &self,
+        type_name: &str,
+        components: &[S],
+        options: CrudOptions,
+    ) -> MetadataResult<Vec<SaveResult>> {
         check_component_cap(components.len(), type_name, CrudCall::Create)?;
         let op = CreateMetadataOp {
             type_name,
             components,
+            all_or_none: options.all_or_none,
         };
         let resp = self.call(&op).await?;
         Ok(resp.results)
@@ -378,16 +449,31 @@ impl MetadataClient {
     ///
     /// Same input shape as [`Self::create_metadata`] — each
     /// component's `<fullName>` identifies which existing component
-    /// to update. Returns one [`SaveResult`] per component.
+    /// to update. Returns one [`SaveResult`] per component. Partial
+    /// success is possible; [`Self::update_metadata_with`] with
+    /// [`CrudOptions::all_or_none`] rolls the whole call back instead.
     pub async fn update_metadata<S: AsRef<str>>(
         &self,
         type_name: &str,
         components: &[S],
     ) -> MetadataResult<Vec<SaveResult>> {
+        self.update_metadata_with(type_name, components, CrudOptions::default())
+            .await
+    }
+
+    /// [`Self::update_metadata`] with [`CrudOptions`], such as
+    /// all-or-nothing saving.
+    pub async fn update_metadata_with<S: AsRef<str>>(
+        &self,
+        type_name: &str,
+        components: &[S],
+        options: CrudOptions,
+    ) -> MetadataResult<Vec<SaveResult>> {
         check_component_cap(components.len(), type_name, CrudCall::Update)?;
         let op = UpdateMetadataOp {
             type_name,
             components,
+            all_or_none: options.all_or_none,
         };
         let resp = self.call(&op).await?;
         Ok(resp.results)
@@ -398,16 +484,31 @@ impl MetadataClient {
     /// Same input shape as [`Self::create_metadata`]. The returned
     /// [`UpsertResult::created`] flag distinguishes per-component
     /// inserts (`true`) from updates (`false`). Available in
-    /// API v31+.
+    /// API v31+. Partial success is possible;
+    /// [`Self::upsert_metadata_with`] with [`CrudOptions::all_or_none`]
+    /// rolls the whole call back instead.
     pub async fn upsert_metadata<S: AsRef<str>>(
         &self,
         type_name: &str,
         components: &[S],
     ) -> MetadataResult<Vec<UpsertResult>> {
+        self.upsert_metadata_with(type_name, components, CrudOptions::default())
+            .await
+    }
+
+    /// [`Self::upsert_metadata`] with [`CrudOptions`], such as
+    /// all-or-nothing saving.
+    pub async fn upsert_metadata_with<S: AsRef<str>>(
+        &self,
+        type_name: &str,
+        components: &[S],
+        options: CrudOptions,
+    ) -> MetadataResult<Vec<UpsertResult>> {
         check_component_cap(components.len(), type_name, CrudCall::Upsert)?;
         let op = UpsertMetadataOp {
             type_name,
             components,
+            all_or_none: options.all_or_none,
         };
         let resp = self.call(&op).await?;
         Ok(resp.results)
@@ -416,16 +517,31 @@ impl MetadataClient {
     /// Delete one or more metadata components.
     ///
     /// Returns one [`DeleteResult`] per `full_names` entry. Partial
-    /// success is possible — inspect each entry.
+    /// success is possible — inspect each entry — unless
+    /// [`Self::delete_metadata_with`] sets
+    /// [`CrudOptions::all_or_none`].
     pub async fn delete_metadata<S: AsRef<str>>(
         &self,
         type_name: &str,
         full_names: &[S],
     ) -> MetadataResult<Vec<DeleteResult>> {
+        self.delete_metadata_with(type_name, full_names, CrudOptions::default())
+            .await
+    }
+
+    /// [`Self::delete_metadata`] with [`CrudOptions`], such as
+    /// all-or-nothing deletion.
+    pub async fn delete_metadata_with<S: AsRef<str>>(
+        &self,
+        type_name: &str,
+        full_names: &[S],
+        options: CrudOptions,
+    ) -> MetadataResult<Vec<DeleteResult>> {
         check_component_cap(full_names.len(), type_name, CrudCall::Delete)?;
         let op = DeleteMetadataOp {
             type_name,
             full_names,
+            all_or_none: options.all_or_none,
         };
         let resp = self.call(&op).await?;
         Ok(resp.results)
@@ -529,6 +645,7 @@ mod tests {
         let op = CreateMetadataOp {
             type_name: "ApexClass",
             components: &["<fullName>Foo</fullName>"],
+            all_or_none: false,
         };
         let body = op.render_body().unwrap();
         assert!(body.contains(r#"<met:metadata xsi:type="met:ApexClass""#));
@@ -542,6 +659,7 @@ mod tests {
         let op = CreateMetadataOp {
             type_name: "ApexClass",
             components: &["<fullName>A</fullName>", "<fullName>B</fullName>"],
+            all_or_none: false,
         };
         let body = op.render_body().unwrap();
         assert_eq!(
@@ -577,6 +695,7 @@ mod tests {
         let op = DeleteMetadataOp {
             type_name: "ApexTrigger",
             full_names: &["AccountTrigger"],
+            all_or_none: false,
         };
         let body = op.render_body().unwrap();
         assert_eq!(
@@ -607,10 +726,63 @@ mod tests {
         let op = DeleteMetadataOp {
             type_name: "Weird<>",
             full_names: &["a&b"],
+            all_or_none: false,
         };
         let body = op.render_body().unwrap();
         assert!(body.contains("<met:type>Weird&lt;&gt;</met:type>"));
         assert!(body.contains("<met:fullNames>a&amp;b</met:fullNames>"));
+    }
+
+    #[test]
+    fn write_ops_render_the_all_or_none_header_only_when_asked() {
+        let header =
+            "<met:AllOrNoneHeader><met:allOrNone>true</met:allOrNone></met:AllOrNoneHeader>";
+        let comps = ["<fullName>Foo</fullName>"];
+        for all_or_none in [false, true] {
+            let expected = if all_or_none { header } else { "" };
+            let create = CreateMetadataOp {
+                type_name: "ApexClass",
+                components: &comps,
+                all_or_none,
+            };
+            let update = UpdateMetadataOp {
+                type_name: "ApexClass",
+                components: &comps,
+                all_or_none,
+            };
+            let upsert = UpsertMetadataOp {
+                type_name: "ApexClass",
+                components: &comps,
+                all_or_none,
+            };
+            let delete = DeleteMetadataOp {
+                type_name: "ApexClass",
+                full_names: &["Foo"],
+                all_or_none,
+            };
+            assert_eq!(create.render_headers().unwrap(), expected);
+            assert_eq!(update.render_headers().unwrap(), expected);
+            assert_eq!(upsert.render_headers().unwrap(), expected);
+            assert_eq!(delete.render_headers().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn read_and_rename_ops_render_no_headers() {
+        #[derive(Deserialize)]
+        struct Empty {}
+        let read = ReadMetadataOp::<Empty, _> {
+            type_name: "ApexClass",
+            full_names: &["Foo"],
+            _marker: PhantomData,
+        };
+        let rename = RenameMetadataOp {
+            type_name: "ApexClass",
+            old_full_name: "A",
+            new_full_name: "B",
+        };
+        assert_eq!(read.render_headers().unwrap(), "");
+        assert_eq!(rename.render_headers().unwrap(), "");
     }
 
     #[test]

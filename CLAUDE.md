@@ -32,10 +32,11 @@ Current versions are tracked in each crate's `Cargo.toml`; crates.io is the sour
 
 `cirrus-metadata`:
 - File-based: `deploy`, `check_deploy_status`, `cancel_deploy`, `deploy_recent_validation`, `retrieve`, `check_retrieve_status`, plus `wait_for_deploy` / `wait_for_retrieve` polling helpers and the poll-only `wait_for_retrieve_done`. The helpers return every terminal state as `Ok`; `DeployResult::into_result` / `RetrieveResult::into_result` turn a job that did not succeed into `MetadataError::DeployFailed` / `RetrieveFailed`, which carry the whole result.
-- CRUD-based: `create_metadata`, `read_metadata`, `update_metadata`, `upsert_metadata`, `delete_metadata`, `rename_metadata`. Per Salesforce's contract the cap is 10 components per call; `create`/`update`/`read`/`delete` raise it to 200 for `CustomMetadata` and `CustomApplication`, and `upsert` stays at 10 for every type.
+- CRUD-based: `create_metadata`, `read_metadata`, `update_metadata`, `upsert_metadata`, `delete_metadata`, `rename_metadata`. Per Salesforce's contract the cap is 10 components per call; `create`/`update`/`read`/`delete` raise it to 200 for `CustomMetadata` and `CustomApplication`, and `upsert` stays at 10 for every type. Each of `create`/`update`/`upsert`/`delete` has a `_with` form taking `CrudOptions`; `CrudOptions::all_or_none` sends the `AllOrNoneHeader` so the whole call rolls back when any record fails (API 34.0+; the default stays Salesforce's save-what-succeeds).
 - Utility: `list_metadata`, `describe_metadata`, `describe_value_type`.
+- SOAP headers: `MetadataClientBuilder::call_options_client` sends `CallOptions` on every call the WSDL binds it to (all but `describeValueType`). `deploy_with_debugging` / `deploy_recent_validation_with_debugging` send a `DebuggingHeader` (categories only; the schema-required `debugLevel` goes out nil), and `check_deploy_status_with_debugging` / `wait_for_deploy_with_debugging` return the `DebuggingInfo` log from the response header. A default call's envelope carries only the `SessionHeader`.
 - Typed `package.xml` via `PackageManifest` builder; `MetadataType` ships constants for the common types and `MetadataType::new` names anything else.
-- Open-ended escape hatch (`MetadataClient::request_builder()`), retry policy, and `INVALID_SESSION_ID` auto-refresh against the configured `AuthSession`.
+- Open-ended escape hatch (`MetadataClient::request_builder()`), retry policy, and `INVALID_SESSION_ID` auto-refresh against the configured `AuthSession`. A custom `SoapOperation` adds request headers through `render_headers` (and opts out of the client's `CallOptions` with `ACCEPTS_CALL_OPTIONS = false`), `MetadataClient::call_with_response_headers` returns the response's `DebuggingInfo` header, and `xml_escape` is public for rendering both.
 - Transport contract: same https-or-loopback rule as `cirrus` (shared in `cirrus_auth::transport`), checked at build and on every call since the instance URL is re-read from the session; `MetadataClientBuilder::allow_insecure_transport(true)` is the opt-out. `api_version` must be the bare `XX.X` form. Errors that retain a non-SOAP body are scrubbed of the session id.
 
 Tests: ~585 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s wall). Integration tests against real orgs are `#[ignore]`-gated and live under each crate's `tests/integration/`.
@@ -93,7 +94,7 @@ If you find yourself wanting a fifth, first check whether the existing four woul
 The Metadata API has two surfaces: a small REST slice covering `deployRequest` (in `cirrus::handlers::metadata`) and a much larger SOAP surface for everything else (`retrieve`, `listMetadata`, `describeMetadata`, the CRUD-based calls, etc.). `cirrus-metadata` covers the SOAP surface — SOAP is the canonical Metadata API, not a legacy holdout.
 
 - **Transport core (`transport.rs`):** `SoapOperation` is the trait/dispatch path analogous to `Cirrus::send`. Every typed handler builds a `SoapOperation` and routes through `MetadataClient::call`. Retry + `INVALID_SESSION_ID` refresh wrap the call.
-- **Envelopes (`envelope.rs`):** wraps the operation body with SOAP namespaces, `<SessionHeader>` (the Metadata API expects the bearer token inside the envelope, not on the `Authorization` header — `request_builder()` deliberately does not inject auth), and the action header. Property-tested for XML round-trip safety.
+- **Envelopes (`envelope.rs`):** wraps the operation body with SOAP namespaces, `<SessionHeader>` (the Metadata API expects the bearer token inside the envelope, not on the `Authorization` header — `request_builder()` deliberately does not inject auth), and the action header. Property-tested for XML round-trip safety. Request headers beyond `SessionHeader` come from the client's `CallOptions` and `SoapOperation::render_headers`; the typed header pieces live in `headers.rs`.
 - **Handlers (`handlers/{file_based, crud, utility}.rs`):** add methods directly to `MetadataClient` via inherent `impl` blocks so callers see `md.deploy(...)`, `md.list_metadata(...)`, etc. at the top level — no `.utility()` / `.crud()` accessor pattern.
 - **Package manifests (`package_manifest.rs`):** typed builder for `package.xml`; `MetadataType` carries constants for the ~40 most-commonly-used types and `MetadataType::new` takes any other Salesforce-defined name. Round-trips through `quick-xml`. Used as `RetrieveRequest::unpackaged`.
 - **Caller-supplied metadata bodies:** the 200+ concrete metadata types (`CustomObject`, `ApexClass`, `Flow`, …) are **not** modeled. Callers pass XML strings or `serde`-generic bodies via the `_as::<T>` variants of the CRUD methods. Only platform envelopes are typed.
@@ -161,6 +162,7 @@ cirrus/
         │   ├── lib.rs          # MetadataClient + builder, re-exports
         │   ├── transport.rs    # SoapOperation trait + dispatch
         │   ├── envelope.rs     # SOAP envelope builder
+        │   ├── headers.rs      # CallOptions / AllOrNone / Debugging headers, DebuggingInfo
         │   ├── package_manifest.rs
         │   ├── result.rs       # typed response envelopes
         │   ├── error.rs        # MetadataError / MetadataResult / SoapFault

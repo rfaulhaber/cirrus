@@ -24,8 +24,9 @@
 use bytes::Bytes;
 use cirrus_metadata::auth::StaticTokenAuth;
 use cirrus_metadata::{
-    DeployOptions, DeployProblemType, DeployStatus, MetadataClient, MetadataError, MetadataType,
-    PackageManifest, RetrieveRequest, RetrieveStatus, RetryPolicy, TestLevel, WaitConfig,
+    DebuggingHeader, DeployOptions, DeployProblemType, DeployStatus, LogCategory, LogCategoryLevel,
+    LogInfo, MetadataClient, MetadataError, MetadataType, PackageManifest, RetrieveRequest,
+    RetrieveStatus, RetryPolicy, TestLevel, WaitConfig,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1561,4 +1562,346 @@ async fn wait_for_retrieve_timeout_fires_within_its_budget() {
         elapsed < budget * 2,
         "timeout overshot its budget: {elapsed:?}"
     );
+}
+
+// -- DebuggingHeader / DebuggingInfo -----------------------------------------
+
+fn apex_fine_debugging() -> DebuggingHeader {
+    DebuggingHeader {
+        categories: vec![LogInfo {
+            category: LogCategory::ApexCode,
+            level: LogCategoryLevel::Fine,
+        }],
+    }
+}
+
+/// The wire form of [`apex_fine_debugging`]: `debugLevel` is the
+/// schema-required, doc-deprecated element, sent nil.
+const APEX_FINE_DEBUGGING_HEADER: &str = "<met:DebuggingHeader>\
+     <met:categories><met:category>Apex_code</met:category><met:level>Fine</met:level></met:categories>\
+     <met:debugLevel xsi:nil=\"true\"/>\
+     </met:DebuggingHeader>";
+
+fn deploy_response() -> ResponseTemplate {
+    xml_response(
+        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <deployResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <done>false</done>
+        <id>0Af00000dbg</id>
+        <state>Queued</state>
+      </result>
+    </deployResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+    )
+}
+
+/// Envelope for a checkDeployStatus response; `debug_log` becomes the
+/// `DebuggingInfo` output header when present.
+fn deploy_status_response(done: bool, debug_log: Option<&str>) -> ResponseTemplate {
+    let header = debug_log
+        .map(|log| {
+            format!(
+                "<soapenv:Header><DebuggingInfo><debugLog>{log}</debugLog></DebuggingInfo></soapenv:Header>"
+            )
+        })
+        .unwrap_or_default();
+    let status = if done { "Succeeded" } else { "InProgress" };
+    xml_response(&format!(
+        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  {header}
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000dbg</id>
+        <done>{done}</done>
+        <success>true</success>
+        <status>{status}</status>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+    ))
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_debuggingheader.htm
+/// DebuggingHeader: `categories` is a LogInfo[] ("category", "level");
+/// `debugLevel` is deprecated and "If you provide values for both
+/// debugLevel and categories, the categories value is used"; the
+/// header is supported on deploy().
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl):
+/// `DebuggingHeader{categories: LogInfo minOccurs=0 maxOccurs=unbounded,
+/// debugLevel: LogType}` with `debugLevel` schema-required (no
+/// minOccurs=0); LogCategory `Apex_code` and LogCategoryLevel `Fine`
+/// are enumeration values; bound as an input header of deploy and
+/// deployRecentValidation.
+#[tokio::test]
+async fn deploy_with_debugging_sends_the_header_after_the_session_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:deploy>"))
+        .and(body_string_contains(format!(
+            "</met:SessionHeader>{APEX_FINE_DEBUGGING_HEADER}</soapenv:Header>"
+        )))
+        .respond_with(deploy_response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .deploy_with_debugging(
+            Bytes::from_static(b"PK"),
+            DeployOptions::default(),
+            apex_fine_debugging(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.id, "0Af00000dbg");
+}
+
+#[tokio::test]
+async fn deploy_sends_no_debugging_header() {
+    let server = MockServer::start().await;
+    // Mounted first so a request carrying the header reaches it.
+    Mock::given(method("POST"))
+        .and(body_string_contains("DebuggingHeader"))
+        .respond_with(deploy_response())
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:deploy>"))
+        .respond_with(deploy_response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    md.deploy(Bytes::from_static(b"PK"), DeployOptions::default())
+        .await
+        .unwrap();
+}
+
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl):
+/// deployRecentValidation binds DebuggingHeader as an input header.
+#[tokio::test]
+async fn deploy_recent_validation_with_debugging_sends_the_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:deployRecentValidation>"))
+        .and(body_string_contains(format!(
+            "</met:SessionHeader>{APEX_FINE_DEBUGGING_HEADER}</soapenv:Header>"
+        )))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <deployRecentValidationResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>0Af00000NEWdep</result>
+    </deployRecentValidationResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let id = md
+        .deploy_recent_validation_with_debugging("0Af00000valid", apex_fine_debugging())
+        .await
+        .unwrap();
+    assert_eq!(id, "0Af00000NEWdep");
+}
+
+#[tokio::test]
+async fn deploy_recent_validation_sends_no_debugging_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DebuggingHeader"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:deployRecentValidation>"))
+        .respond_with(xml_response(
+            r#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <deployRecentValidationResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>0Af00000NEWdep</result>
+    </deployRecentValidationResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    md.deploy_recent_validation("0Af00000valid").await.unwrap();
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_debuggingheader.htm
+/// "After the deployment finishes, and if tests were run, the response
+/// of checkDeployStatus() contains the debug log output in the
+/// debugLog field of a DebuggingInfo output header."
+/// SOURCE: API 66.0 Metadata WSDL (sforce.660.metadata.wsdl):
+/// `DebuggingInfo{debugLog: string}`, an output header of
+/// checkDeployStatus.
+#[tokio::test]
+async fn check_deploy_status_with_debugging_returns_the_debug_log() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(deploy_status_response(
+            true,
+            Some("47.0 APEX_CODE,FINE;DB,INFO\nUSER_DEBUG a &amp; b"),
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let (result, info) = md
+        .check_deploy_status_with_debugging("0Af00000dbg", true)
+        .await
+        .unwrap();
+    assert_eq!(result.status, Some(DeployStatus::Succeeded));
+    assert_eq!(
+        info.unwrap().debug_log,
+        "47.0 APEX_CODE,FINE;DB,INFO\nUSER_DEBUG a & b"
+    );
+}
+
+#[tokio::test]
+async fn check_deploy_status_with_debugging_has_no_info_without_the_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response(true, None))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let (result, info) = md
+        .check_deploy_status_with_debugging("0Af00000dbg", false)
+        .await
+        .unwrap();
+    assert!(result.done);
+    assert!(info.is_none());
+}
+
+#[tokio::test]
+async fn check_deploy_status_still_returns_just_the_result() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response(true, Some("log")))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md.check_deploy_status("0Af00000dbg", false).await.unwrap();
+    assert_eq!(result.status, Some(DeployStatus::Succeeded));
+}
+
+/// The debug log of a deploy that ran tests is produced once it has
+/// finished, so the final details fetch is the call whose header the
+/// wait returns.
+#[tokio::test]
+async fn wait_for_deploy_with_debugging_returns_the_info_from_the_details_fetch() {
+    let server = MockServer::start().await;
+    // Mounted first: the details fetch is the only request carrying
+    // includeDetails=true.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeDetails>true</met:includeDetails>",
+        ))
+        .respond_with(deploy_status_response(true, Some("final-log")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeDetails>false</met:includeDetails>",
+        ))
+        .respond_with(deploy_status_response(true, Some("poll-log")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let (result, info) = md
+        .wait_for_deploy_with_debugging("0Af00000dbg", fast_wait())
+        .await
+        .unwrap();
+    assert_eq!(result.status, Some(DeployStatus::Succeeded));
+    assert_eq!(info.unwrap().debug_log, "final-log");
+}
+
+#[tokio::test]
+async fn wait_for_deploy_with_debugging_falls_back_to_the_terminal_polls_info() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeDetails>true</met:includeDetails>",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeDetails>false</met:includeDetails>",
+        ))
+        .respond_with(deploy_status_response(true, Some("poll-log")))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let (result, info) = md
+        .wait_for_deploy_with_debugging("0Af00000dbg", fast_wait())
+        .await
+        .unwrap();
+    assert!(result.details.is_none());
+    assert_eq!(info.unwrap().debug_log, "poll-log");
+}
+
+#[tokio::test]
+async fn wait_for_deploy_with_still_returns_just_the_result() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response(true, Some("log")))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let result = md
+        .wait_for_deploy_with("0Af00000dbg", fast_wait())
+        .await
+        .unwrap();
+    assert_eq!(result.status, Some(DeployStatus::Succeeded));
+}
+
+/// An Apex debug log runs to megabytes; its `Debug` output carries the
+/// length, not the text.
+#[tokio::test]
+async fn debugging_info_debug_output_does_not_grow_with_the_log() {
+    let server = MockServer::start().await;
+    let log = "x".repeat(1024 * 1024);
+    Mock::given(method("POST"))
+        .respond_with(deploy_status_response(true, Some(&log)))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let (_, info) = md
+        .check_deploy_status_with_debugging("0Af00000dbg", false)
+        .await
+        .unwrap();
+    let info = info.unwrap();
+    assert_eq!(info.debug_log.len(), 1024 * 1024);
+    assert!(format!("{info:?}").len() < 128);
 }

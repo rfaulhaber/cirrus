@@ -107,6 +107,9 @@ struct DescribeValueTypeResponseWire {
 
 impl SoapOperation for DescribeValueTypeOp {
     const NAME: &'static str = "describeValueType";
+    // The Metadata WSDL (API 66.0, sforce.660.metadata.wsdl) binds
+    // CallOptions on every operation except this one.
+    const ACCEPTS_CALL_OPTIONS: bool = false;
     // Read-only: safe to replay on ambiguous transport failures.
     const IDEMPOTENT: bool = true;
     type Response = DescribeValueTypeResponseWire;

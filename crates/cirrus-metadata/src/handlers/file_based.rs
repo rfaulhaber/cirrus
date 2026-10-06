@@ -22,6 +22,7 @@
 
 use crate::envelope::xml_escape;
 use crate::error::{MetadataError, MetadataResult};
+use crate::headers::{DebuggingHeader, DebuggingInfo, render_debugging_header};
 use crate::result::{
     AsyncResult, CancelDeployResult, DeployOptions, DeployResult, RetrieveRequest, RetrieveResult,
 };
@@ -39,6 +40,7 @@ use std::time::Duration;
 struct DeployOp {
     zip: Bytes,
     options: DeployOptions,
+    debugging: Option<DebuggingHeader>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +73,10 @@ impl SoapOperation for DeployOp {
         out.push_str(&opts);
         out.push_str("</met:DeployOptions>");
         Ok(out)
+    }
+
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(render_debugging_headers(self.debugging.as_ref()))
     }
 }
 
@@ -136,6 +142,7 @@ impl SoapOperation for CancelDeployOp {
 
 struct DeployRecentValidationOp {
     validation_id: String,
+    debugging: Option<DebuggingHeader>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +161,20 @@ impl SoapOperation for DeployRecentValidationOp {
             xml_escape(&self.validation_id),
         ))
     }
+
+    fn render_headers(&self) -> MetadataResult<String> {
+        Ok(render_debugging_headers(self.debugging.as_ref()))
+    }
+}
+
+/// The `DebuggingHeader` of a deploy call, or nothing when the caller
+/// didn't ask for a debug log.
+fn render_debugging_headers(debugging: Option<&DebuggingHeader>) -> String {
+    let mut out = String::new();
+    if let Some(header) = debugging {
+        render_debugging_header(header, &mut out);
+    }
+    out
 }
 
 struct RetrieveOp {
@@ -373,7 +394,33 @@ impl MetadataClient {
     /// use [`Self::check_deploy_status`] or [`Self::wait_for_deploy`]
     /// to follow its progress.
     pub async fn deploy(&self, zip: Bytes, options: DeployOptions) -> MetadataResult<AsyncResult> {
-        let op = DeployOp { zip, options };
+        let op = DeployOp {
+            zip,
+            options,
+            debugging: None,
+        };
+        let resp = self.call(&op).await?;
+        Ok(resp.result)
+    }
+
+    /// [`Self::deploy`] that also sends a [`DebuggingHeader`], asking
+    /// Salesforce to record an Apex debug log for the deployment.
+    ///
+    /// Once the deployment has finished and ran tests, the log is in the
+    /// `DebuggingInfo` header of the status check — read it with
+    /// [`Self::check_deploy_status_with_debugging`] or
+    /// [`Self::wait_for_deploy_with_debugging`].
+    pub async fn deploy_with_debugging(
+        &self,
+        zip: Bytes,
+        options: DeployOptions,
+        debugging: DebuggingHeader,
+    ) -> MetadataResult<AsyncResult> {
+        let op = DeployOp {
+            zip,
+            options,
+            debugging: Some(debugging),
+        };
         let resp = self.call(&op).await?;
         Ok(resp.result)
     }
@@ -389,12 +436,29 @@ impl MetadataClient {
         deploy_id: &str,
         include_details: bool,
     ) -> MetadataResult<DeployResult> {
+        self.check_deploy_status_with_debugging(deploy_id, include_details)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::check_deploy_status`] that also returns the
+    /// [`DebuggingInfo`] output header.
+    ///
+    /// The Apex debug log is present once the deployment has finished
+    /// and ran tests, and only for a deploy that was sent with a
+    /// [`DebuggingHeader`] (see [`Self::deploy_with_debugging`]);
+    /// otherwise the second element is `None`.
+    pub async fn check_deploy_status_with_debugging(
+        &self,
+        deploy_id: &str,
+        include_details: bool,
+    ) -> MetadataResult<(DeployResult, Option<DebuggingInfo>)> {
         let op = CheckDeployStatusOp {
             async_process_id: deploy_id.to_string(),
             include_details,
         };
-        let resp = self.call(&op).await?;
-        Ok(resp.result)
+        let (resp, headers) = self.call_with_response_headers(&op).await?;
+        Ok((resp.result, headers.debugging_info))
     }
 
     /// Requests cancellation of an in-progress deployment.
@@ -429,6 +493,23 @@ impl MetadataClient {
     pub async fn deploy_recent_validation(&self, validation_id: &str) -> MetadataResult<String> {
         let op = DeployRecentValidationOp {
             validation_id: validation_id.to_string(),
+            debugging: None,
+        };
+        let resp = self.call(&op).await?;
+        Ok(resp.result)
+    }
+
+    /// [`Self::deploy_recent_validation`] that also sends a
+    /// [`DebuggingHeader`]; read the log back with
+    /// [`Self::wait_for_deploy_with_debugging`] on the returned id.
+    pub async fn deploy_recent_validation_with_debugging(
+        &self,
+        validation_id: &str,
+        debugging: DebuggingHeader,
+    ) -> MetadataResult<String> {
+        let op = DeployRecentValidationOp {
+            validation_id: validation_id.to_string(),
+            debugging: Some(debugging),
         };
         let resp = self.call(&op).await?;
         Ok(resp.result)
@@ -523,6 +604,24 @@ impl MetadataClient {
         deploy_id: &str,
         config: WaitConfig,
     ) -> MetadataResult<DeployResult> {
+        self.wait_for_deploy_with_debugging(deploy_id, config)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::wait_for_deploy_with`] that also returns the
+    /// [`DebuggingInfo`] of the deployment; the outcome contract is the
+    /// same.
+    ///
+    /// The log comes from the final `include_details: true` fetch, or
+    /// from the terminal poll when that fetch fails. It is `None`
+    /// unless the deploy was sent with a [`DebuggingHeader`] and ran
+    /// tests.
+    pub async fn wait_for_deploy_with_debugging(
+        &self,
+        deploy_id: &str,
+        config: WaitConfig,
+    ) -> MetadataResult<(DeployResult, Option<DebuggingInfo>)> {
         let start = tokio::time::Instant::now();
         let mut delay = config.initial_delay;
         loop {
@@ -530,13 +629,18 @@ impl MetadataClient {
             // processed component and can balloon into megabytes for
             // large deploys. We fetch the full DeployDetails once after
             // the deploy reaches a terminal state.
-            let result = self.check_deploy_status(deploy_id, false).await?;
+            let (result, info) = self
+                .check_deploy_status_with_debugging(deploy_id, false)
+                .await?;
             if result.done {
                 // The terminal result is already in hand; the details
                 // fetch only enriches it. If the follow-up fails (after
                 // its own retries), return what we have — an error here
                 // would discard a completed deploy's outcome.
-                return match self.check_deploy_status(deploy_id, true).await {
+                return match self
+                    .check_deploy_status_with_debugging(deploy_id, true)
+                    .await
+                {
                     Ok(with_details) => Ok(with_details),
                     Err(e) => {
                         tracing::warn!(
@@ -546,7 +650,7 @@ impl MetadataClient {
                             "deploy reached a terminal state but the details fetch failed; \
                              returning the result without details",
                         );
-                        Ok(result)
+                        Ok((result, info))
                     }
                 };
             }
@@ -716,6 +820,7 @@ mod tests {
         DeployOp {
             zip: Bytes::from_static(zip),
             options,
+            debugging: None,
         }
     }
 
@@ -792,6 +897,7 @@ mod tests {
         let op = DeployOp {
             zip: Bytes::from(zip),
             options: opts,
+            debugging: None,
         };
         let body = op.render_body().unwrap();
 
@@ -816,6 +922,31 @@ mod tests {
         let body = op.render_body().unwrap();
         // Nothing optional is set — DeployOptions body should be empty.
         assert!(body.contains("<met:DeployOptions></met:DeployOptions>"));
+    }
+
+    #[test]
+    fn deploy_ops_render_the_debugging_header_only_when_set() {
+        use crate::headers::{LogCategory, LogCategoryLevel, LogInfo};
+
+        let header = DebuggingHeader {
+            categories: vec![LogInfo {
+                category: LogCategory::ApexCode,
+                level: LogCategoryLevel::Fine,
+            }],
+        };
+        let mut deploy = deploy_op(b"", DeployOptions::default());
+        assert_eq!(deploy.render_headers().unwrap(), "");
+        deploy.debugging = Some(header.clone());
+        let rendered = deploy.render_headers().unwrap();
+        assert!(rendered.starts_with("<met:DebuggingHeader>"), "{rendered}");
+
+        let mut recent = DeployRecentValidationOp {
+            validation_id: "0Af".into(),
+            debugging: None,
+        };
+        assert_eq!(recent.render_headers().unwrap(), "");
+        recent.debugging = Some(header);
+        assert_eq!(recent.render_headers().unwrap(), rendered);
     }
 
     #[test]
