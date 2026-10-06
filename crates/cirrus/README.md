@@ -53,7 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### REST surface
 
-- **sObject CRUD** — `sf.sobject("Account").{create, retrieve, update, delete, upsert}`
+- **sObject CRUD** — `sf.sobject("Account").{create, retrieve, update, delete, upsert}`,
+  plus `retrieve_by_external_id`, `delete_by_external_id` and `upsert_with`
+  (`UpsertOptions { update_only: true }` sends the documented `updateOnly`)
   with typed and untyped variants. Multipart blob upload for `ContentVersion` /
   `Document` / `Attachment`.
 - **SOQL** — `sf.query(...)`, `sf.query_all(...)`, `sf.query_more(...)`. Typed
@@ -163,6 +165,14 @@ target is rejected with `CirrusError::InvalidInput` and no request is sent,
 and `Cirrus::builder().build()` fails outright on an `http://` instance URL.
 `CirrusBuilder::allow_insecure_transport(true)` is the opt-out for a
 deliberate plaintext hop, such as a recording proxy on a trusted network.
+
+The path is sent as written — nothing is percent-encoded — so a value
+interpolated into it has to be encoded first: a raw `#` starts a fragment
+that never reaches Salesforce, `?` starts the query string, and `/` or `%`
+change the path. `sf.versioned_url(&["sobjects", "Product2", "SKU__c", sku])?`
+builds a versioned URL from separate segments, encoding each one and refusing
+an empty segment or a `.`/`..`; `cirrus::encode_path_segment(value)` encodes
+one segment for an instance-rooted or Apex REST path.
 
 Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
 `Sforce-Query-Options`, …) go through `send_with_headers`, which keeps retry,

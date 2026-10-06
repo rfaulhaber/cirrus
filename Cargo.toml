@@ -29,6 +29,7 @@ cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.3.0" }
 reqwest = { version = "0.13", default-features = false, features = ["form", "gzip", "json", "multipart", "query", "rustls", "charset", "system-proxy"] }
 tokio = { version = "1.52", features = ["sync", "time"] }
 url = "2.5"
+percent-encoding = "2.3"
 bytes = "1.11"
 http-serde = "2.1.1"
 httpdate = "1"

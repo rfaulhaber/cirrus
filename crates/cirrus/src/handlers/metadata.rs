@@ -117,7 +117,7 @@ impl MetadataHandler<'_> {
     ) -> CirrusResult<DeployRequest> {
         let url = self
             .client
-            .versioned_segments(&["metadata", "deployRequest", deploy_id])?;
+            .versioned_url(&["metadata", "deployRequest", deploy_id])?;
         if include_details {
             self.client
                 .send_at::<_, _, ()>(
@@ -147,7 +147,7 @@ impl MetadataHandler<'_> {
     pub async fn cancel_deploy(&self, deploy_id: &str) -> CirrusResult<DeployRequest> {
         let url = self
             .client
-            .versioned_segments(&["metadata", "deployRequest", deploy_id])?;
+            .versioned_url(&["metadata", "deployRequest", deploy_id])?;
         let body = CancelBody {
             deploy_result: CancelStatus {
                 status: "Canceling",
@@ -175,7 +175,7 @@ impl MetadataHandler<'_> {
         &self,
         validated_deploy_request_id: &str,
     ) -> CirrusResult<DeployRequest> {
-        let url = self.client.versioned_segments(&[
+        let url = self.client.versioned_url(&[
             "metadata",
             "deployRequest",
             validated_deploy_request_id,

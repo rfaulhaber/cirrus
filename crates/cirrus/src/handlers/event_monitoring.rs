@@ -126,12 +126,9 @@ impl EventMonitoringHandler<'_> {
         // Percent-encode the record ID as its own path segment. `fetch_raw`
         // resolves the resulting fully-qualified URL through passthrough
         // mode, so the encoding is preserved.
-        let url = self.client.versioned_segments(&[
-            "sobjects",
-            "EventLogFile",
-            log_file_id,
-            "LogFile",
-        ])?;
+        let url =
+            self.client
+                .versioned_url(&["sobjects", "EventLogFile", log_file_id, "LogFile"])?;
         let (_headers, bytes) = self
             .client
             .fetch_raw(reqwest::Method::GET, &url, CSV_ACCEPT, None)
@@ -240,11 +237,17 @@ mod tests {
     async fn download_percent_encodes_record_id() {
         // A reserved character in the record ID must be percent-encoded into
         // a single path segment rather than altering the path structure.
+        // wiremock matches on `Url::path()`, which is percent-encoded, so
+        // the exact path pins the encoding and the `[^/]+` anchor fails if
+        // the id is ever split into two segments.
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/sobjects/EventLogFile/0AT%2Fweird%20id/LogFile",
+            ))
             .and(path_regex(
-                r"^/services/data/v66\.0/sobjects/EventLogFile/.+/LogFile$",
+                r"^/services/data/v66\.0/sobjects/EventLogFile/[^/]+/LogFile$",
             ))
             .and(header("accept", "text/csv"))
             .respond_with(ResponseTemplate::new(200).set_body_string("ok"))

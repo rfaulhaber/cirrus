@@ -7,7 +7,8 @@
 //!   [`describe_global`].
 //! - [`SObjectHandler`] (from [`Cirrus::sobject`]): per-object
 //!   operations — describe metadata, retrieve, create, update, delete,
-//!   upsert. Generic over caller-supplied record types: every method that
+//!   and retrieve, upsert and delete by external ID. Generic over
+//!   caller-supplied record types: every method that
 //!   produces a record returns `serde_json::Value` by default, with an
 //!   `_as::<T>()` variant for typed deserialization.
 //!
@@ -95,6 +96,29 @@ impl SObjectsHandler<'_> {
 }
 
 /// Per-object handler. Returned by [`Cirrus::sobject`].
+///
+/// # External IDs
+///
+/// [`retrieve_by_external_id`](Self::retrieve_by_external_id),
+/// [`upsert`](Self::upsert) and
+/// [`delete_by_external_id`](Self::delete_by_external_id) address a
+/// record through `sobjects/{name}/{external_field}/{external_value}`.
+/// The value occupies exactly one path segment and is percent-encoded, so
+/// `/`, `#`, `?`, `%`, `=`, spaces and the like pass safely. An empty
+/// value is refused with [`CirrusError::InvalidInput`] rather than sent,
+/// because the URL it would produce is a different resource.
+///
+/// One documented case no encoding avoids: Salesforce answers 404 for a
+/// value that ends like a file extension it blocks, such as the email
+/// `example@email.inc`, and that 404 reads exactly like the `NOT_FOUND`
+/// for a misspelled external-ID field. The [Upsert] page lists the
+/// workarounds: use a different External ID field, keep a copy of the
+/// value with `_` in place of `.`, query for the record's `Id` first and
+/// address it by id, or move the call to SOAP or to a custom Apex REST
+/// endpoint that takes the value as a query parameter.
+///
+/// [Upsert]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_patch.htm
+/// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
 #[derive(Debug)]
 pub struct SObjectHandler<'a> {
     client: &'a Cirrus,
@@ -120,7 +144,7 @@ impl<'a> SObjectHandler<'a> {
     pub async fn describe_as<R: DeserializeOwned>(&self) -> CirrusResult<R> {
         let url = self
             .client
-            .versioned_segments(&["sobjects", self.name, "describe"])?;
+            .versioned_url(&["sobjects", self.name, "describe"])?;
         self.client
             .send_at(reqwest::Method::GET, &url, None::<&()>, None::<&()>)
             .await
@@ -148,11 +172,11 @@ impl<'a> SObjectHandler<'a> {
         &self,
         since: SystemTime,
     ) -> CirrusResult<Option<R>> {
-        // versioned_segments produces an absolute URL, which the
+        // versioned_url produces an absolute URL, which the
         // three-mode path resolution passes through verbatim.
         let url = self
             .client
-            .versioned_segments(&["sobjects", self.name, "describe"])?;
+            .versioned_url(&["sobjects", self.name, "describe"])?;
         let date = http_date(since)?;
         self.client.get_if_modified_since(&url, &date).await
     }
@@ -167,9 +191,7 @@ impl<'a> SObjectHandler<'a> {
 
     /// Typed variant of [`retrieve`](Self::retrieve).
     pub async fn retrieve_as<R: DeserializeOwned>(&self, id: &str) -> CirrusResult<R> {
-        let url = self
-            .client
-            .versioned_segments(&["sobjects", self.name, id])?;
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         self.client
             .send_at(reqwest::Method::GET, &url, None::<&()>, None::<&()>)
             .await
@@ -189,9 +211,7 @@ impl<'a> SObjectHandler<'a> {
         id: &str,
         fields: &[&str],
     ) -> CirrusResult<R> {
-        let url = self
-            .client
-            .versioned_segments(&["sobjects", self.name, id])?;
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         let joined = fields.join(",");
         let query = [("fields", joined.as_str())];
         self.client
@@ -208,7 +228,7 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self.client.versioned_segments(&["sobjects", self.name])?;
+        let url = self.client.versioned_url(&["sobjects", self.name])?;
         self.client
             .send_at(reqwest::Method::POST, &url, None::<&()>, Some(body))
             .await
@@ -223,9 +243,7 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self
-            .client
-            .versioned_segments(&["sobjects", self.name, id])?;
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         self.client
             .send_at::<(), (), B>(reqwest::Method::PATCH, &url, None, Some(body))
             .await
@@ -236,9 +254,55 @@ impl<'a> SObjectHandler<'a> {
     /// Calls `DELETE /services/data/{api_version}/sobjects/{name}/{id}`.
     /// Salesforce returns 204 No Content on success.
     pub async fn delete(&self, id: &str) -> CirrusResult<()> {
-        let url = self
-            .client
-            .versioned_segments(&["sobjects", self.name, id])?;
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
+        self.client
+            .send_at::<(), (), ()>(reqwest::Method::DELETE, &url, None, None)
+            .await
+    }
+
+    /// Retrieves the record whose `external_field` equals `external_value`,
+    /// returning every field.
+    ///
+    /// Calls
+    /// `GET /services/data/{api_version}/sobjects/{name}/{external_field}/{external_value}`.
+    /// A value no record carries is a 404 [`crate::CirrusError::Api`]. See
+    /// [External IDs](Self#external-ids) for the encoding, and for the one
+    /// documented value shape that answers 404 regardless.
+    pub async fn retrieve_by_external_id(
+        &self,
+        external_field: &str,
+        external_value: &str,
+    ) -> CirrusResult<Value> {
+        self.retrieve_by_external_id_as(external_field, external_value)
+            .await
+    }
+
+    /// Typed variant of
+    /// [`retrieve_by_external_id`](Self::retrieve_by_external_id).
+    pub async fn retrieve_by_external_id_as<R: DeserializeOwned>(
+        &self,
+        external_field: &str,
+        external_value: &str,
+    ) -> CirrusResult<R> {
+        let url = self.external_id_url(external_field, external_value)?;
+        self.client
+            .send_at(reqwest::Method::GET, &url, None::<&()>, None::<&()>)
+            .await
+    }
+
+    /// Deletes the record whose `external_field` equals `external_value`.
+    ///
+    /// Calls
+    /// `DELETE /services/data/{api_version}/sobjects/{name}/{external_field}/{external_value}`.
+    /// Salesforce returns 204 No Content on success; a value no record
+    /// carries is a 404 [`crate::CirrusError::Api`]. See
+    /// [External IDs](Self#external-ids) for the encoding.
+    pub async fn delete_by_external_id(
+        &self,
+        external_field: &str,
+        external_value: &str,
+    ) -> CirrusResult<()> {
+        let url = self.external_id_url(external_field, external_value)?;
         self.client
             .send_at::<(), (), ()>(reqwest::Method::DELETE, &url, None, None)
             .await
@@ -248,11 +312,14 @@ impl<'a> SObjectHandler<'a> {
     /// `external_value` exists, it's updated; otherwise a new record is
     /// created. The `created` flag on the returned
     /// [`SObjectCreateResult`] distinguishes the two outcomes.
+    /// [`upsert_with`](Self::upsert_with) takes an [`UpsertOptions`] to
+    /// forbid the create.
     ///
     /// Calls
     /// `PATCH /services/data/{api_version}/sobjects/{name}/{external_field}/{external_value}`.
     /// `external_value` is percent-encoded, so values containing `/`,
-    /// `=`, or other reserved characters are passed safely.
+    /// `=`, or other reserved characters are passed safely — with the one
+    /// documented exception under [External IDs](Self#external-ids).
     ///
     /// If multiple records match the external ID, Salesforce returns 300
     /// — surfaced as [`crate::CirrusError::Api`].
@@ -265,15 +332,67 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self.client.versioned_segments(&[
-            "sobjects",
-            self.name,
+        self.upsert_with(
             external_field,
             external_value,
-        ])?;
+            body,
+            UpsertOptions::default(),
+        )
+        .await
+    }
+
+    /// [`upsert`](Self::upsert) with [`UpsertOptions`].
+    ///
+    /// With [`update_only`](UpsertOptions::update_only) the request carries
+    /// `updateOnly=true`, which Salesforce documents as forcing "the upsert
+    /// to behave like an update": a value no record carries is then a 404
+    /// [`crate::CirrusError::Api`] instead of a create.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, UpsertOptions, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::json;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // Sync existing Accounts by SKU__c without ever creating one.
+    /// let result = sf
+    ///     .sobject("Account")
+    ///     .upsert_with(
+    ///         "SKU__c",
+    ///         "SKU#1",
+    ///         &json!({ "Name": "Acme" }),
+    ///         UpsertOptions { update_only: true },
+    ///     )
+    ///     .await?;
+    /// assert_eq!(result.created, Some(false));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn upsert_with<B>(
+        &self,
+        external_field: &str,
+        external_value: &str,
+        body: &B,
+        options: UpsertOptions,
+    ) -> CirrusResult<SObjectCreateResult>
+    where
+        B: Serialize + ?Sized,
+    {
+        let url = self.external_id_url(external_field, external_value)?;
+        let query = options.update_only.then_some([("updateOnly", "true")]);
         self.client
-            .send_at(reqwest::Method::PATCH, &url, None::<&()>, Some(body))
+            .send_at(reqwest::Method::PATCH, &url, query.as_ref(), Some(body))
             .await
+    }
+
+    /// The sObject Rows by External ID URL, with the field and the value
+    /// each as one encoded segment.
+    fn external_id_url(&self, external_field: &str, external_value: &str) -> CirrusResult<String> {
+        self.client
+            .versioned_url(&["sobjects", self.name, external_field, external_value])
     }
 
     /// Inserts a new record carrying binary blob data — `ContentVersion`,
@@ -330,7 +449,7 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self.client.versioned_segments(&["sobjects", self.name])?;
+        let url = self.client.versioned_url(&["sobjects", self.name])?;
         let json_bytes =
             serde_json::to_vec(spec.metadata).map_err(crate::error::CirrusError::Serialization)?;
         let content_type = spec.content_type.unwrap_or("application/octet-stream");
@@ -374,9 +493,7 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
-        let url = self
-            .client
-            .versioned_segments(&["sobjects", self.name, id])?;
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         let json_bytes =
             serde_json::to_vec(spec.metadata).map_err(crate::error::CirrusError::Serialization)?;
         let content_type = spec.content_type.unwrap_or("application/octet-stream");
@@ -421,6 +538,28 @@ fn http_date(since: SystemTime) -> CirrusResult<String> {
         ));
     }
     Ok(httpdate::fmt_http_date(since))
+}
+
+/// Options for [`SObjectHandler::upsert_with`].
+///
+/// The default is a plain upsert: a value no record carries creates one.
+///
+/// ```
+/// use cirrus::UpsertOptions;
+///
+/// let never_create = UpsertOptions { update_only: true };
+/// assert!(!UpsertOptions::default().update_only);
+/// # let _ = never_create;
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpsertOptions {
+    /// Sends `updateOnly=true`, documented on the [Upsert] page as "an
+    /// optional parameter that prevents a new record from being created.
+    /// Forces the upsert to behave like an update". A value no record
+    /// carries is then a 404 instead of a create.
+    ///
+    /// [Upsert]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_patch.htm
+    pub update_only: bool,
 }
 
 /// Specification for a multipart blob upload via
@@ -499,8 +638,8 @@ impl<B: ?Sized> std::fmt::Debug for BlobUploadSpec<'_, B> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use crate::Cirrus;
     use crate::auth::StaticTokenAuth;
+    use crate::{Cirrus, CirrusError, UpsertOptions};
     use serde_json::json;
     use std::sync::Arc;
     use wiremock::matchers::{body_json, header, method, path, path_regex, query_param};
@@ -683,6 +822,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retrieve_refuses_an_empty_id_without_a_request() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_basic_info_get.htm
+        // "URI: /services/data/vXX.X/sobjects/sObject/" — the URL an
+        // empty id would produce is the sObject Basic Information
+        // resource, whose 200 body would be returned as the "record".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "objectDescribe": {"name": "Account"},
+                "recentItems": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf.sobject("Account").retrieve("").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CirrusError::InvalidInput {
+                    field: "path segment",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        let err = sf
+            .sobject("Account")
+            .retrieve_with_fields("", &["Name"])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CirrusError::InvalidInput { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_patches_to_external_id_path() {
         let server = MockServer::start().await;
 
@@ -746,6 +924,180 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.created, Some(false));
+    }
+
+    #[tokio::test]
+    async fn retrieve_by_external_id_gets_the_encoded_external_id_path() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_get.htm
+        // "Retrieves a record based on the value of the specified external
+        // ID field. URI: /services/data/vXX.X/sobjects/sObject/fieldName/fieldValue
+        // HTTP Method: GET". The value is one path segment, so a `#` in it
+        // has to arrive as `%23` or the request is for `.../SKU__c/SKU`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Product2/SKU__c/SKU%231",
+            ))
+            .and(path_regex(
+                r"^/services/data/v66\.0/sobjects/Product2/SKU__c/[^/]+$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "attributes": {
+                    "type": "Product2",
+                    "url": "/services/data/v66.0/sobjects/Product2/01txx0000000001"
+                },
+                "Id": "01txx0000000001",
+                "SKU__c": "SKU#1",
+                "Name": "Widget"
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let record = sf
+            .sobject("Product2")
+            .retrieve_by_external_id("SKU__c", "SKU#1")
+            .await
+            .unwrap();
+        assert_eq!(record["Id"], "01txx0000000001");
+
+        #[derive(serde::Deserialize)]
+        struct Product {
+            #[serde(rename = "Name")]
+            name: String,
+        }
+        let typed: Product = sf
+            .sobject("Product2")
+            .retrieve_by_external_id_as("SKU__c", "SKU#1")
+            .await
+            .unwrap();
+        assert_eq!(typed.name, "Widget");
+    }
+
+    #[tokio::test]
+    async fn delete_by_external_id_deletes_the_encoded_external_id_path() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_delete.htm
+        // "Deletes a record based on the value of the specified external ID
+        // field. URI: /services/data/vXX.X/sobjects/sObject/fieldName/fieldValue
+        // HTTP Method: DELETE". Unencoded, `SKU#1` would delete the record
+        // whose SKU is `SKU`.
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Product2/SKU__c/SKU%231",
+            ))
+            .and(path_regex(
+                r"^/services/data/v66\.0/sobjects/Product2/SKU__c/[^/]+$",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.sobject("Product2")
+            .delete_by_external_id("SKU__c", "SKU#1")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn by_external_id_refuses_an_empty_value_without_a_request() {
+        // `sobjects/Product2/SKU__c/` is the sObject Rows resource with
+        // `SKU__c` read as a record id, not a lookup by external ID.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .sobject("Product2")
+            .retrieve_by_external_id("SKU__c", "")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CirrusError::InvalidInput { .. }),
+            "got {err:?}"
+        );
+        let err = sf
+            .sobject("Product2")
+            .delete_by_external_id("SKU__c", "")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CirrusError::InvalidInput { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_update_only_sends_the_query_parameter_on_the_encoded_path() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_patch.htm
+        // "updateOnly: An optional parameter that prevents a new record from
+        // being created. Forces the upsert to behave like an update when
+        // updateOnly=true is used." The example URL on dome_upsert is
+        // .../sobjects/Account/customExtIdField__c/11999?updateOnly=true.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/services/data/v66.0/sobjects/Account/Ext__c/A%231"))
+            .and(query_param("updateOnly", "true"))
+            .and(body_json(json!({"Name": "Acme"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "001xx0000000001",
+                "success": true,
+                "errors": [],
+                "created": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let result = sf
+            .sobject("Account")
+            .upsert_with(
+                "Ext__c",
+                "A#1",
+                &json!({"Name": "Acme"}),
+                UpsertOptions { update_only: true },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.created, Some(false));
+    }
+
+    #[tokio::test]
+    async fn upsert_without_options_sends_no_query_string() {
+        // The default upsert must not carry `updateOnly=false` or any
+        // other parameter the plain PATCH page doesn't show.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/services/data/v66.0/sobjects/Account/Ext__c/A-1"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "001xx0000000001",
+                "success": true,
+                "errors": [],
+                "created": true
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.sobject("Account")
+            .upsert("Ext__c", "A-1", &json!({"Name": "Acme"}))
+            .await
+            .unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.query(), None, "url was {}", received[0].url);
     }
 
     #[tokio::test]

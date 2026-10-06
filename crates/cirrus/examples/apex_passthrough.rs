@@ -39,8 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // POST /services/apexrest/Hello with a JSON body, expecting a
     // {"greeting": "..."} response. Path normalization accepts both
-    // "Hello" and "/Hello" — segments after the leading word pass
-    // through verbatim (e.g. "Hello/{name}").
+    // "Hello" and "/Hello". The path is sent as written, so a segment
+    // built from data is encoded first:
+    // format!("Hello/{}", cirrus::encode_path_segment(name)).
     let req = Request {
         name: "world".into(),
     };
