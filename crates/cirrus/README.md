@@ -2,6 +2,8 @@
 
 An ergonomic Rust HTTP client for the Salesforce REST API.
 
+API reference: [docs.rs/cirrus](https://docs.rs/cirrus)
+
 This project is in no way affiliated with Salesforce.
 
 `cirrus` is a strongly-typed, async-first client built on `reqwest` and

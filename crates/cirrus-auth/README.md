@@ -2,6 +2,8 @@
 
 Salesforce OAuth 2.0 authentication flows for the Cirrus SDK.
 
+API reference: [docs.rs/cirrus-auth](https://docs.rs/cirrus-auth)
+
 This project is in no way affiliated with Salesforce.
 
 `cirrus-auth` ships the authentication layer for the

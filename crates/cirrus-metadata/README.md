@@ -2,6 +2,8 @@
 
 Salesforce Metadata API (SOAP) client for the Cirrus SDK.
 
+API reference: [docs.rs/cirrus-metadata](https://docs.rs/cirrus-metadata)
+
 This project is in no way affiliated with Salesforce.
 
 `cirrus-metadata` is the SOAP-Metadata-API sibling of
