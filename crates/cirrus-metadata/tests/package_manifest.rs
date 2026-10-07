@@ -27,14 +27,14 @@ fn to_xml_is_well_formed_and_parses() {
     let mut saw_version = false;
     let mut type_names = Vec::new();
     let mut members = Vec::new();
-    let mut current_tag: Option<Vec<u8>> = None;
+    let mut current_tag: Option<String> = None;
 
     loop {
         match reader.read_event().unwrap() {
             Event::Start(e) => {
                 depth += 1;
-                let local = e.name().local_name().as_ref().to_vec();
-                if local == b"Package" {
+                let local = e.name().local_name().as_ref().to_string();
+                if local == "Package" {
                     saw_package = true;
                 }
                 current_tag = Some(local);
@@ -45,12 +45,12 @@ fn to_xml_is_well_formed_and_parses() {
             }
             Event::Text(t) => {
                 if let Some(tag) = &current_tag {
-                    let text = unescape(&t.decode().unwrap()).unwrap().into_owned();
-                    if tag == b"name" {
+                    let text = unescape(&t).unwrap().into_owned();
+                    if tag == "name" {
                         type_names.push(text);
-                    } else if tag == b"members" {
+                    } else if tag == "members" {
                         members.push(text);
-                    } else if tag == b"version" {
+                    } else if tag == "version" {
                         assert_eq!(text, "66.0");
                         saw_version = true;
                     }
@@ -122,7 +122,7 @@ fn packaged_manifest_emits_full_name_before_types() {
     loop {
         match reader.read_event().unwrap() {
             Event::Start(e) => {
-                let local = e.name().local_name().as_ref().to_vec();
+                let local = e.name().local_name().as_ref().to_string();
                 element_order.push(local);
             }
             Event::Eof => break,
@@ -130,9 +130,9 @@ fn packaged_manifest_emits_full_name_before_types() {
         }
     }
     // Find positions of <fullName>, <types>, <version> at top level.
-    let i_full = element_order.iter().position(|t| t == b"fullName").unwrap();
-    let i_types = element_order.iter().position(|t| t == b"types").unwrap();
-    let i_version = element_order.iter().position(|t| t == b"version").unwrap();
+    let i_full = element_order.iter().position(|t| t == "fullName").unwrap();
+    let i_types = element_order.iter().position(|t| t == "types").unwrap();
+    let i_version = element_order.iter().position(|t| t == "version").unwrap();
     assert!(i_full < i_types);
     assert!(i_types < i_version);
 }
@@ -161,20 +161,20 @@ fn wildcard_and_named_members_render_as_separate_types_blocks() {
     let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
     let mut members: Vec<String> = Vec::new();
     let mut name: Option<String> = None;
-    let mut current_tag: Option<Vec<u8>> = None;
+    let mut current_tag: Option<String> = None;
     loop {
         match reader.read_event().unwrap() {
-            Event::Start(e) => current_tag = Some(e.name().local_name().as_ref().to_vec()),
+            Event::Start(e) => current_tag = Some(e.name().local_name().as_ref().to_string()),
             Event::Text(t) => {
-                let text = unescape(&t.decode().unwrap()).unwrap().into_owned();
+                let text = unescape(&t).unwrap().into_owned();
                 match current_tag.as_deref() {
-                    Some(b"members") => members.push(text),
-                    Some(b"name") => name = Some(text),
+                    Some("members") => members.push(text),
+                    Some("name") => name = Some(text),
                     _ => {}
                 }
             }
             Event::End(e) => {
-                if e.name().local_name().as_ref() == b"types" {
+                if e.name().local_name().as_ref() == "types" {
                     blocks.push((name.take().unwrap(), std::mem::take(&mut members)));
                 }
                 current_tag = None;

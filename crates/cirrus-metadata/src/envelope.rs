@@ -192,10 +192,10 @@ pub(crate) fn parse_envelope(
     // Walk until we enter <Body>.
     loop {
         match reader.read_event()? {
-            Event::Start(e) if e.name().local_name().as_ref() == b"Header" => {
+            Event::Start(e) if e.name().local_name().as_ref() == "Header" => {
                 headers = parse_header(&mut reader)?;
             }
-            Event::Start(e) if e.name().local_name().as_ref() == b"Body" => {
+            Event::Start(e) if e.name().local_name().as_ref() == "Body" => {
                 let body = parse_body(&mut reader, expected_response_local_name)?;
                 return Ok(ParsedEnvelope { headers, body });
             }
@@ -229,7 +229,7 @@ fn parse_header(reader: &mut Reader<&[u8]>) -> MetadataResult<ResponseHeaders> {
         let event_start = position(reader)?;
         match reader.read_event()? {
             Event::Start(e) => {
-                if skipped_depth == 0 && e.name().local_name().as_ref() == b"DebuggingInfo" {
+                if skipped_depth == 0 && e.name().local_name().as_ref() == "DebuggingInfo" {
                     skip_element(reader)?;
                     headers.debugging_info = Some(event_start..position(reader)?);
                 } else {
@@ -266,16 +266,16 @@ fn parse_body(
         match reader.read_event()? {
             Event::Start(e) => {
                 let local = e.name().local_name();
-                if local.as_ref() == b"Fault" {
+                if local.as_ref() == "Fault" {
                     return parse_fault(reader).map(EnvelopeBody::Fault);
                 }
-                if local.as_ref() == expected_response_local_name.as_bytes() {
+                if local.as_ref() == expected_response_local_name {
                     skip_element(reader)?;
                     return Ok(EnvelopeBody::Success(event_start..position(reader)?));
                 }
                 return Err(MetadataError::InvalidResponse(format!(
                     "unexpected <Body> child <{}>: expected <{}> or <Fault>",
-                    String::from_utf8_lossy(local.as_ref()),
+                    local.as_ref(),
                     expected_response_local_name,
                 )));
             }
@@ -286,12 +286,12 @@ fn parse_body(
             // other empty element is an unexpected child.
             Event::Empty(e) => {
                 let local = e.name().local_name();
-                if local.as_ref() == expected_response_local_name.as_bytes() {
+                if local.as_ref() == expected_response_local_name {
                     return Ok(EnvelopeBody::Success(event_start..position(reader)?));
                 }
                 return Err(MetadataError::InvalidResponse(format!(
                     "unexpected empty <Body> child <{}/>: expected <{}> or <Fault>",
-                    String::from_utf8_lossy(local.as_ref()),
+                    local.as_ref(),
                     expected_response_local_name,
                 )));
             }
@@ -368,8 +368,8 @@ fn parse_fault(reader: &mut Reader<&[u8]>) -> MetadataResult<SoapFault> {
                 depth += 1;
                 if depth == 2 {
                     field = match e.name().local_name().as_ref() {
-                        b"faultcode" => Some(Field::Code),
-                        b"faultstring" => Some(Field::String_),
+                        "faultcode" => Some(Field::Code),
+                        "faultstring" => Some(Field::String_),
                         _ => None,
                     };
                     if field.is_some() {
@@ -389,21 +389,15 @@ fn parse_fault(reader: &mut Reader<&[u8]>) -> MetadataResult<SoapFault> {
                 }
             }
             // Salesforce wraps faultstring in CDATA when the message
-            // contains XML metacharacters (`<`, `>`, `&`). CDATA bytes
-            // are already raw — no entity unescape needed.
+            // contains XML metacharacters (`<`, `>`, `&`). CDATA content
+            // is already raw — no entity unescape needed.
             Event::CData(c) => {
                 if depth == tracked_child_depth
                     && let Some(f) = field
                 {
-                    let bytes = c.into_inner();
-                    let s = std::str::from_utf8(&bytes).map_err(|e| {
-                        MetadataError::InvalidResponse(format!(
-                            "<Fault> CDATA contained invalid UTF-8: {e}"
-                        ))
-                    })?;
                     match f {
-                        Field::Code => faultcode.push_str(s),
-                        Field::String_ => faultstring.push_str(s),
+                        Field::Code => faultcode.push_str(&c),
+                        Field::String_ => faultstring.push_str(&c),
                     }
                 }
             }
@@ -450,12 +444,9 @@ fn parse_fault(reader: &mut Reader<&[u8]>) -> MetadataResult<SoapFault> {
 }
 
 fn unescape_text(t: &BytesText<'_>) -> MetadataResult<String> {
-    // The reader yields Text events still entity-escaped: `decode`
-    // only handles the byte encoding, `unescape` resolves entities.
-    let decoded = t.decode().map_err(quick_xml::Error::from)?;
-    Ok(unescape(&decoded)
-        .map_err(quick_xml::Error::from)?
-        .into_owned())
+    // The reader yields Text events as they appear in the source, so
+    // `unescape` resolves any entities they still carry.
+    Ok(unescape(t).map_err(quick_xml::Error::from)?.into_owned())
 }
 
 /// Resolve a `GeneralRef` event (`&lt;`, `&#x30;`, …) to its textual
@@ -463,7 +454,7 @@ fn unescape_text(t: &BytesText<'_>) -> MetadataResult<String> {
 /// re-wrap it and let `unescape` handle both predefined entities and
 /// numeric character references.
 fn resolve_ref(r: &BytesRef<'_>) -> MetadataResult<String> {
-    let name = r.decode().map_err(quick_xml::Error::from)?;
+    let name: &str = r;
     Ok(unescape(&format!("&{name};"))
         .map_err(quick_xml::Error::from)?
         .into_owned())
@@ -1038,7 +1029,7 @@ mod property_tests {
             loop {
                 match reader.read_event() {
                     Ok(quick_xml::events::Event::Text(t)) => {
-                        got.push_str(&unescape(&t.decode().unwrap()).unwrap());
+                        got.push_str(&unescape(&t).unwrap());
                     }
                     Ok(quick_xml::events::Event::GeneralRef(r)) => {
                         got.push_str(&resolve_ref(&r).unwrap());
