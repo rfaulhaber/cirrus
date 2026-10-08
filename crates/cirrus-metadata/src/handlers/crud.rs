@@ -28,7 +28,11 @@
 //! as the default, so callers can write naked element names —
 //! `<fullName>Foo</fullName>` rather than
 //! `<met:fullName>Foo</met:fullName>`. Both forms work; the naked
-//! form is more readable for hand-built XML.
+//! form is more readable for hand-built XML. The envelope also binds
+//! the `xsi` and `xsd` prefixes, so inner XML pasted from a
+//! `-meta.xml` file keeps working: a CustomMetadata value such as
+//! `<value xsi:type="xsd:boolean">false</value>` needs no namespace
+//! declaration of its own.
 //!
 //! ## Per-call component cap
 //!
@@ -396,7 +400,10 @@ impl MetadataClient {
     /// SDK wraps each in `<metadata xsi:type="met:{type_name}">…</metadata>`
     /// and handles the SOAP envelope. Inside the wrapper, the
     /// metadata namespace is the default, so caller XML can use bare
-    /// element names like `<fullName>Foo</fullName>`.
+    /// element names like `<fullName>Foo</fullName>`; the `xsi` and
+    /// `xsd` prefixes are bound on the envelope, so typed values such
+    /// as `<value xsi:type="xsd:boolean">false</value>` work as pasted
+    /// from a `-meta.xml` file.
     ///
     /// ```no_run
     /// # use cirrus_metadata::{MetadataClient, SaveResult, MetadataError};

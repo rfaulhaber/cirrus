@@ -197,6 +197,51 @@ async fn crud_calls_take_a_metadata_type_for_the_type_name() {
     assert_eq!(records[0].label.as_deref(), Some("Default"));
 }
 
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_custommetadata.htm
+/// Every CustomMetadata sample types its values with the `xsd` prefix,
+/// `<value xsi:type="xsd:boolean">false</value>`, declaring
+/// `xmlns:xsd` on the root the CRUD caller strips away. The envelope
+/// binds both `xsi` and `xsd` so the pasted inner XML resolves.
+#[tokio::test]
+async fn create_metadata_envelope_binds_the_xsd_prefix_for_typed_values() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance""#,
+        ))
+        .and(body_string_contains(
+            r#"xmlns:xsd="http://www.w3.org/2001/XMLSchema""#,
+        ))
+        .and(body_string_contains(
+            r#"<value xsi:type="xsd:boolean">false</value>"#,
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <createMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <fullName>Settings.Default</fullName>
+        <success>true</success>
+      </result>
+    </createMetadataResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let record = r#"<fullName>Settings.Default</fullName><label>Default</label>
+        <values><field>Enabled__c</field><value xsi:type="xsd:boolean">false</value></values>"#;
+    let results = md
+        .create_metadata(MetadataType::CUSTOM_METADATA, &[record])
+        .await
+        .unwrap();
+    assert!(results[0].success);
+}
+
 /// An empty component array has nothing to save, so it is rejected
 /// before an envelope is built rather than spending a round trip.
 #[tokio::test]
