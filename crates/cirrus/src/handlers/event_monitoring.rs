@@ -71,8 +71,20 @@
 
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
+use crate::locator::{self, Segment};
 
 const CSV_ACCEPT: &str = "text/csv";
+
+/// The one documented shape of an EventLogFile `LogFile` value.
+const LOG_FILE: &[&[Segment]] = &[&[
+    Segment::Literal("services"),
+    Segment::Literal("data"),
+    Segment::Version,
+    Segment::Literal("sobjects"),
+    Segment::Literal("EventLogFile"),
+    Segment::Value,
+    Segment::Literal("LogFile"),
+]];
 
 impl Cirrus {
     /// Returns a handler for Event Monitoring (`EventLogFile`) log-file
@@ -149,11 +161,14 @@ impl EventMonitoringHandler<'_> {
     /// # Errors
     ///
     /// A fully-qualified URL is accepted only when its origin matches
-    /// the session's instance URL. Anything else returns
-    /// [`CirrusError::InvalidResponse`] without issuing a request:
-    /// downloads are bearer-authenticated, and `log_file_url` is a
-    /// server-supplied value, so following it to another host would
-    /// hand the org's access token to that host.
+    /// the session's instance URL, and only the documented
+    /// `sobjects/EventLogFile/{id}/LogFile` path is sent. Anything else
+    /// returns [`CirrusError::InvalidResponse`] without issuing a
+    /// request: downloads are bearer-authenticated, and `log_file_url`
+    /// is a server-supplied value that callers store and replay, so
+    /// following it to another host would hand the org's access token
+    /// to that host, and following it to another resource would fetch
+    /// that resource as the integration user.
     ///
     /// [`EventLogFileRecord`]: crate::EventLogFileRecord
     /// [`CirrusError::InvalidResponse`]: crate::CirrusError::InvalidResponse
@@ -166,32 +181,13 @@ impl EventMonitoringHandler<'_> {
         Ok(bytes)
     }
 
-    /// Normalizes a `LogFile` value into something that resolves against
-    /// this session's instance, rejecting any absolute URL that points
-    /// somewhere else.
+    /// Normalizes a `LogFile` value into the instance-rooted path it
+    /// names, rejecting an absolute URL on another host and any path
+    /// that is not the documented `LogFile` resource.
     fn instance_rooted(&self, log_file_url: &str) -> CirrusResult<String> {
-        if !(log_file_url.starts_with("http://") || log_file_url.starts_with("https://")) {
-            // Bare paths are normalized the way query_more does, so
-            // callers can pass the LogFile field straight through
-            // whether or not it has a leading slash.
-            return Ok(if log_file_url.starts_with('/') {
-                log_file_url.to_string()
-            } else {
-                format!("/{log_file_url}")
-            });
-        }
-
-        let candidate = url::Url::parse(log_file_url)?;
-        let instance = url::Url::parse(self.client.auth().instance_url())?;
-        if candidate.origin() == instance.origin() {
-            Ok(log_file_url.to_string())
-        } else {
-            Err(CirrusError::InvalidResponse(format!(
-                "EventLogFile LogFile URL points at {}, not the org instance {}",
-                candidate.origin().ascii_serialization(),
-                instance.origin().ascii_serialization(),
-            )))
-        }
+        locator::confine(self.client.auth().instance_url(), log_file_url, LOG_FILE).map_err(
+            |message| CirrusError::InvalidResponse(format!("EventLogFile LogFile URL {message}")),
+        )
     }
 }
 
@@ -347,6 +343,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CirrusError::InvalidResponse(_)), "{err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_url_refuses_a_value_naming_another_resource() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_event_log_file_query.htm
+        // Every documented LogFile value is
+        // `/services/data/vXX.X/sobjects/EventLogFile/{id}/LogFile`. A
+        // value that reaches this method from storage or a client is
+        // confined to that shape, so it cannot be turned into a bearer-
+        // authenticated GET of any other resource.
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        for value in [
+            "/services/data/v66.0/query?q=SELECT+Id+FROM+Contact",
+            "/services/data/v66.0/tooling/executeAnonymous/?anonymousBody=System.debug(1);",
+            "/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile?x=1",
+            "/services/data/v66.0/sobjects/Contact/003xx",
+            "/services/data/v66.0/sobjects/EventLogFile/../Contact/003xx/LogFile",
+            "/services/data/v66.0/sobjects/EventLogFile//LogFile",
+        ] {
+            let err = sf.event_monitoring().download_url(value).await.unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidResponse(_)),
+                "{value}: {err:?}"
+            );
+        }
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 

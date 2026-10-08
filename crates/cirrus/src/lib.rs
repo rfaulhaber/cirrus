@@ -44,6 +44,7 @@
 
 mod error;
 pub mod handlers;
+mod locator;
 pub mod pagination;
 mod response;
 pub mod retry;
@@ -1556,17 +1557,7 @@ fn check_transport_security(
 /// `/services/data/66.0/query` and every call would come back as a
 /// generic `NOT_FOUND` that never mentions the version.
 fn validate_api_version(version: &str) -> CirrusResult<()> {
-    let numeric = version.strip_prefix('v').and_then(|v| v.split_once('.'));
-    let well_formed = match numeric {
-        Some((major, minor)) => {
-            !major.is_empty()
-                && !minor.is_empty()
-                && major.bytes().all(|b| b.is_ascii_digit())
-                && minor.bytes().all(|b| b.is_ascii_digit())
-        }
-        None => false,
-    };
-    if version == "latest" || well_formed {
+    if version == "latest" || locator::is_api_version_segment(version) {
         return Ok(());
     }
     Err(CirrusError::InvalidInput {
@@ -3296,8 +3287,11 @@ mod property_tests {
         }
 
         /// Fully-qualified URLs pass through `resolve_url` unchanged.
-        /// This is the locator-passthrough contract (`nextRecordsUrl`,
-        /// Bulk 2.0 result locators).
+        /// This is the contract behind `versioned_url` and a caller's
+        /// own absolute URL on the verbs; locators (`nextRecordsUrl`,
+        /// the EventLogFile `LogFile` path) are confined by
+        /// `crate::locator` to an instance-rooted path before they reach
+        /// it, and Bulk 2.0 result locators are query parameters.
         #[test]
         fn resolve_url_passes_through_absolute_urls(host in "[a-z0-9-]{1,20}", path in path_segment()) {
             let sf = fixture("https://my.salesforce.com");
