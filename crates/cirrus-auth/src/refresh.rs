@@ -278,11 +278,7 @@ impl MintConfig {
 
         check_instance_url(&self.instance_url, &token)?;
 
-        let expires_at = token.cache_expiry(self.token_ttl);
-        Ok(CachedToken {
-            access_token: token.access_token,
-            expires_at,
-        })
+        Ok(CachedToken::from_response(token, self.token_ttl))
     }
 }
 
@@ -442,6 +438,14 @@ impl RefreshTokenAuthBuilder {
     /// re-minting. Defaults to 30 minutes. Raising it does not extend a
     /// token past a shorter `expires_in` advertised by the token
     /// endpoint, which always wins.
+    ///
+    /// A token is re-minted ahead of that bound by a refresh margin of
+    /// 60 seconds, or half the TTL when the TTL is under two minutes, so
+    /// a 30-second TTL caches for 15 seconds rather than for nothing.
+    /// `Duration::ZERO` disables caching and mints (and, under rotation,
+    /// rotates the refresh token) on every call; `Duration::MAX` keeps
+    /// the token until [`invalidate`](crate::AuthSession::invalidate)
+    /// clears it.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.token_ttl = Some(ttl);
         self
@@ -772,12 +776,15 @@ mod tests {
 
     #[tokio::test]
     async fn transient_failure_inside_the_margin_falls_back_to_the_cached_token() {
+        // An advertised lifetime shorter than the refresh margin puts the
+        // cached token inside the margin the moment it is minted.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "00DXX!FIRST",
                 "instance_url": "https://my-org.my.salesforce.com",
+                "expires_in": 30,
             })))
             .up_to_n_times(1)
             .mount(&server)
@@ -790,7 +797,6 @@ mod tests {
 
         let auth = builder_with_required_fields()
             .login_url(server.uri())
-            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
             .build()
             .unwrap();
         assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");

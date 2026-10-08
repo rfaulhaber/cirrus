@@ -3,9 +3,10 @@
 //!
 //! Three behaviours live here so the flows cannot drift apart:
 //!
-//! - A cached token is reused while it is fresh, meaning more than
-//!   [`EXPIRY_MARGIN`](crate::token_endpoint::EXPIRY_MARGIN) away from
-//!   its estimated expiry.
+//! - A cached token is reused while it is fresh, meaning more than its
+//!   refresh margin away from its estimated expiry: the full
+//!   [`EXPIRY_MARGIN`](crate::token_endpoint::EXPIRY_MARGIN), or half the
+//!   flow's configured TTL when that is shorter.
 //! - A mint is single-flight. Callers that queue on the flow's lock while
 //!   a mint is in flight share that mint's outcome, success or failure,
 //!   instead of each repeating the grant in turn. A caller notes when it
@@ -19,8 +20,8 @@
 //!   still accept. An OAuth error is never masked that way.
 
 use crate::error::{AuthError, AuthResult};
-use crate::token_endpoint::token_is_fresh;
-use std::time::Instant;
+use crate::token_endpoint::{TokenResponse, refresh_margin};
+use std::time::{Duration, Instant};
 
 /// An access token together with the instant after which it is not
 /// trusted any more.
@@ -28,6 +29,26 @@ use std::time::Instant;
 pub(crate) struct CachedToken {
     pub(crate) access_token: String,
     pub(crate) expires_at: Instant,
+    /// How far ahead of `expires_at` the token stops counting as fresh.
+    pub(crate) refresh_margin: Duration,
+}
+
+impl CachedToken {
+    /// Caches a freshly minted token for the shorter of its advertised
+    /// lifetime and `token_ttl`, with the refresh margin that TTL allows.
+    pub(crate) fn from_response(token: TokenResponse, token_ttl: Duration) -> Self {
+        Self {
+            expires_at: token.cache_expiry(token_ttl),
+            refresh_margin: refresh_margin(token_ttl),
+            access_token: token.access_token,
+        }
+    }
+
+    /// Whether the token is still safe to hand out: its estimated expiry
+    /// is more than the refresh margin away.
+    fn is_fresh(&self) -> bool {
+        self.expires_at > Instant::now() + self.refresh_margin
+    }
 }
 
 impl std::fmt::Debug for CachedToken {
@@ -35,6 +56,7 @@ impl std::fmt::Debug for CachedToken {
         f.debug_struct("CachedToken")
             .field("access_token", &"[redacted]")
             .field("expires_at", &self.expires_at)
+            .field("refresh_margin", &self.refresh_margin)
             .finish()
     }
 }
@@ -63,7 +85,7 @@ impl MintState {
     pub(crate) fn fresh_token(&self) -> Option<String> {
         self.cached
             .as_ref()
-            .filter(|c| token_is_fresh(c.expires_at))
+            .filter(|c| c.is_fresh())
             .map(|c| c.access_token.clone())
     }
 
@@ -170,12 +192,12 @@ impl MintState {
 mod tests {
     use super::*;
     use crate::token_endpoint::EXPIRY_MARGIN;
-    use std::time::Duration;
 
     fn token(value: &str, lifetime: Duration) -> CachedToken {
         CachedToken {
             access_token: value.into(),
             expires_at: Instant::now() + lifetime,
+            refresh_margin: EXPIRY_MARGIN,
         }
     }
 

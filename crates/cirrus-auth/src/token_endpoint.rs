@@ -22,8 +22,25 @@ use std::time::{Duration, Instant};
 /// avoidable 401 round-trips at every TTL boundary. The margin is not a
 /// hard cut-off: when the proactive refresh fails transiently, the flows
 /// keep using the cached token until its estimated expiry
-/// (see [`crate::mint`]).
+/// (see [`crate::mint`]). A configured TTL shorter than twice this value
+/// scales the margin down, see [`refresh_margin`].
 pub(super) const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+
+/// Ceiling on how long a token is cached locally, whatever `token_ttl`
+/// says. `Instant` arithmetic has a platform-dependent range, and a TTL
+/// such as `Duration::MAX` is a caller saying "never expire locally", so
+/// it has to saturate here rather than fall through to "already expired"
+/// and mint on every call.
+const MAX_CACHE_TTL: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// The refresh margin for a flow whose cache is bounded by `token_ttl`:
+/// the full [`EXPIRY_MARGIN`], or half the TTL when that is shorter, so
+/// a short TTL still caches for half its length instead of putting every
+/// freshly minted token inside the margin. `Duration::ZERO` caches
+/// nothing.
+pub(super) fn refresh_margin(token_ttl: Duration) -> Duration {
+    EXPIRY_MARGIN.min(token_ttl / 2)
+}
 
 /// Successful token-endpoint response.
 ///
@@ -108,11 +125,12 @@ impl TokenResponse {
         let ttl = match self.expires_in {
             Some(secs) => Duration::from_secs(secs).min(fallback_ttl),
             None => fallback_ttl,
-        };
-        // `Instant + Duration` panics on overflow and `expires_in` is
-        // server-controlled, so add fallibly: an unrepresentable expiry
-        // becomes "already expired", which re-mints rather than aborting
-        // the caller's task.
+        }
+        .min(MAX_CACHE_TTL);
+        // `Instant + Duration` panics on overflow. The ceiling keeps every
+        // mainstream platform's clock in range; should one fall short,
+        // the expiry becomes "already expired", which re-mints rather
+        // than aborting the caller's task.
         Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
     }
 }
@@ -253,14 +271,6 @@ pub(super) fn require_secure_login_url(url: &str) -> AuthResult<()> {
             url: url.to_string(),
         })
     }
-}
-
-/// Whether a cached token minted to expire at `expires_at` is still safe to
-/// use, accounting for the [`EXPIRY_MARGIN`] refresh window. The JWT,
-/// refresh, and client-credentials flows all call this, so they apply an
-/// identical margin.
-pub(super) fn token_is_fresh(expires_at: Instant) -> bool {
-    expires_at > Instant::now() + EXPIRY_MARGIN
 }
 
 // Redact every secret-bearing field. The `id`, `issued_at`, `scope`,
@@ -894,6 +904,26 @@ mod tests {
         // instant must not overflow the caller's task.
         let expiry = response("https://x", Some(u64::MAX)).cache_expiry(Duration::from_secs(300));
         assert!(expiry <= Instant::now() + Duration::from_secs(300));
+    }
+
+    #[test]
+    fn cache_expiry_saturates_an_unbounded_ttl() {
+        // `Duration::MAX` is "never expire locally", which must not
+        // collapse into "expired now" because the instant is out of range.
+        let expiry = response("https://x", None).cache_expiry(Duration::MAX);
+        assert!(expiry >= Instant::now() + Duration::from_secs(365 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn refresh_margin_is_the_fixed_margin_or_half_a_shorter_ttl() {
+        assert_eq!(refresh_margin(Duration::from_secs(1800)), EXPIRY_MARGIN);
+        assert_eq!(refresh_margin(Duration::from_secs(120)), EXPIRY_MARGIN);
+        assert_eq!(refresh_margin(Duration::MAX), EXPIRY_MARGIN);
+        assert_eq!(
+            refresh_margin(Duration::from_secs(30)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(refresh_margin(Duration::ZERO), Duration::ZERO);
     }
 
     /// Records, as `target LEVEL field=value ...` lines, every event the
