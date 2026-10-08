@@ -162,6 +162,28 @@ mod tests {
     }
 
     #[test]
+    fn version_number_requires_ascii_digits_on_both_sides() {
+        // `ApiVersion::latest` promises a result usable as a `vXX.X` path
+        // segment, so anything `u32::from_str` tolerates beyond digits
+        // (a leading sign) must be rejected here, matching the builder's
+        // own check.
+        let parse = |version: &str| {
+            crate::ApiVersion {
+                label: "x".into(),
+                url: "/x".into(),
+                version: version.into(),
+            }
+            .version_number()
+        };
+        assert_eq!(parse("66.0"), Some((66, 0)));
+        assert_eq!(parse("+66.0"), None);
+        assert_eq!(parse("66.+0"), None);
+        assert_eq!(parse(" 66.0"), None);
+        assert_eq!(parse("66."), None);
+        assert_eq!(parse(".0"), None);
+    }
+
+    #[test]
     fn latest_returns_none_for_empty_slice() {
         assert!(crate::ApiVersion::latest(&[]).is_none());
     }
@@ -252,6 +274,41 @@ mod tests {
         assert!(
             matches!(err, crate::CirrusError::InvalidResponse(_)),
             "expected InvalidResponse, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_with_latest_version_never_installs_a_version_build_would_refuse() {
+        // `u32::from_str` accepts a leading `+`, so a gateway or mock that
+        // answers `"+66.0"` would otherwise be installed as the path
+        // segment `v+66.0`, which `build()` refuses for a configured
+        // version and which turns every later call into an opaque
+        // NOT_FOUND.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "x", "url": "/services/data/v66.0", "version": "+66.0"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let err = Cirrus::builder()
+            .auth(auth)
+            .build_with_latest_version()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::CirrusError::InvalidInput {
+                    field: "api_version",
+                    ..
+                } | crate::CirrusError::InvalidResponse(_)
+            ),
+            "got {err:?}"
         );
     }
 

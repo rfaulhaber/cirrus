@@ -1507,6 +1507,9 @@ impl CirrusBuilder {
     pub async fn build_with_latest_version(self) -> CirrusResult<Cirrus> {
         let bootstrap = self.build()?;
         let latest = bootstrap.latest_api_version().await?;
+        // The discovered value is server-supplied, so it gets the same
+        // check a configured one does before it becomes a path segment.
+        validate_api_version(&latest)?;
         Ok(Cirrus {
             api_version: latest,
             ..bootstrap
