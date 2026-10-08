@@ -135,14 +135,20 @@ impl TokenResponse {
         let ttl = match self.expires_in {
             Some(secs) => Duration::from_secs(secs).min(fallback_ttl),
             None => fallback_ttl,
-        }
-        .min(MAX_CACHE_TTL);
-        // `Instant + Duration` panics on overflow. The ceiling keeps every
-        // mainstream platform's clock in range; should one fall short,
-        // the expiry becomes "already expired", which re-mints rather
-        // than aborting the caller's task.
-        Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
+        };
+        expiry_after(ttl)
     }
+}
+
+/// The instant `ttl` from now, bounded by [`MAX_CACHE_TTL`].
+///
+/// `Instant + Duration` panics on overflow. The ceiling keeps every
+/// mainstream platform's clock in range; should one fall short, the
+/// expiry becomes "already expired", which re-mints rather than aborting
+/// the caller's task.
+pub(super) fn expiry_after(ttl: Duration) -> Instant {
+    let ttl = ttl.min(MAX_CACHE_TTL);
+    Instant::now().checked_add(ttl).unwrap_or_else(Instant::now)
 }
 
 /// Connect-phase timeout of the token-endpoint client a flow builder

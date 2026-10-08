@@ -80,6 +80,10 @@ let (url, pending) = flow.start()?;
 
 // Phase 2 — on callback, with `pending` restored from your store.
 let session = flow.complete(pending, &code, &state).await?;
+
+// Keep the session renewable: the builder inherits this flow's login URL,
+// key, secret and HTTP client, and starts with the access token just issued.
+let auth = flow.refresh_auth(&session)?.build()?;
 ```
 
 `PendingExchange` carries only the per-attempt PKCE verifier and CSRF

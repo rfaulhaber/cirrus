@@ -46,9 +46,11 @@
 //! A [`TokenExchangeSession`] containing the Salesforce `access_token`,
 //! `instance_url`, and (depending on the connected app's scopes and the
 //! request) optional `refresh_token`, `id_token`, `scope`, `issued_at`.
-//! If a `refresh_token` is returned, wire it into a
-//! [`crate::RefreshTokenAuth`] for ongoing API access — the same
-//! pattern as Web Server PKCE.
+//! If a `refresh_token` is returned, build a [`crate::RefreshTokenAuth`]
+//! from it for ongoing API access, giving the builder the same
+//! `login_url`, consumer key and secret this flow used; whether the
+//! refresh grant needs the secret is a connected-app setting of its own,
+//! see the [`refresh`](crate::refresh) module docs.
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{

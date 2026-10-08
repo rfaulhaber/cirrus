@@ -29,25 +29,33 @@
 //!
 //! ## Wiring back into the SDK
 //!
-//! With a refresh token in hand, build a [`crate::RefreshTokenAuth`]:
+//! [`WebServerFlow::refresh_auth`] turns the [`CompletedSession`] into a
+//! [`crate::RefreshTokenAuth`] builder that keeps this flow's login URL,
+//! consumer key and secret, and HTTP client, and starts out holding the
+//! access token the session was issued with, so the first call does not
+//! spend a refresh grant on it:
 //!
 //! ```no_run
-//! # use cirrus_auth::{RefreshTokenAuth, WebServerFlow};
+//! # use cirrus_auth::WebServerFlow;
 //! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-//! # let flow = WebServerFlow::builder()
-//! #     .consumer_key("k").redirect_uri("https://app/cb").build()?;
+//! let flow = WebServerFlow::builder()
+//!     .consumer_key("3MVG9...")
+//!     .consumer_secret("28A2...")
+//!     .redirect_uri("https://app.example.com/oauth/callback")
+//!     .scope("api")
+//!     .scope("refresh_token")
+//!     .build()?;
 //! # let (_url, pending) = flow.start()?;
 //! # let state = pending.state().to_string();
-//! # let session = flow.complete(pending, "code", &state).await?;
-//! let refresh_token = session.refresh_token
-//!     .ok_or("connected app didn't return a refresh token")?;
-//! let auth = RefreshTokenAuth::builder()
-//!     .consumer_key("k")
-//!     .refresh_token(refresh_token)
-//!     .instance_url(session.instance_url)
-//!     .build()?;
+//! let session = flow.complete(pending, "code", &state).await?;
+//! let auth = flow.refresh_auth(&session)?.build()?;
 //! # Ok(()) }
 //! ```
+//!
+//! Against an org with Refresh Token Rotation, register an
+//! [`on_rotation`](crate::RefreshTokenAuthBuilder::on_rotation) handler
+//! on that builder before `build` whenever the refresh token is persisted;
+//! the [`refresh`](crate::refresh) module docs explain why.
 //!
 //! ## Confidential vs public clients
 //!
@@ -57,6 +65,7 @@
 //! The builder treats `consumer_secret` as optional accordingly.
 
 use crate::error::{AuthError, AuthResult};
+use crate::refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
 use crate::token_endpoint::{
     GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
 };
@@ -226,6 +235,44 @@ impl WebServerFlow {
             sfdc_site_url: token.sfdc_site_url,
             sfdc_site_id: token.sfdc_site_id,
         })
+    }
+
+    /// Prepares a [`RefreshTokenAuth`] for the session this flow just
+    /// completed, so the rest of the SDK can keep renewing it.
+    ///
+    /// The builder carries over the connected app's consumer key and
+    /// secret, this flow's `login_url` and HTTP client, the session's
+    /// `instance_url` and refresh token, and the access token that came
+    /// with it (see
+    /// [`initial_access_token`](RefreshTokenAuthBuilder::initial_access_token)),
+    /// so the first call reuses that token instead of spending a refresh
+    /// grant on it. Add [`on_rotation`](RefreshTokenAuthBuilder::on_rotation)
+    /// or a `token_ttl` before calling `build`.
+    ///
+    /// Fails with [`AuthError::MissingField`] naming `refresh_token` when
+    /// the session has none: the connected app's scopes must include
+    /// `refresh_token` and the user must have granted it.
+    ///
+    /// Whether the refresh grant itself needs the consumer secret is the
+    /// app's "Require Secret for Refresh Token Flow" setting, which is
+    /// separate from the web-server one; see the
+    /// [`refresh`](crate::refresh) module docs.
+    pub fn refresh_auth(&self, session: &CompletedSession) -> AuthResult<RefreshTokenAuthBuilder> {
+        let refresh_token = session
+            .refresh_token
+            .clone()
+            .ok_or(AuthError::MissingField("refresh_token"))?;
+        let mut builder = RefreshTokenAuth::builder()
+            .consumer_key(&self.consumer_key)
+            .refresh_token(refresh_token)
+            .login_url(&self.login_url)
+            .instance_url(&session.instance_url)
+            .initial_access_token(&session.access_token)
+            .http_client(self.http.clone());
+        if let Some(secret) = &self.consumer_secret {
+            builder = builder.consumer_secret(secret);
+        }
+        Ok(builder)
     }
 }
 
@@ -525,6 +572,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::AuthSession;
     use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -877,6 +925,103 @@ mod tests {
         let sent = form_value(&body, "code_verifier").expect("code_verifier must be sent");
         assert_eq!(sent, verifier);
         assert_eq!(pkce_s256_challenge(&sent), published_challenge);
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_requires_a_refresh_token() {
+        // A connected app without the `refresh_token` scope issues none;
+        // the hand-off has nothing to renew with and must say which field.
+        let server = MockServer::start().await;
+        let mut body = documented_token_response();
+        body.as_object_mut().unwrap().remove("refresh_token");
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let session = flow.complete(pending, "c", &state).await.unwrap();
+
+        let err = flow.refresh_auth(&session).unwrap_err();
+        assert!(
+            matches!(err, AuthError::MissingField("refresh_token")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_serves_the_issued_access_token_without_a_mint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let session = flow.complete(pending, "c", &state).await.unwrap();
+
+        let auth = flow.refresh_auth(&session).unwrap().build().unwrap();
+        let token = auth.access_token().await.unwrap();
+        assert_eq!(token, session.access_token);
+        assert_eq!(auth.instance_url(), session.instance_url);
+        // Only the code exchange reached the endpoint. A refresh grant here
+        // would, under Refresh Token Rotation, replace the refresh token
+        // the caller just stored.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "unexpected refresh grant");
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_carries_the_flow_configuration_into_the_refresh_grant() {
+        // The refresh grant must go to the host that issued the code, with
+        // the same client id and secret; a builder that fell back to the
+        // production login URL or dropped the secret would be rejected by
+        // a sandbox or a confidential app at the first renewal.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let mut refreshed = documented_token_response();
+        refreshed["access_token"] = serde_json::Value::String("REFRESHED".into());
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_id=consumer-key-123"))
+            .and(body_string_contains("client_secret=hunter2"))
+            .and(body_string_contains(
+                "refresh_token=5Aep861KIwKdekr...refresh",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refreshed))
+            .mount(&server)
+            .await;
+
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .consumer_secret("hunter2")
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let session = flow.complete(pending, "c", &state).await.unwrap();
+
+        let auth = flow.refresh_auth(&session).unwrap().build().unwrap();
+        auth.invalidate(&session.access_token).await;
+        let token = auth.access_token().await.unwrap();
+        assert_eq!(token, "REFRESHED");
     }
 
     #[tokio::test]

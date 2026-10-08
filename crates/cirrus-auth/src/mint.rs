@@ -20,7 +20,7 @@
 //!   still accept. An OAuth error is never masked that way.
 
 use crate::error::{AuthError, AuthResult};
-use crate::token_endpoint::{TokenResponse, refresh_margin};
+use crate::token_endpoint::{TokenResponse, expiry_after, refresh_margin};
 use std::time::{Duration, Instant};
 
 /// An access token together with the instant after which it is not
@@ -41,6 +41,16 @@ impl CachedToken {
             expires_at: token.cache_expiry(token_ttl),
             refresh_margin: refresh_margin(token_ttl),
             access_token: token.access_token,
+        }
+    }
+
+    /// Caches a token the caller obtained outside this flow, alongside
+    /// its refresh token, as if it had been minted now for `token_ttl`.
+    pub(crate) fn issued_now(access_token: String, token_ttl: Duration) -> Self {
+        Self {
+            expires_at: expiry_after(token_ttl),
+            refresh_margin: refresh_margin(token_ttl),
+            access_token,
         }
     }
 
@@ -81,6 +91,14 @@ pub(crate) struct MintState {
 }
 
 impl MintState {
+    /// A cache that starts out holding `token`, with no mint on record.
+    pub(crate) fn seeded(token: CachedToken) -> Self {
+        Self {
+            cached: Some(token),
+            ..Self::default()
+        }
+    }
+
     /// The cached token while it is fresh.
     pub(crate) fn fresh_token(&self) -> Option<String> {
         self.cached
