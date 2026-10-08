@@ -71,6 +71,10 @@ pub(super) fn refresh_margin(token_ttl: Duration) -> Duration {
 /// - `signature` / `id` / `token_type` — present on every successful
 ///   flow except where Salesforce explicitly omits (e.g. some on-behalf-of
 ///   exchanges).
+/// - `sfdc_site_url` / `sfdc_site_id` — only when the authenticated user
+///   is a member of an Experience Cloud site; the Web Server and Refresh
+///   Token flow pages list both.
+///   (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5>)
 #[derive(Deserialize)]
 pub(super) struct TokenResponse {
     pub(super) access_token: String,
@@ -104,6 +108,12 @@ pub(super) struct TokenResponse {
     /// have a consumer secret (some public-client variants).
     #[serde(default)]
     pub(super) signature: Option<String>,
+    /// Experience Cloud site URL, for a user who is a member of a site.
+    #[serde(default)]
+    pub(super) sfdc_site_url: Option<String>,
+    /// Experience Cloud site ID, for the same case.
+    #[serde(default)]
+    pub(super) sfdc_site_id: Option<String>,
     /// Always `"Bearer"` for the OAuth 2.0 flows Salesforce exposes.
     /// Parsed defensively so a future divergence wouldn't break the
     /// deserializer; not propagated onto session structs.
@@ -291,6 +301,8 @@ impl std::fmt::Debug for TokenResponse {
             .field("issued_at", &self.issued_at)
             .field("id", &self.id)
             .field("signature", &self.signature.as_ref().map(|_| "[redacted]"))
+            .field("sfdc_site_url", &self.sfdc_site_url)
+            .field("sfdc_site_id", &self.sfdc_site_id)
             .field("token_type", &self.token_type)
             .finish()
     }
@@ -545,6 +557,8 @@ mod tests {
             issued_at: None,
             id: None,
             signature: None,
+            sfdc_site_url: None,
+            sfdc_site_id: None,
             token_type: None,
         }
     }

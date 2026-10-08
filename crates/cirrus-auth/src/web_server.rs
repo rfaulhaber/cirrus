@@ -223,6 +223,8 @@ impl WebServerFlow {
             issued_at: token.issued_at,
             signature: token.signature,
             scope: token.scope,
+            sfdc_site_url: token.sfdc_site_url,
+            sfdc_site_id: token.sfdc_site_id,
         })
     }
 }
@@ -297,10 +299,18 @@ pub struct CompletedSession {
     pub signature: Option<String>,
     /// Granted scopes, space-separated.
     pub scope: Option<String>,
+    /// Experience Cloud site URL, returned when the authenticated user is
+    /// a member of a site (for example a login through
+    /// `https://acme.my.site.com/portal`). `None` for a direct org login.
+    pub sfdc_site_url: Option<String>,
+    /// Experience Cloud site ID for the same case. Some Connect REST
+    /// requests need it, and nothing else in the response carries it.
+    pub sfdc_site_id: Option<String>,
 }
 
 // Tokens and the HMAC `signature` are secrets — redact in `{:?}`.
-// `instance_url`, `id`, `issued_at`, and `scope` are non-secret.
+// `instance_url`, `id`, `issued_at`, `scope` and the site fields are
+// non-secret.
 impl std::fmt::Debug for CompletedSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompletedSession")
@@ -315,6 +325,8 @@ impl std::fmt::Debug for CompletedSession {
             .field("issued_at", &self.issued_at)
             .field("signature", &self.signature.as_ref().map(|_| "[redacted]"))
             .field("scope", &self.scope)
+            .field("sfdc_site_url", &self.sfdc_site_url)
+            .field("sfdc_site_id", &self.sfdc_site_id)
             .finish()
     }
 }
@@ -787,6 +799,45 @@ mod tests {
             session.signature.as_deref(),
             Some("CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=")
         );
+        // The documented sample is a non-site login: no site fields.
+        assert_eq!(session.sfdc_site_url, None);
+        assert_eq!(session.sfdc_site_id, None);
+    }
+
+    #[tokio::test]
+    async fn complete_surfaces_the_experience_cloud_site_fields() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm
+        // (release 264): the token response lists `sfdc_site_url` ("If the
+        // user is a member of an Experience Cloud site, the site URL is
+        // provided") and `sfdc_site_id` ("the user's site ID is provided").
+        // The page names the keys but prints no sample values; the ones
+        // here are shaped like a site URL and a Network record id.
+        let server = MockServer::start().await;
+        let mut body = documented_token_response();
+        body["sfdc_site_url"] = serde_json::Value::String("https://acme.my.site.com/portal".into());
+        body["sfdc_site_id"] = serde_json::Value::String("0DB5e000000TN1aGAG".into());
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let session = flow.complete(pending, "c", &state).await.unwrap();
+
+        assert_eq!(
+            session.sfdc_site_url.as_deref(),
+            Some("https://acme.my.site.com/portal")
+        );
+        assert_eq!(session.sfdc_site_id.as_deref(), Some("0DB5e000000TN1aGAG"));
+        // Neither value is a credential, so diagnostics may show them.
+        let debug = format!("{session:?}");
+        assert!(debug.contains("0DB5e000000TN1aGAG"), "{debug}");
     }
 
     #[tokio::test]
