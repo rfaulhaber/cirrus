@@ -40,6 +40,17 @@ pub struct SalesforceError {
     /// Field names involved in the error, when applicable (validation errors).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    /// Every other key on the error object, under its wire name.
+    ///
+    /// Some errors carry more than the three documented members: a
+    /// `DUPLICATES_DETECTED` error, for one, brings the matching records
+    /// when the request asked for them with
+    /// `Sforce-Duplicate-Rule-Header: includeRecordDetails=true`. Those
+    /// members are kept here rather than dropped, so a caller can offer
+    /// "use the existing record" from the error alone. Serializing the
+    /// error writes them back at the top level.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Errors produced by the Cirrus client.
@@ -294,6 +305,7 @@ mod tests {
                 message: "Required field missing".to_string(),
                 error_code: "REQUIRED_FIELD_MISSING".to_string(),
                 fields: vec!["Name".to_string()],
+                extra: Default::default(),
             }],
             raw: None,
         };
@@ -417,6 +429,40 @@ mod tests {
         let parsed: Vec<SalesforceError> = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].fields.is_empty());
+        assert!(parsed[0].extra.is_empty());
+    }
+
+    #[test]
+    fn salesforce_error_keeps_undocumented_keys_under_their_wire_names() {
+        // Wire-shape provenance: the Duplicate Rule Header page
+        // (https://developer.salesforce.com/docs/platform/api-rest/guide/headers-duplicaterules.html)
+        // says includeRecordDetails=true returns "all fields in the
+        // duplicate record" on a DUPLICATES_DETECTED error, but no REST
+        // page shows the key that carries them. The key below is the
+        // SOAP name; what the test pins is that any key beyond message,
+        // errorCode and fields reaches the caller, whatever it is called.
+        let json = r#"[{
+            "message": "You're creating a duplicate record. We recommend you use an existing record instead.",
+            "errorCode": "DUPLICATES_DETECTED",
+            "duplicateResult": {"matchResults": [{"matchRecords": [{"record": {"Id": "00Q5f000001AbCdEAK"}}]}]}
+        }]"#;
+        let parsed: Vec<SalesforceError> = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed[0].error_code, "DUPLICATES_DETECTED");
+        assert!(parsed[0].fields.is_empty());
+        assert_eq!(
+            parsed[0].extra["duplicateResult"]["matchResults"][0]["matchRecords"][0]["record"]["Id"],
+            "00Q5f000001AbCdEAK"
+        );
+
+        // The members go back out at the top level, not nested under
+        // the field that holds them.
+        let round_trip = serde_json::to_value(&parsed[0]).unwrap();
+        assert!(round_trip.get("extra").is_none(), "{round_trip}");
+        assert_eq!(
+            round_trip["duplicateResult"],
+            parsed[0].extra["duplicateResult"]
+        );
+        assert!(round_trip.get("fields").is_none(), "{round_trip}");
     }
 
     /// A `reqwest::Error` produced without any network: an invalid default
