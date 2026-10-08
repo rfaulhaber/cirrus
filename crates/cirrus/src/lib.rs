@@ -954,8 +954,16 @@ impl Cirrus {
                         } else {
                             NON_SUCCESS_BODY_CAP
                         };
+                        // A terminal 429 or 5xx hands its hint to the
+                        // caller, who may own the retries this policy
+                        // does not make. Read before the headers move
+                        // into the parser.
+                        let retry_after = retry::parse_retry_after(&headers);
                         match collect_body(response, cap).await {
-                            Ok(bytes) => break parse(status, headers, bytes),
+                            Ok(bytes) => {
+                                break parse(status, headers, bytes)
+                                    .map_err(|e| e.with_retry_after(retry_after));
+                            }
                             Err(CollectBodyError::TooLarge { limit }) => {
                                 break Err(CirrusError::ResponseTooLarge { status, limit });
                             }
@@ -2510,10 +2518,101 @@ mod tests {
             let sf = fixture_with_policy(server.uri(), fast_retry_policy());
             let err = sf.get::<serde_json::Value>("limits").await.unwrap_err();
             assert!(
-                matches!(err, CirrusError::Api { status: 503, .. }),
-                "expected the 503 to surface, got {err:?}"
+                matches!(
+                    err,
+                    CirrusError::Api {
+                        status: 503,
+                        retry_after: Some(hint),
+                        ..
+                    } if hint == Duration::from_secs(120)
+                ),
+                "expected the 503 to surface with its hint, got {err:?}"
             );
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_terminal_429_carries_the_retry_after_hint() {
+            // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+            // Under RetryPolicy::none the SDK makes no retries of its
+            // own, so the caller who does needs the server's window.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), RetryPolicy::none());
+            let err = sf.get::<serde_json::Value>("limits").await.unwrap_err();
+            match err {
+                CirrusError::Api {
+                    status,
+                    retry_after,
+                    ..
+                } => {
+                    assert_eq!(status, 429);
+                    assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                }
+                other => panic!("expected Api error, got {other:?}"),
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_503_the_policy_never_replays_carries_the_retry_after_hint() {
+            // A POST is not replayed on a 5xx, so its hint reaches the
+            // caller even with retries enabled.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/services/data/v66.0/sobjects/Account"))
+                .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "30"))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let err = sf
+                .post::<serde_json::Value, _>("sobjects/Account", &serde_json::json!({"Name": "x"}))
+                .await
+                .unwrap_err();
+            match err {
+                CirrusError::Api {
+                    status,
+                    retry_after,
+                    ..
+                } => {
+                    assert_eq!(status, 503);
+                    assert_eq!(retry_after, Some(Duration::from_secs(30)));
+                }
+                other => panic!("expected Api error, got {other:?}"),
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_error_without_retry_after_carries_no_hint() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!([
+                    {"errorCode": "NOT_FOUND", "message": "The requested resource does not exist"}
+                ])))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), RetryPolicy::none());
+            let err = sf.get::<serde_json::Value>("limits").await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CirrusError::Api {
+                        status: 404,
+                        retry_after: None,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
         }
 
         #[tokio::test]

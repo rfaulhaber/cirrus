@@ -136,10 +136,17 @@ pub(crate) fn should_retry_status(
 ///
 /// Salesforce answers a Metadata API SOAP fault with HTTP 500, so the
 /// status alone can't tell a deterministic application error from a
-/// transient one. Everything outside this list — `INVALID_TYPE`,
-/// `INVALID_CROSS_REFERENCE_KEY`, `INVALID_SESSION_ID`,
-/// `REQUEST_LIMIT_EXCEEDED` — returns the same fault on every attempt,
-/// so replaying it only spends API calls and delays the error.
+/// transient one. Everything outside this list is left out on purpose.
+/// `INVALID_TYPE`, `INVALID_CROSS_REFERENCE_KEY` and
+/// `INVALID_SESSION_ID` return the same fault on every attempt, so
+/// replaying them only spends API calls and delays the error.
+/// `REQUEST_LIMIT_EXCEEDED` is different: it signals the rolling
+/// 24-hour quota, where a replay burns more of it, but also the cap on
+/// concurrent long-running requests, which clears by itself as they
+/// finish. A replay of that case would need a backoff far longer than
+/// this policy's (under a second in total by default), because the
+/// requests holding the slots have by definition run for 20 seconds or
+/// more; a caller that wants to wait them out does so around the call.
 ///
 /// Descriptions from the `ExceptionCode` reference:
 /// `SERVER_UNAVAILABLE` — "A server that's necessary for this call is
@@ -360,9 +367,10 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_faults_are_not_transient() {
-        // Replaying any of these returns the identical fault, so the
-        // dispatcher must surface them on the first attempt.
+    fn faults_outside_the_transient_list_are_not_replayed() {
+        // The first three return the identical fault on every attempt.
+        // REQUEST_LIMIT_EXCEEDED can clear, but not inside this
+        // policy's backoff, so it surfaces on the first attempt too.
         for code in [
             "INVALID_TYPE",
             "INVALID_SESSION_ID",

@@ -379,10 +379,12 @@ async fn send_with_retries(
                 // SOAP faults can arrive with HTTP 500 or (uncommonly)
                 // HTTP 200, so the body decides the outcome — not the
                 // status. Parsing before the retry decision is what
-                // keeps a deterministic application fault (INVALID_TYPE,
-                // REQUEST_LIMIT_EXCEEDED, INVALID_SESSION_ID) from being
-                // replayed under the 5xx rule and surfaced only after
-                // the whole retry budget is spent.
+                // keeps a fault the policy never replays (INVALID_TYPE
+                // and INVALID_SESSION_ID, which are deterministic, and
+                // REQUEST_LIMIT_EXCEEDED, whose concurrency form clears
+                // too slowly for this backoff) from being replayed under
+                // the 5xx rule and surfaced only after the whole retry
+                // budget is spent.
                 //
                 // The text is validated as UTF-8 once, here, and the
                 // envelope is then parsed in place. `Vec::from` reuses
@@ -432,7 +434,11 @@ async fn send_with_retries(
                             attempt += 1;
                             continue;
                         }
-                        return Err(MetadataError::Soap { status, fault });
+                        return Err(MetadataError::Soap {
+                            status,
+                            fault,
+                            retry_after: retry::parse_retry_after(&headers),
+                        });
                     }
                     Err((parse_err, raw)) => {
                         // No SOAP envelope means the response came from
@@ -459,6 +465,7 @@ async fn send_with_retries(
                         return Err(MetadataError::Http4xx5xx {
                             status,
                             raw: crate::error::cap_raw_body(&raw),
+                            retry_after: retry::parse_retry_after(&headers),
                         });
                     }
                 }

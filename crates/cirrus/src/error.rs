@@ -3,8 +3,9 @@
 //! Salesforce REST endpoints return errors as a JSON array of objects with a
 //! consistent shape (`message`, `errorCode`, optional `fields`), regardless of
 //! the success-response shape. [`SalesforceError`] models that shape, and
-//! [`CirrusError::Api`] carries the parsed array along with the HTTP
-//! status.
+//! [`CirrusError::Api`] carries the parsed entries along with the HTTP
+//! status. A few per-operation doc pages print a single error object in
+//! place of the array; that form parses as a one-entry list.
 //!
 //! Auth-flow errors (OAuth token endpoints, JWT signing, missing builder
 //! fields on a flow) come from the [`cirrus_auth`] crate as
@@ -14,6 +15,7 @@
 
 use cirrus_auth::AuthError;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Specialized `Result` type for Cirrus operations.
@@ -25,8 +27,10 @@ const INVALID_SESSION_ID: &str = "INVALID_SESSION_ID";
 
 /// A single Salesforce API error entry.
 ///
-/// Salesforce REST endpoints return errors as a JSON array of these objects.
-/// The shape is schema-independent and applies to every REST resource.
+/// Salesforce REST endpoints return errors as a JSON array of these objects
+/// (a few per-operation examples print one object without the array; both
+/// parse). The shape is schema-independent and applies to every REST
+/// resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SalesforceError {
     /// Human-readable description of the error.
@@ -37,6 +41,17 @@ pub struct SalesforceError {
     /// Field names involved in the error, when applicable (validation errors).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    /// Every other key on the error object, under its wire name.
+    ///
+    /// Some errors carry more than the three documented members: a
+    /// `DUPLICATES_DETECTED` error, for one, brings the matching records
+    /// when the request asked for them with
+    /// `Sforce-Duplicate-Rule-Header: includeRecordDetails=true`. Those
+    /// members are kept here rather than dropped, so a caller can offer
+    /// "use the existing record" from the error alone. Serializing the
+    /// error writes them back at the top level.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Errors produced by the Cirrus client.
@@ -71,26 +86,40 @@ pub enum CirrusError {
     Http(#[source] reqwest::Error),
 
     /// Salesforce returned a non-2xx response. `errors` holds the parsed
-    /// Salesforce error array; if the body could not be parsed as the
-    /// canonical shape, the raw body is in `raw`.
+    /// Salesforce error entries (the documented array, or the bare object
+    /// some per-operation pages print); if the body could not be parsed
+    /// as either, the raw body is in `raw`.
+    ///
+    /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
+    /// later field is an additive change.
     #[error("Salesforce API error (status {status}): {}", display_errors(.errors, .raw))]
+    #[non_exhaustive]
     Api {
         /// HTTP status code returned by Salesforce.
         status: u16,
-        /// Parsed Salesforce error entries. Empty if the body was not parseable
-        /// as the canonical error array.
+        /// Parsed Salesforce error entries. Empty if the body was not
+        /// parseable as the error array or as a single error object.
         errors: Vec<SalesforceError>,
         /// Raw response body, capped at 2 KiB (longer bodies are
         /// truncated with a marker — non-Salesforce shapes come from
         /// proxies/gateways, and retaining them unboundedly would let
         /// echoed request data flow into logs). Populated when `errors`
-        /// is empty so callers can see what came back.
+        /// is empty so callers can see what came back; `None` when the
+        /// body was empty too.
         ///
         /// Bearer-token material is replaced with `[redacted]` before
         /// the body is stored, because those intermediary pages tend to
         /// echo the request that provoked them and this value reaches
         /// the error's `Display`.
         raw: Option<String>,
+        /// The response's `Retry-After` hint, when it carried one in a
+        /// form the client could read (delta-seconds or an HTTP-date,
+        /// per RFC 7231 §7.1.3). A caller that owns its own retries —
+        /// under [`RetryPolicy::none`](crate::RetryPolicy::none), once
+        /// the retry budget is spent, or on a request the policy never
+        /// replays — can wait as long as the server asked. `None` when
+        /// the header was absent or unreadable.
+        retry_after: Option<Duration>,
     },
 
     /// An auth flow (token acquisition, refresh, OAuth exchange) failed.
@@ -198,12 +227,34 @@ impl CirrusError {
                 status,
                 errors,
                 raw: Some(raw),
+                retry_after,
             } => Self::Api {
                 status,
                 errors,
                 raw: Some(redact_body(&raw, token)),
+                retry_after,
             },
             Self::InvalidResponse(message) => Self::InvalidResponse(redact_body(&message, token)),
+            other => other,
+        }
+    }
+
+    /// Attaches the response's `Retry-After` hint to an
+    /// [`Api`](Self::Api) error. Every other variant passes through
+    /// unchanged: the hint belongs to a response, and only `Api` is one.
+    pub(crate) fn with_retry_after(self, retry_after: Option<Duration>) -> Self {
+        match self {
+            Self::Api {
+                status,
+                errors,
+                raw,
+                ..
+            } => Self::Api {
+                status,
+                errors,
+                raw,
+                retry_after,
+            },
             other => other,
         }
     }
@@ -289,8 +340,10 @@ mod tests {
                 message: "Required field missing".to_string(),
                 error_code: "REQUIRED_FIELD_MISSING".to_string(),
                 fields: vec!["Name".to_string()],
+                extra: Default::default(),
             }],
             raw: None,
+            retry_after: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("400"));
@@ -304,6 +357,7 @@ mod tests {
             status: 500,
             errors: vec![],
             raw: Some("Internal Server Error".to_string()),
+            retry_after: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("500"));
@@ -321,6 +375,7 @@ mod tests {
             raw: Some(format!(
                 "Bad Gateway — upstream rejected:\nGET /services/data/v66.0/query?q=SELECT+Id\nAuthorization: Bearer {token}\n"
             )),
+            retry_after: None,
         }
         .redact_secrets(token);
 
@@ -347,6 +402,7 @@ mod tests {
                 "authorization: bearer stale-one\nX-Forwarded-Authorization: BEARER stale-two\n"
                     .to_string(),
             ),
+            retry_after: None,
         }
         .redact_secrets("current-token");
 
@@ -389,6 +445,7 @@ mod tests {
             status: 503,
             errors: vec![],
             raw: Some("Service Unavailable — bearer".to_string()),
+            retry_after: None,
         }
         .redact_secrets("tok");
         let CirrusError::Api { raw: Some(raw), .. } = &err else {
@@ -412,6 +469,40 @@ mod tests {
         let parsed: Vec<SalesforceError> = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].fields.is_empty());
+        assert!(parsed[0].extra.is_empty());
+    }
+
+    #[test]
+    fn salesforce_error_keeps_undocumented_keys_under_their_wire_names() {
+        // Wire-shape provenance: the Duplicate Rule Header page
+        // (https://developer.salesforce.com/docs/platform/api-rest/guide/headers-duplicaterules.html)
+        // says includeRecordDetails=true returns "all fields in the
+        // duplicate record" on a DUPLICATES_DETECTED error, but no REST
+        // page shows the key that carries them. The key below is the
+        // SOAP name; what the test pins is that any key beyond message,
+        // errorCode and fields reaches the caller, whatever it is called.
+        let json = r#"[{
+            "message": "You're creating a duplicate record. We recommend you use an existing record instead.",
+            "errorCode": "DUPLICATES_DETECTED",
+            "duplicateResult": {"matchResults": [{"matchRecords": [{"record": {"Id": "00Q5f000001AbCdEAK"}}]}]}
+        }]"#;
+        let parsed: Vec<SalesforceError> = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed[0].error_code, "DUPLICATES_DETECTED");
+        assert!(parsed[0].fields.is_empty());
+        assert_eq!(
+            parsed[0].extra["duplicateResult"]["matchResults"][0]["matchRecords"][0]["record"]["Id"],
+            "00Q5f000001AbCdEAK"
+        );
+
+        // The members go back out at the top level, not nested under
+        // the field that holds them.
+        let round_trip = serde_json::to_value(&parsed[0]).unwrap();
+        assert!(round_trip.get("extra").is_none(), "{round_trip}");
+        assert_eq!(
+            round_trip["duplicateResult"],
+            parsed[0].extra["duplicateResult"]
+        );
+        assert!(round_trip.get("fields").is_none(), "{round_trip}");
     }
 
     /// A `reqwest::Error` produced without any network: an invalid default

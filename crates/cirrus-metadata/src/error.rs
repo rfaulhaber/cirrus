@@ -13,6 +13,7 @@
 
 use crate::result::{DeployResult, RetrieveResult};
 use cirrus_auth::AuthError;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Specialized `Result` type for `cirrus-metadata` operations.
@@ -67,6 +68,10 @@ impl SoapFault {
 /// [`DeployFailed`](Self::DeployFailed) and
 /// [`RetrieveFailed`](Self::RetrieveFailed) carry a job's result rather
 /// than another error, and their `Display` summarizes it.
+///
+/// [`Soap`](Self::Soap) and [`Http4xx5xx`](Self::Http4xx5xx) are
+/// `#[non_exhaustive]` themselves: destructure them with `..` so a
+/// later field is an additive change.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MetadataError {
@@ -84,6 +89,7 @@ pub enum MetadataError {
 
     /// The server returned a SOAP fault (`<soapenv:Fault>`).
     #[error("Metadata API SOAP fault (status {status}) [{}]: {}", .fault.code(), .fault.faultstring)]
+    #[non_exhaustive]
     Soap {
         /// HTTP status code accompanying the fault. SOAP 1.1 faults
         /// usually arrive with HTTP 500, but Salesforce occasionally
@@ -93,12 +99,21 @@ pub enum MetadataError {
         status: u16,
         /// The parsed SOAP fault.
         fault: SoapFault,
+        /// The response's `Retry-After` hint, when it carried one in a
+        /// form the client could read (delta-seconds or an HTTP-date,
+        /// per RFC 7231 §7.1.3). A caller that owns its own retries —
+        /// under [`RetryPolicy::none`](crate::RetryPolicy::none), once
+        /// the retry budget is spent, or on an operation the policy
+        /// never replays — can wait as long as the server asked.
+        /// `None` when the header was absent or unreadable.
+        retry_after: Option<Duration>,
     },
 
     /// The server returned a non-2xx status with a body that wasn't a
     /// recognizable SOAP envelope. The raw body is preserved for
     /// inspection.
     #[error("HTTP {status} from Metadata API (non-SOAP body): {raw}")]
+    #[non_exhaustive]
     Http4xx5xx {
         /// HTTP status code returned.
         status: u16,
@@ -109,6 +124,10 @@ pub enum MetadataError {
         /// attempt, and the content of any echoed `<sessionId>`
         /// element, are replaced with `[redacted]`.
         raw: String,
+        /// The response's `Retry-After` hint, as on
+        /// [`Soap`](Self::Soap). A gateway's 429 or 503 is where it
+        /// most often appears.
+        retry_after: Option<Duration>,
     },
 
     /// An auth flow (token acquisition, refresh, OAuth exchange) failed.
@@ -268,9 +287,14 @@ impl MetadataError {
     /// Every new variant that stores body text has to be added here.
     pub(crate) fn redact_secrets(self, token: &str) -> Self {
         match self {
-            Self::Http4xx5xx { status, raw } => Self::Http4xx5xx {
+            Self::Http4xx5xx {
+                status,
+                raw,
+                retry_after,
+            } => Self::Http4xx5xx {
                 status,
                 raw: redact_body(&raw, token),
+                retry_after,
             },
             Self::InvalidResponse(message) => Self::InvalidResponse(redact_body(&message, token)),
             other => other,
@@ -387,6 +411,7 @@ mod tests {
         let err = MetadataError::Http4xx5xx {
             status: 400,
             raw: echoed.into(),
+            retry_after: None,
         }
         .redact_secrets("00Dxx!live");
         let MetadataError::Http4xx5xx { raw, .. } = &err else {
@@ -484,6 +509,7 @@ mod tests {
                 faultcode: "sf:INVALID_TYPE".into(),
                 faultstring: "no such metadata type".into(),
             },
+            retry_after: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("500"));

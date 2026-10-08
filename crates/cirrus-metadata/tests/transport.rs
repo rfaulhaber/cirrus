@@ -319,7 +319,7 @@ async fn soap_fault_surfaces_as_typed_error() {
 
     let err = md.call(&Ping).await.unwrap_err();
     match err {
-        MetadataError::Soap { status, fault } => {
+        MetadataError::Soap { status, fault, .. } => {
             assert_eq!(status, 500);
             assert_eq!(fault.code(), "INVALID_TYPE");
             assert!(fault.faultstring.contains("no such metadata type"));
@@ -495,12 +495,103 @@ async fn non_envelope_body_surfaces_as_http_error() {
 
     let err = md.call(&Ping).await.unwrap_err();
     match err {
-        MetadataError::Http4xx5xx { status, raw } => {
+        MetadataError::Http4xx5xx { status, raw, .. } => {
             assert_eq!(status, 502);
             assert!(raw.contains("bad gateway"));
         }
         other => panic!("expected Http4xx5xx, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_terminal_soap_fault_carries_the_retry_after_hint() {
+    // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+    // Under RetryPolicy::none the client makes no retries of its own,
+    // so a caller who does needs the server's window.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .insert_header("Retry-After", "60")
+                .set_body_string(fault_body("SERVER_UNAVAILABLE", "try again later")),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, RetryPolicy::none());
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Soap {
+            status,
+            fault,
+            retry_after,
+            ..
+        } => {
+            assert_eq!(status, 500);
+            assert_eq!(fault.code(), "SERVER_UNAVAILABLE");
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(60)));
+        }
+        other => panic!("expected Soap error, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_non_soap_error_carries_the_retry_after_hint() {
+    // A gateway 503 on a non-idempotent operation is never replayed, so
+    // its hint reaches the caller even with retries enabled.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("content-type", "text/html")
+                .insert_header("Retry-After", "30")
+                .set_body_string("<html>upstream busy</html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, fast_retries());
+    let err = md.call(&Mutate).await.unwrap_err();
+    match err {
+        MetadataError::Http4xx5xx {
+            status,
+            retry_after,
+            ..
+        } => {
+            assert_eq!(status, 503);
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+        }
+        other => panic!("expected Http4xx5xx, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_error_without_retry_after_carries_no_hint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(fault_body("INVALID_TYPE", "no such metadata type")),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_with_cap(&server, None, RetryPolicy::none());
+    let err = md.call(&Ping).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            MetadataError::Soap {
+                retry_after: None,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1667,7 +1758,7 @@ async fn a_non_utf8_error_body_keeps_a_lossy_excerpt() {
     let md = client_with_cap(&server, None, RetryPolicy::none());
     let err = md.call(&Ping).await.unwrap_err();
     match err {
-        MetadataError::Http4xx5xx { status, raw } => {
+        MetadataError::Http4xx5xx { status, raw, .. } => {
             assert_eq!(status, 502);
             assert!(raw.contains("bad gateway"), "{raw}");
             assert!(raw.contains('\u{fffd}'), "{raw}");

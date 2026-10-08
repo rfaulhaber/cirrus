@@ -8,11 +8,17 @@
 //!
 //! ## The success-vs-error split
 //!
-//! Every REST endpoint returns the same error shape on non-2xx — a JSON array
-//! of `{message, errorCode, fields}`. That lets [`parse_response_bytes`] check
-//! the status code first and only attempt to deserialize into the caller's `R`
-//! on success. Callers never need to model error shapes in their response
-//! types.
+//! Salesforce documents one error shape for every REST endpoint on non-2xx:
+//! a JSON array of `{message, errorCode, fields}` ([Status Codes and Error
+//! Responses]). A few per-operation pages (Upsert's "incorrect external ID
+//! field", the sObject blob insert's "example error response") print the
+//! same object without the array around it, so the parser also accepts a
+//! bare object as a one-entry array. Either way [`parse_response_bytes`]
+//! checks the status code first and only attempts to deserialize into the
+//! caller's `R` on success. Callers never need to model error shapes in
+//! their response types.
+//!
+//! [Status Codes and Error Responses]: https://developer.salesforce.com/docs/platform/api-rest/guide/errorcodes.html
 
 use crate::error::{CirrusError, CirrusResult, SalesforceError};
 use reqwest::header::HeaderMap;
@@ -1048,15 +1054,19 @@ fn capped_serde_message(err: &serde_json::Error) -> String {
 
 /// Parses a non-2xx response body into a [`CirrusError::Api`].
 ///
-/// Tries the standard Salesforce error-array shape first; falls back to
-/// preserving the raw body (capped at [`RAW_ERROR_BODY_CAP`] bytes) for
-/// debugging when the array doesn't parse. Used both by
-/// [`parse_response_bytes`] (JSON success path) and the raw-body
-/// transport path that bypasses JSON deserialization on success
+/// Tries the documented Salesforce error array first, then a bare error
+/// object, which some per-operation pages print in place of the array.
+/// When neither parses, the body is preserved in `raw` (capped at
+/// [`RAW_ERROR_BODY_CAP`] bytes) for debugging — unless it was empty, in
+/// which case `raw` stays `None` and the error reads as having no body.
+/// Used both by [`parse_response_bytes`] (JSON success path) and the
+/// raw-body transport path that bypasses JSON deserialization on success
 /// (Bulk API CSV downloads).
 pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
-    let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes).unwrap_or_default();
-    let raw = if errors.is_empty() {
+    let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes)
+        .or_else(|_| serde_json::from_slice::<SalesforceError>(bytes).map(|e| vec![e]))
+        .unwrap_or_default();
+    let raw = if errors.is_empty() && !bytes.is_empty() {
         Some(capped_body(bytes, RAW_ERROR_BODY_CAP))
     } else {
         None
@@ -1065,6 +1075,7 @@ pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
         status,
         errors,
         raw,
+        retry_after: None,
     }
 }
 
@@ -1315,6 +1326,7 @@ mod tests {
                 status,
                 errors,
                 raw,
+                ..
             } => {
                 assert_eq!(status, 400);
                 assert_eq!(errors.len(), 1);
@@ -1326,6 +1338,55 @@ mod tests {
     }
 
     #[test]
+    fn bare_object_error_body_parses_as_one_entry() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+        // "Incorrect external ID field" prints the error without the
+        // array that the Status Codes and Error Responses page wraps it
+        // in. Verbatim, spacing included.
+        let body =
+            r#"{ "message" : "The requested resource does not exist", "errorCode" : "NOT_FOUND" }"#;
+        let err = parse_response_bytes::<Value>(404, body.as_bytes()).unwrap_err();
+        match err {
+            CirrusError::Api {
+                status,
+                errors,
+                raw,
+                ..
+            } => {
+                assert_eq!(status, 404);
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].error_code, "NOT_FOUND");
+                assert_eq!(errors[0].message, "The requested resource does not exist");
+                assert!(errors[0].fields.is_empty());
+                assert!(raw.is_none(), "a parsed body is not kept raw: {raw:?}");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_error_body_leaves_raw_absent() {
+        // An edge or load balancer answering 503 with no body: there is
+        // nothing to preserve, and the error says so instead of printing
+        // an empty excerpt that reads like a parsing problem.
+        let err = parse_error_response(503, b"");
+        match &err {
+            CirrusError::Api {
+                status,
+                errors,
+                raw,
+                ..
+            } => {
+                assert_eq!(*status, 503);
+                assert!(errors.is_empty());
+                assert!(raw.is_none(), "{raw:?}");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+        assert!(err.to_string().contains("<no body>"), "{err}");
+    }
+
+    #[test]
     fn falls_back_to_raw_when_error_body_is_unparseable() {
         let body = "<html>Internal Server Error</html>";
         let err = parse_response_bytes::<Value>(500, body.as_bytes()).unwrap_err();
@@ -1334,6 +1395,7 @@ mod tests {
                 status,
                 errors,
                 raw,
+                ..
             } => {
                 assert_eq!(status, 500);
                 assert!(errors.is_empty());

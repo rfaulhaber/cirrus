@@ -105,6 +105,7 @@ mod tests {
                 status,
                 errors,
                 raw,
+                ..
             } => {
                 assert_eq!(status, 401);
                 assert_eq!(errors.len(), 1);
