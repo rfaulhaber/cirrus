@@ -96,7 +96,9 @@ pub use token_endpoint::{
 pub use token_exchange::{
     SubjectTokenType, TokenExchangeFlow, TokenExchangeFlowBuilder, TokenExchangeSession,
 };
-pub use web_server::{CompletedSession, PendingExchange, WebServerFlow, WebServerFlowBuilder};
+pub use web_server::{
+    AuthorizeOptions, CompletedSession, PendingExchange, WebServerFlow, WebServerFlowBuilder,
+};
 
 // The README's Rust code blocks are compiled as doctests, so the quick
 // start cannot drift from the API. The item exists only under

@@ -149,10 +149,30 @@ impl WebServerFlow {
     /// Cloud site login such as `https://MyDomainName.my.site.com/fineapps`
     /// yields `.../fineapps/services/oauth2/authorize`, matching the
     /// endpoint [`complete`](Self::complete) will POST the code to.
+    ///
+    /// Parameters that vary per attempt, such as the user's `login_hint`
+    /// or a `nonce` for the ID token, go through
+    /// [`start_with`](Self::start_with).
     pub fn start(&self) -> AuthResult<(String, PendingExchange)> {
+        self.start_with(&AuthorizeOptions::default())
+    }
+
+    /// [`start`](Self::start) with per-attempt [`AuthorizeOptions`].
+    ///
+    /// `prompt` and `login_hint` set in `options` replace the flow-level
+    /// values for this attempt. A `nonce`, whether supplied or generated,
+    /// is sent in the URL, kept in the returned [`PendingExchange`], and
+    /// handed back on [`CompletedSession::nonce`] so the caller can check
+    /// the ID token's claim against it.
+    pub fn start_with(&self, options: &AuthorizeOptions) -> AuthResult<(String, PendingExchange)> {
         let code_verifier = random_b64url(VERIFIER_BYTES)?;
         let state = random_b64url(STATE_BYTES)?;
         let code_challenge = pkce_s256_challenge(&code_verifier);
+        let nonce = match &options.nonce {
+            Nonce::None => None,
+            Nonce::Generate => Some(random_b64url(STATE_BYTES)?),
+            Nonce::Value(value) => Some(value.clone()),
+        };
 
         let mut url = url::Url::parse(&self.login_url)?;
         let base_path = url.path().trim_end_matches('/').to_string();
@@ -168,17 +188,34 @@ impl WebServerFlow {
             if !self.scopes.is_empty() {
                 q.append_pair("scope", &self.scopes.join(" "));
             }
-            if let Some(p) = self.prompt.as_deref() {
+            if let Some(p) = options.prompt.as_deref().or(self.prompt.as_deref()) {
                 q.append_pair("prompt", p);
             }
-            if let Some(h) = self.login_hint.as_deref() {
+            if let Some(h) = options.login_hint.as_deref().or(self.login_hint.as_deref()) {
                 q.append_pair("login_hint", h);
+            }
+            if let Some(n) = nonce.as_deref() {
+                q.append_pair("nonce", n);
+            }
+            if let Some(d) = options.display.as_deref() {
+                q.append_pair("display", d);
+            }
+            // Salesforce's default is false; only the opt-in is sent.
+            if options.immediate {
+                q.append_pair("immediate", "true");
+            }
+            if let Some(p) = options.sso_provider.as_deref() {
+                q.append_pair("sso_provider", p);
+            }
+            for (key, value) in &options.extra {
+                q.append_pair(key, value);
             }
         }
 
         let pending = PendingExchange {
             code_verifier,
             state,
+            nonce,
             flow: Some(self.fingerprint()),
         };
 
@@ -268,6 +305,7 @@ impl WebServerFlow {
             scope: token.scope,
             sfdc_site_url: token.sfdc_site_url,
             sfdc_site_id: token.sfdc_site_id,
+            nonce: pending.nonce,
         })
     }
 
@@ -310,6 +348,128 @@ impl WebServerFlow {
     }
 }
 
+/// Per-attempt parameters for the authorization request built by
+/// [`WebServerFlow::start_with`].
+///
+/// A flow is shared across every login it serves, so values that differ
+/// from one attempt to the next live here: the `login_hint` for the user
+/// about to sign in, the `prompt` for this attempt, a `nonce` to bind an
+/// ID token to it, and the `display`, `immediate` and `sso_provider`
+/// parameters Salesforce documents for the authorize endpoint. `prompt`
+/// and `login_hint` set here replace the flow-level values for the one
+/// attempt.
+#[derive(Clone, Default)]
+pub struct AuthorizeOptions {
+    login_hint: Option<String>,
+    prompt: Option<String>,
+    nonce: Nonce,
+    display: Option<String>,
+    immediate: bool,
+    sso_provider: Option<String>,
+    extra: Vec<(String, String)>,
+}
+
+/// Where the `nonce` parameter comes from, if anywhere.
+#[derive(Clone, Default)]
+enum Nonce {
+    #[default]
+    None,
+    Generate,
+    Value(String),
+}
+
+// `login_hint` is the end user's username, redacted like the flow's own.
+// The nonce is kept out of logs for the same reason `state` is.
+impl std::fmt::Debug for AuthorizeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nonce = match self.nonce {
+            Nonce::None => "none",
+            Nonce::Generate => "generated",
+            Nonce::Value(_) => "[redacted]",
+        };
+        f.debug_struct("AuthorizeOptions")
+            .field(
+                "login_hint",
+                &self.login_hint.as_ref().map(|_| "[redacted]"),
+            )
+            .field("prompt", &self.prompt)
+            .field("nonce", &nonce)
+            .field("display", &self.display)
+            .field("immediate", &self.immediate)
+            .field("sso_provider", &self.sso_provider)
+            .field("extra", &self.extra)
+            .finish()
+    }
+}
+
+impl AuthorizeOptions {
+    /// Pre-fills the username on the login page for this attempt,
+    /// replacing the flow-level
+    /// [`login_hint`](WebServerFlowBuilder::login_hint). For an Experience
+    /// Cloud site login Salesforce also needs `prompt=login` for the hint
+    /// to take effect.
+    pub fn login_hint(mut self, hint: impl Into<String>) -> Self {
+        self.login_hint = Some(hint.into());
+        self
+    }
+
+    /// The OAuth `prompt` for this attempt (`login`, `consent`,
+    /// `select_account`, or several separated by spaces), replacing the
+    /// flow-level [`prompt`](WebServerFlowBuilder::prompt).
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = Some(prompt.into());
+        self
+    }
+
+    /// Sends this value as the `nonce`, which Salesforce echoes in the ID
+    /// token when the `openid` scope is requested. It travels in the
+    /// [`PendingExchange`] and comes back on [`CompletedSession::nonce`]
+    /// for the caller to compare with the token's `nonce` claim.
+    pub fn nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.nonce = Nonce::Value(nonce.into());
+        self
+    }
+
+    /// Like [`nonce`](Self::nonce), with a fresh random value (16 bytes,
+    /// URL-safe base64) generated when the authorization URL is built.
+    pub fn generate_nonce(mut self) -> Self {
+        self.nonce = Nonce::Generate;
+        self
+    }
+
+    /// The `display` type of the login and authorization pages: `page`
+    /// (Salesforce's default), `popup`, `touch` or `mobile`.
+    pub fn display(mut self, display: impl Into<String>) -> Self {
+        self.display = Some(display.into());
+        self
+    }
+
+    /// Sends `immediate=true`: a user who is logged in and has already
+    /// approved the app skips the approval step, and any other user comes
+    /// back with `immediate_unsuccessful` instead of a login page. Not
+    /// available for Experience Cloud sites. `false`, Salesforce's
+    /// default, sends no parameter.
+    pub fn immediate(mut self, immediate: bool) -> Self {
+        self.immediate = immediate;
+        self
+    }
+
+    /// Developer name of a single sign-on identity provider configured
+    /// for the login URL, to send the user straight to it.
+    pub fn sso_provider(mut self, provider: impl Into<String>) -> Self {
+        self.sso_provider = Some(provider.into());
+        self
+    }
+
+    /// Appends any other query parameter to the authorization URL.
+    /// Multiple calls accumulate, and a key the flow already sends is
+    /// repeated rather than replaced.
+    pub fn param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra.push((key.into(), value.into()));
+        self
+    }
+}
+
 /// Opaque, serializable handle holding the PKCE verifier + state nonce
 /// between the authorize and token-exchange phases. The caller must
 /// persist it until the OAuth callback fires and pass it back to
@@ -344,19 +504,26 @@ pub struct PendingExchange {
     /// Digest of the issuing flow's configuration, see
     /// [`WebServerFlow::fingerprint`]. Absent from values persisted
     /// before it was recorded, which `complete` accepts unchecked.
+    /// The `nonce` sent in the authorization URL, when
+    /// [`AuthorizeOptions`] asked for one. Absent from values persisted
+    /// before it existed.
+    #[serde(default)]
+    nonce: Option<String>,
     #[serde(default)]
     flow: Option<String>,
 }
 
 // Redact the PKCE secret — leaking it lets anyone holding the
-// authorization code complete the exchange. `state` is a CSRF nonce —
-// non-secret to the user but better hygiene to keep out of logs. The
-// flow digest reveals nothing about the configuration it was taken from.
+// authorization code complete the exchange. `state` is a CSRF nonce and
+// `nonce` an ID-token one — non-secret to the user but better hygiene to
+// keep out of logs. The flow digest reveals nothing about the
+// configuration it was taken from.
 impl std::fmt::Debug for PendingExchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingExchange")
             .field("code_verifier", &"[redacted]")
             .field("state", &"[redacted]")
+            .field("nonce", &self.nonce.as_ref().map(|_| "[redacted]"))
             .field("flow", &self.flow)
             .finish()
     }
@@ -369,6 +536,13 @@ impl PendingExchange {
     /// token — avoid emitting to logs or telemetry.
     pub fn state(&self) -> &str {
         &self.state
+    }
+
+    /// The `nonce` sent in the authorization URL, if [`AuthorizeOptions`]
+    /// asked for one. The same value is returned on
+    /// [`CompletedSession::nonce`] once the exchange succeeds.
+    pub fn nonce(&self) -> Option<&str> {
+        self.nonce.as_deref()
     }
 }
 
@@ -409,11 +583,16 @@ pub struct CompletedSession {
     /// Experience Cloud site ID for the same case. Some Connect REST
     /// requests need it, and nothing else in the response carries it.
     pub sfdc_site_id: Option<String>,
+    /// The `nonce` the authorization request carried, if
+    /// [`AuthorizeOptions`] set one. Compare it with the `nonce` claim of
+    /// `id_token` before trusting that token; this crate does not
+    /// validate ID tokens itself.
+    pub nonce: Option<String>,
 }
 
 // Tokens and the HMAC `signature` are secrets — redact in `{:?}`.
 // `instance_url`, `id`, `issued_at`, `scope` and the site fields are
-// non-secret.
+// non-secret; the nonce is kept out of logs like `state`.
 impl std::fmt::Debug for CompletedSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompletedSession")
@@ -430,6 +609,7 @@ impl std::fmt::Debug for CompletedSession {
             .field("scope", &self.scope)
             .field("sfdc_site_url", &self.sfdc_site_url)
             .field("sfdc_site_id", &self.sfdc_site_id)
+            .field("nonce", &self.nonce.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -825,6 +1005,138 @@ mod tests {
         let parsed = url::Url::parse(&url).unwrap();
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
         assert!(!q.contains_key("scope"));
+    }
+
+    #[test]
+    fn start_with_appends_the_per_attempt_parameters() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm
+        // (release 264) lists these optional authorize parameters:
+        // `display` (page, popup, touch, mobile), `immediate` ("A boolean
+        // value ... The default value is false"), `login_hint`, `nonce`,
+        // `prompt` and `sso_provider` ("The developer name of a single
+        // sign-on (SSO) identity provider").
+        let flow = flow_with_required_fields().build().unwrap();
+        let options = AuthorizeOptions::default()
+            .login_hint("user@example.com")
+            .prompt("consent")
+            .display("popup")
+            .immediate(true)
+            .sso_provider("Corporate_Okta")
+            .param("custom_param", "custom value");
+        let (url, _) = flow.start_with(&options).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+
+        let get = |k: &str| q.get(k).map(|s| s.as_ref());
+        assert_eq!(get("login_hint"), Some("user@example.com"));
+        assert_eq!(get("prompt"), Some("consent"));
+        assert_eq!(get("display"), Some("popup"));
+        assert_eq!(get("immediate"), Some("true"));
+        assert_eq!(get("sso_provider"), Some("Corporate_Okta"));
+        assert_eq!(get("custom_param"), Some("custom value"));
+    }
+
+    #[test]
+    fn start_with_overrides_the_flow_level_prompt_and_login_hint() {
+        let flow = flow_with_required_fields()
+            .prompt("login")
+            .login_hint("default@example.com")
+            .build()
+            .unwrap();
+        let options = AuthorizeOptions::default()
+            .prompt("consent")
+            .login_hint("this-user@example.com");
+        let (url, _) = flow.start_with(&options).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+
+        let values = |k: &str| {
+            pairs
+                .iter()
+                .filter(|(key, _)| key == k)
+                .map(|(_, v)| v.to_string())
+                .collect::<Vec<_>>()
+        };
+        // Exactly one of each: the override replaces, it does not add.
+        assert_eq!(values("prompt"), ["consent"]);
+        assert_eq!(values("login_hint"), ["this-user@example.com"]);
+    }
+
+    #[test]
+    fn start_sends_only_the_configured_parameters() {
+        // Salesforce documents `immediate` as defaulting to false, and the
+        // other per-attempt parameters have no default: none of them may
+        // appear unless asked for, and the session then carries no nonce.
+        let flow = flow_with_required_fields().build().unwrap();
+        let (url, pending) = flow.start().unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        for key in ["nonce", "display", "immediate", "sso_provider"] {
+            assert!(!q.contains_key(key), "unexpected {key} in {url}");
+        }
+        assert_eq!(pending.nonce(), None);
+    }
+
+    #[tokio::test]
+    async fn start_with_a_generated_nonce_carries_it_to_the_completed_session() {
+        // The nonce published in the authorize URL is what Salesforce
+        // echoes in the ID token. The caller validates that claim after
+        // `complete`, so the same value must survive the persisted
+        // pending and come back on the session.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .scope("openid")
+            .build()
+            .unwrap();
+        let (url, pending) = flow
+            .start_with(&AuthorizeOptions::default().generate_nonce())
+            .unwrap();
+        let published = url::Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "nonce")
+            .map(|(_, v)| v.into_owned())
+            .expect("nonce must be in the authorize URL");
+        assert!(published.len() >= 22, "nonce too short: {published}");
+
+        let restored: PendingExchange =
+            serde_json::from_str(&serde_json::to_string(&pending).unwrap()).unwrap();
+        let state = restored.state().to_string();
+        let session = flow.complete(restored, "c", &state).await.unwrap();
+        assert_eq!(session.nonce.as_deref(), Some(published.as_str()));
+    }
+
+    #[test]
+    fn start_with_an_explicit_nonce_uses_it_verbatim() {
+        let flow = flow_with_required_fields().build().unwrap();
+        let (url, pending) = flow
+            .start_with(&AuthorizeOptions::default().nonce("caller-chosen-nonce"))
+            .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(
+            q.get("nonce").map(|s| s.as_ref()),
+            Some("caller-chosen-nonce")
+        );
+        assert_eq!(pending.nonce(), Some("caller-chosen-nonce"));
+    }
+
+    #[test]
+    fn authorize_options_debug_redacts_the_login_hint_and_nonce() {
+        let options = AuthorizeOptions::default()
+            .login_hint("user@example.com")
+            .nonce("caller-chosen-nonce")
+            .display("popup");
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("user@example.com"), "leaked: {debug}");
+        assert!(!debug.contains("caller-chosen-nonce"), "leaked: {debug}");
+        assert!(debug.contains("popup"), "{debug}");
     }
 
     #[test]

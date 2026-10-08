@@ -86,6 +86,11 @@ let session = flow.complete(pending, &code, &state).await?;
 let auth = flow.refresh_auth(&session)?.build()?;
 ```
 
+`start_with(&AuthorizeOptions)` adds the parameters that vary per attempt:
+`login_hint`, `prompt`, `display`, `immediate`, `sso_provider`, any extra
+pair, and a `nonce` (supplied or generated) that comes back on
+`CompletedSession::nonce` for checking the ID token's claim.
+
 `PendingExchange` carries only the per-attempt PKCE verifier and CSRF
 nonce, plus a digest of the flow configuration that issued it — never the
 consumer key or secret. The verifier is still a secret: keep it in a
