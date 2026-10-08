@@ -1075,6 +1075,7 @@ pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
         status,
         errors,
         raw,
+        retry_after: None,
     }
 }
 
@@ -1325,6 +1326,7 @@ mod tests {
                 status,
                 errors,
                 raw,
+                ..
             } => {
                 assert_eq!(status, 400);
                 assert_eq!(errors.len(), 1);
@@ -1393,6 +1395,7 @@ mod tests {
                 status,
                 errors,
                 raw,
+                ..
             } => {
                 assert_eq!(status, 500);
                 assert!(errors.is_empty());

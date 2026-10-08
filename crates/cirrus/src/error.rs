@@ -15,6 +15,7 @@
 
 use cirrus_auth::AuthError;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Specialized `Result` type for Cirrus operations.
@@ -88,7 +89,11 @@ pub enum CirrusError {
     /// Salesforce error entries (the documented array, or the bare object
     /// some per-operation pages print); if the body could not be parsed
     /// as either, the raw body is in `raw`.
+    ///
+    /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
+    /// later field is an additive change.
     #[error("Salesforce API error (status {status}): {}", display_errors(.errors, .raw))]
+    #[non_exhaustive]
     Api {
         /// HTTP status code returned by Salesforce.
         status: u16,
@@ -107,6 +112,14 @@ pub enum CirrusError {
         /// echo the request that provoked them and this value reaches
         /// the error's `Display`.
         raw: Option<String>,
+        /// The response's `Retry-After` hint, when it carried one in a
+        /// form the client could read (delta-seconds or an HTTP-date,
+        /// per RFC 7231 §7.1.3). A caller that owns its own retries —
+        /// under [`RetryPolicy::none`](crate::RetryPolicy::none), once
+        /// the retry budget is spent, or on a request the policy never
+        /// replays — can wait as long as the server asked. `None` when
+        /// the header was absent or unreadable.
+        retry_after: Option<Duration>,
     },
 
     /// An auth flow (token acquisition, refresh, OAuth exchange) failed.
@@ -214,12 +227,34 @@ impl CirrusError {
                 status,
                 errors,
                 raw: Some(raw),
+                retry_after,
             } => Self::Api {
                 status,
                 errors,
                 raw: Some(redact_body(&raw, token)),
+                retry_after,
             },
             Self::InvalidResponse(message) => Self::InvalidResponse(redact_body(&message, token)),
+            other => other,
+        }
+    }
+
+    /// Attaches the response's `Retry-After` hint to an
+    /// [`Api`](Self::Api) error. Every other variant passes through
+    /// unchanged: the hint belongs to a response, and only `Api` is one.
+    pub(crate) fn with_retry_after(self, retry_after: Option<Duration>) -> Self {
+        match self {
+            Self::Api {
+                status,
+                errors,
+                raw,
+                ..
+            } => Self::Api {
+                status,
+                errors,
+                raw,
+                retry_after,
+            },
             other => other,
         }
     }
@@ -308,6 +343,7 @@ mod tests {
                 extra: Default::default(),
             }],
             raw: None,
+            retry_after: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("400"));
@@ -321,6 +357,7 @@ mod tests {
             status: 500,
             errors: vec![],
             raw: Some("Internal Server Error".to_string()),
+            retry_after: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("500"));
@@ -338,6 +375,7 @@ mod tests {
             raw: Some(format!(
                 "Bad Gateway — upstream rejected:\nGET /services/data/v66.0/query?q=SELECT+Id\nAuthorization: Bearer {token}\n"
             )),
+            retry_after: None,
         }
         .redact_secrets(token);
 
@@ -364,6 +402,7 @@ mod tests {
                 "authorization: bearer stale-one\nX-Forwarded-Authorization: BEARER stale-two\n"
                     .to_string(),
             ),
+            retry_after: None,
         }
         .redact_secrets("current-token");
 
@@ -406,6 +445,7 @@ mod tests {
             status: 503,
             errors: vec![],
             raw: Some("Service Unavailable — bearer".to_string()),
+            retry_after: None,
         }
         .redact_secrets("tok");
         let CirrusError::Api { raw: Some(raw), .. } = &err else {

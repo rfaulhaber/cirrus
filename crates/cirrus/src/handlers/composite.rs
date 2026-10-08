@@ -993,6 +993,7 @@ mod tests {
                 status,
                 errors,
                 raw,
+                ..
             } => {
                 assert_eq!(status, 400);
                 assert!(errors.is_empty());
