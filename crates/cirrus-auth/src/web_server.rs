@@ -57,12 +57,29 @@
 //! on that builder before `build` whenever the refresh token is persisted;
 //! the [`refresh`](crate::refresh) module docs explain why.
 //!
-//! ## Confidential vs public clients
+//! ## The consumer secret
 //!
-//! Public (PKCE-only) clients omit `consumer_secret` and rely on the
-//! `code_verifier` for client authentication. Confidential clients still
-//! send `client_secret` on the token exchange — Salesforce permits both.
-//! The builder treats `consumer_secret` as optional accordingly.
+//! Two connected-app settings decide whether `client_secret` must
+//! accompany the token requests, and both require it by default:
+//!
+//! - The code exchange in [`WebServerFlow::complete`] needs it unless
+//!   "Require Secret for Web Server Flow" is off
+//!   (`isConsumerSecretOptional = true` on the `ConnectedApp` metadata
+//!   type, or its external-client-app equivalent).
+//! - The refresh grant that [`WebServerFlow::refresh_auth`] sets up
+//!   needs it unless "Require Secret for Refresh Token Flow" is off
+//!   (`isSecretRequiredForRefreshToken = false`). The two settings are
+//!   independent of each other.
+//!
+//! The flow sends the secret only when `consumer_secret` is set, so a
+//! public client — a desktop or single-page app that cannot keep a
+//! secret — needs an administrator to turn both settings off. PKCE
+//! protects the code against interception; it does not stand in for the
+//! secret. With a setting on and no secret, the token endpoint answers
+//! with an [`AuthError::OAuth`] that names no setting.
+//!
+//! (`isConsumerSecretOptional`, `isSecretRequiredForRefreshToken`:
+//! <https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
 
 use crate::error::{AuthError, AuthResult};
 use crate::refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
@@ -648,8 +665,11 @@ impl WebServerFlowBuilder {
         self
     }
 
-    /// Connected App's Consumer Secret. Optional — set only for
-    /// confidential clients. Public (PKCE-only) clients omit it.
+    /// Connected App's Consumer Secret. Salesforce requires it on the code
+    /// exchange unless the app's "Require Secret for Web Server Flow"
+    /// setting is off (`isConsumerSecretOptional = true`), which is not
+    /// the default; the refresh grant has a setting of its own, see the
+    /// [module docs](self). Sent only when set.
     pub fn consumer_secret(mut self, secret: impl Into<String>) -> Self {
         self.consumer_secret = Some(secret.into());
         self

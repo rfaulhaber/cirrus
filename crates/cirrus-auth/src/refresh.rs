@@ -38,12 +38,19 @@
 //! access tokens are minted on demand by hitting
 //! `/services/oauth2/token` with `grant_type=refresh_token`.
 //!
-//! ## Confidential vs public clients
+//! ## The consumer secret
 //!
-//! Connected Apps configured as **confidential clients** require a
-//! `client_secret` on every refresh; **public clients** (PKCE-based) do
-//! not. The builder treats `consumer_secret` as optional — set it for
-//! confidential clients, omit it for public.
+//! Whether the refresh grant must carry `client_secret` is the connected
+//! app's "Require Secret for Refresh Token Flow" setting
+//! (`isSecretRequiredForRefreshToken` on the `ConnectedApp` metadata
+//! type, or its external-client-app equivalent). It is on by default and
+//! independent of the web-server flow's "Require Secret for Web Server
+//! Flow", so an app that completed a PKCE code exchange without a secret
+//! can still need one here. The builder sends `consumer_secret` only when
+//! it is set; with the setting on and no secret, every mint fails with an
+//! [`AuthError::OAuth`] from the token endpoint that names no setting.
+//!
+//! (<https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
 //!
 //! ## Token rotation
 //!
@@ -420,8 +427,10 @@ impl RefreshTokenAuthBuilder {
         self
     }
 
-    /// Connected App's Consumer Secret (Client Secret). Required for
-    /// confidential clients; omit for public/PKCE clients.
+    /// Connected App's Consumer Secret (Client Secret). Required unless
+    /// the app's "Require Secret for Refresh Token Flow" setting is off,
+    /// which is not the default and is separate from the web-server
+    /// flow's setting; see the [module docs](self). Sent only when set.
     pub fn consumer_secret(mut self, secret: impl Into<String>) -> Self {
         self.consumer_secret = Some(secret.into());
         self

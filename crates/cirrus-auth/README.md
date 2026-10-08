@@ -69,7 +69,7 @@ connected app's credentials throughout:
 ```rust,ignore
 let flow = WebServerFlow::builder()
     .consumer_key("3MVG9...")
-    .consumer_secret("28A2...")   // confidential clients only
+    .consumer_secret("28A2...")   // required unless the app waives it
     .redirect_uri("https://app.example.com/oauth/callback")
     .scope("api")
     .scope("refresh_token")
@@ -85,6 +85,11 @@ let session = flow.complete(pending, &code, &state).await?;
 // key, secret and HTTP client, and starts with the access token just issued.
 let auth = flow.refresh_auth(&session)?.build()?;
 ```
+
+Salesforce requires `client_secret` on the code exchange and again on the
+refresh grant unless the app's "Require Secret for Web Server Flow" and
+"Require Secret for Refresh Token Flow" settings are turned off; both are
+on by default and independent, and PKCE does not stand in for either.
 
 `start_with(&AuthorizeOptions)` adds the parameters that vary per attempt:
 `login_hint`, `prompt`, `display`, `immediate`, `sso_provider`, any extra
