@@ -25,10 +25,18 @@
 //!    Note on Salesforce specifics: the REST API's documented
 //!    rate-limit signal is **403 with `errorCode:
 //!    REQUEST_LIMIT_EXCEEDED`** (its status-code table doesn't include
-//!    429 at all). That response is deliberately *not* retried — it
-//!    means a rolling 24-hour quota is exhausted, and replaying only
-//!    burns more of it. 429 is retried anyway because proxies and API
-//!    gateways in front of an org do emit it.
+//!    429 at all). Salesforce raises it for two different limits: the
+//!    rolling 24-hour request quota, and the cap on concurrent
+//!    long-running requests (5 on Developer Edition and trial orgs,
+//!    25 on production orgs and sandboxes), which clears on its own
+//!    as those requests finish. Only the message text tells the two
+//!    apart, and Salesforce does not document it. The response is
+//!    deliberately *not* retried either way: a replay inside the quota
+//!    burns more of it, and this backoff (well under a second in total
+//!    by default) cannot outlast requests that by definition have run
+//!    for 20 seconds or more. 429 is retried anyway because proxies
+//!    and API gateways in front of an org do emit it. See the
+//!    [API request limits] cheat sheet.
 //! 2. **Honor server hints.** When the server provides a
 //!    [`Retry-After`] header — either RFC 7231 §7.1.3 form,
 //!    delta-seconds or an HTTP-date — use that delay instead of our
@@ -43,6 +51,7 @@
 //!
 //! [`Retry-After`]: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
 //! [`Cirrus::send_with_replay`]: crate::Cirrus::send_with_replay
+//! [API request limits]: https://developer.salesforce.com/docs/platform/salesforce-app-limits-cheatsheet/guide/salesforce-app-limits-platform-api.html
 
 use crate::error::CirrusError;
 use std::time::Duration;
@@ -200,8 +209,9 @@ pub(crate) fn should_retry_status(
     }
     match status {
         // Rate limited: the request was refused, not processed, so a
-        // replay is safe for any method. (Salesforce's own rate-limit
-        // signal is 403 REQUEST_LIMIT_EXCEEDED — deliberately not
+        // replay is safe for any method. (Salesforce's own signal is
+        // 403 REQUEST_LIMIT_EXCEEDED, for the daily quota and for the
+        // concurrent long-running-request cap alike — deliberately not
         // retried, see the module doc; 429 comes from intermediaries.)
         429 => true,
         // 503 is the canonical "temporarily unavailable" status, but
