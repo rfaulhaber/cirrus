@@ -97,9 +97,13 @@ pub(crate) enum EnvelopeBody {
 /// level. `describeValueType` returns the self-referential
 /// `ValueTypeField`, so an endpoint that can shape the response body
 /// would otherwise turn nesting depth into an unrecoverable stack
-/// overflow. No documented Metadata API response nests anywhere near
-/// this deep.
-const MAX_RESPONSE_DEPTH: i32 = 256;
+/// overflow. The value is sized for an unoptimised build, where that
+/// recursion costs several kilobytes of stack per level and a 2 MiB
+/// thread (std's default, libtest's, Tokio's workers) gives out near
+/// 250 levels: the check has to trip well before the deserializer
+/// does. No documented Metadata API response nests anywhere near this
+/// deep; `readMetadata` of a Flow or Layout stays under a dozen levels.
+const MAX_RESPONSE_DEPTH: i32 = 64;
 
 /// Extra capacity reserved for the constant envelope wrapper — the two
 /// tag pairs plus the three namespace declarations. Comfortably above
