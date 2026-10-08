@@ -179,21 +179,42 @@ impl WebServerFlow {
         let pending = PendingExchange {
             code_verifier,
             state,
+            flow: Some(self.fingerprint()),
         };
 
         Ok((url.into(), pending))
     }
 
+    /// Digest of the configuration an authorization code is bound to:
+    /// consumer key, redirect URI and login URL. Each part is length-
+    /// prefixed so no choice of separator lets two configurations
+    /// collide, and the result is hashed so a persisted pending reveals
+    /// none of them.
+    fn fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        for part in [&self.consumer_key, &self.redirect_uri, &self.login_url] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        URL_SAFE_NO_PAD.encode(hasher.finalize())
+    }
+
     /// Phase 2 — verify the returned `state`, exchange `code` for tokens.
     ///
-    /// `pending` is the value [`start`](Self::start) handed back, restored
-    /// from wherever the caller stored it. Returns a [`CompletedSession`]
-    /// with the access token, instance URL, and (if the connected app
-    /// issued them) refresh and ID tokens.
+    /// `pending` is the value [`start`](Self::start) handed back, taken
+    /// out of wherever the caller stored it: it is single-use, and a
+    /// second `complete` with the same value re-presents a redeemed code
+    /// (see [`PendingExchange`]). Returns a [`CompletedSession`] with the
+    /// access token, instance URL, and (if the connected app issued them)
+    /// refresh and ID tokens.
     ///
-    /// Fails with [`AuthError::StateMismatch`] when `returned_state` does
-    /// not match the nonce this flow issued, without contacting the token
-    /// endpoint.
+    /// Fails without contacting the token endpoint with
+    /// [`AuthError::StateMismatch`] when `returned_state` does not match
+    /// the state carried in `pending`, and with
+    /// [`AuthError::FlowMismatch`] when `pending` was issued by a flow
+    /// with a different consumer key, redirect URI or login URL. Both
+    /// phases must run on the same configuration, though not on the same
+    /// flow value.
     pub async fn complete(
         &self,
         pending: PendingExchange,
@@ -209,6 +230,19 @@ impl WebServerFlow {
         // which-byte info.
         if !constant_time_eq(returned_state.as_bytes(), pending.state.as_bytes()) {
             return Err(AuthError::StateMismatch);
+        }
+
+        // A code is bound to the client, redirect URI and issuing host
+        // (RFC 6749 §4.1.3), so a pending from a differently configured
+        // flow could only fail at the token endpoint, as an opaque
+        // invalid_grant. A pending persisted before the digest existed
+        // carries none and is accepted as before.
+        if pending
+            .flow
+            .as_deref()
+            .is_some_and(|recorded| recorded != self.fingerprint())
+        {
+            return Err(AuthError::FlowMismatch);
         }
 
         let mut body: Vec<(&str, &str)> = vec![
@@ -281,27 +315,49 @@ impl WebServerFlow {
 /// persist it until the OAuth callback fires and pass it back to
 /// [`WebServerFlow::complete`].
 ///
-/// It carries no connected-app credentials — only the two per-attempt
-/// values the SDK generates. The `code_verifier` inside is still a
-/// secret: anyone holding both it and an intercepted authorization code
-/// can complete the exchange. Keep it somewhere the end user cannot read,
-/// such as a server-side session store, or a cookie that is **encrypted**
-/// rather than merely signed — a signed cookie is integrity-protected but
-/// its contents are plainly readable by the browser.
+/// It carries no connected-app credentials — only the per-attempt values
+/// the SDK generates and a digest of the flow configuration that issued
+/// it. The `code_verifier` inside is still a secret: anyone holding both
+/// it and an intercepted authorization code can complete the exchange.
+/// Keep it somewhere the end user cannot read, such as a server-side
+/// session store, or a cookie that is **encrypted** rather than merely
+/// signed — a signed cookie is integrity-protected but its contents are
+/// plainly readable by the browser.
+///
+/// A pending is **single-use**. Take it out of the store, keyed by its
+/// [`state`](Self::state), before calling `complete`, so a callback that
+/// is hit twice (a refreshed callback page, a retried request) finds
+/// nothing rather than presenting the redeemed code again: RFC 6749
+/// §4.1.2 has the server deny that second exchange and lets it revoke
+/// every token the code already produced. The state check cannot catch
+/// this case, because both values come from the same stored pending.
+///
+/// Both phases must run on a flow with the same consumer key, redirect
+/// URI and login URL. An authorization code is bound to all three, so no
+/// other flow could redeem it; `complete` compares the digest recorded
+/// here and fails with [`AuthError::FlowMismatch`] before any request
+/// when they differ.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PendingExchange {
     code_verifier: String,
     state: String,
+    /// Digest of the issuing flow's configuration, see
+    /// [`WebServerFlow::fingerprint`]. Absent from values persisted
+    /// before it was recorded, which `complete` accepts unchecked.
+    #[serde(default)]
+    flow: Option<String>,
 }
 
 // Redact the PKCE secret — leaking it lets anyone holding the
 // authorization code complete the exchange. `state` is a CSRF nonce —
-// non-secret to the user but better hygiene to keep out of logs.
+// non-secret to the user but better hygiene to keep out of logs. The
+// flow digest reveals nothing about the configuration it was taken from.
 impl std::fmt::Debug for PendingExchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingExchange")
             .field("code_verifier", &"[redacted]")
             .field("state", &"[redacted]")
+            .field("flow", &self.flow)
             .finish()
     }
 }
@@ -1022,6 +1078,92 @@ mod tests {
         auth.invalidate(&session.access_token).await;
         let token = auth.access_token().await.unwrap();
         assert_eq!(token, "REFRESHED");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_a_pending_started_by_a_differently_configured_flow() {
+        // A code is bound to the client, redirect URI and host that issued
+        // it, so a pending from a sandbox flow completed on a production
+        // flow can only fail remotely. Catch it locally, before any
+        // request: neither server has a mock, so a POST fails loudly.
+        let sandbox = MockServer::start().await;
+        let production = MockServer::start().await;
+        let started_on = flow_with_required_fields()
+            .login_url(sandbox.uri())
+            .build()
+            .unwrap();
+        let completed_on = flow_with_required_fields()
+            .login_url(production.uri())
+            .build()
+            .unwrap();
+        let (_, pending) = started_on.start().unwrap();
+        let state = pending.state().to_string();
+
+        let err = completed_on
+            .complete(pending, "c", &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::FlowMismatch), "{err:?}");
+        assert!(
+            production
+                .received_requests()
+                .await
+                .is_some_and(|r| r.is_empty()),
+            "the code was posted despite the mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_a_pending_from_an_identically_configured_flow() {
+        // The two phases usually run in different processes, each with
+        // its own flow value built from the same settings; the check must
+        // compare configuration, not identity.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let started_on = flow_with_required_fields()
+            .login_url(server.uri())
+            .consumer_secret("hunter2")
+            .build()
+            .unwrap();
+        let completed_on = flow_with_required_fields()
+            .login_url(server.uri())
+            .consumer_secret("hunter2")
+            .build()
+            .unwrap();
+        let (_, pending) = started_on.start().unwrap();
+        let state = pending.state().to_string();
+
+        completed_on.complete(pending, "c", &state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_a_pending_persisted_without_a_fingerprint() {
+        // A pending written by a build that recorded no flow fingerprint
+        // may still be in a store during a rolling deploy; it carries the
+        // two fields a token request needs and must keep working.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("code_verifier=legacy-verifier"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let pending: PendingExchange = serde_json::from_str(
+            r#"{"code_verifier":"legacy-verifier","state":"legacy-state-value"}"#,
+        )
+        .unwrap();
+
+        flow.complete(pending, "c", "legacy-state-value")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

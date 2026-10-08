@@ -87,16 +87,22 @@ let auth = flow.refresh_auth(&session)?.build()?;
 ```
 
 `PendingExchange` carries only the per-attempt PKCE verifier and CSRF
-nonce — never the consumer key or secret. The verifier is still a secret:
-keep it in a server-side session or an encrypted cookie, not a merely
-signed one.
+nonce, plus a digest of the flow configuration that issued it — never the
+consumer key or secret. The verifier is still a secret: keep it in a
+server-side session or an encrypted cookie, not a merely signed one. A
+pending is single-use: take it out of the store, keyed by its state,
+before calling `complete`, so a callback hit twice finds nothing instead
+of presenting the redeemed code again. Both phases must run on a flow with
+the same consumer key, redirect URI and login URL; `complete` checks the
+digest and fails with `FlowMismatch` before any request when they differ.
 
 ## Errors
 
 `AuthError` (re-exported by `cirrus` as `cirrus::AuthError`) covers OAuth
 token-endpoint errors, missing builder fields, transport failures, and
 malformed responses. Failures a caller usually wants to branch on have
-their own variants — `StateMismatch` (a forged or replayed callback),
+their own variants — `StateMismatch` (a forged or crossed callback),
+`FlowMismatch` (a pending completed on a differently configured flow),
 `InstanceUrlMismatch` (wrong org), `UnexpectedResponse` (a non-OAuth
 error body), `InsecureLoginUrl`, `Signing`, `Randomness`, `HttpClient` (a
 client that could not be built, as distinct from `Http`, a request that
