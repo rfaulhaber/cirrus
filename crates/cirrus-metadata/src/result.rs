@@ -136,8 +136,14 @@ pub struct DeployOptions {
     /// Required `true` for production deployments — roll back the
     /// whole job on any failure.
     pub rollback_on_error: Option<bool>,
-    /// Specific Apex test class names to run. Only meaningful when
-    /// `test_level` is `RunSpecifiedTests`.
+    /// Specific Apex test class names to run, one per entry; a name may
+    /// carry a namespace with dot notation. Requires
+    /// `test_level: Some(TestLevel::RunSpecifiedTests)`: Salesforce
+    /// rejects the deploy under any other level, so [`deploy`] refuses a
+    /// non-empty list paired with another level with
+    /// [`MetadataError::InvalidArgument`] before uploading the zip.
+    ///
+    /// [`deploy`]: crate::MetadataClient::deploy
     pub run_tests: Vec<String>,
     /// `true` if the zip is a single package; `false` for a set.
     pub single_package: Option<bool>,

@@ -262,8 +262,9 @@ pub struct DeployOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_on_error: Option<bool>,
 
-    /// Specific Apex test class names to run. Only meaningful when
-    /// `test_level` is [`TestLevel::RunSpecifiedTests`].
+    /// Specific Apex test class names to run, one per entry. Requires
+    /// `test_level: Some(TestLevel::RunSpecifiedTests)`; Salesforce
+    /// rejects a deploy that pairs this list with any other level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_tests: Option<Vec<String>>,
 
