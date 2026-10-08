@@ -3,8 +3,9 @@
 //! Salesforce REST endpoints return errors as a JSON array of objects with a
 //! consistent shape (`message`, `errorCode`, optional `fields`), regardless of
 //! the success-response shape. [`SalesforceError`] models that shape, and
-//! [`CirrusError::Api`] carries the parsed array along with the HTTP
-//! status.
+//! [`CirrusError::Api`] carries the parsed entries along with the HTTP
+//! status. A few per-operation doc pages print a single error object in
+//! place of the array; that form parses as a one-entry list.
 //!
 //! Auth-flow errors (OAuth token endpoints, JWT signing, missing builder
 //! fields on a flow) come from the [`cirrus_auth`] crate as
@@ -25,8 +26,10 @@ const INVALID_SESSION_ID: &str = "INVALID_SESSION_ID";
 
 /// A single Salesforce API error entry.
 ///
-/// Salesforce REST endpoints return errors as a JSON array of these objects.
-/// The shape is schema-independent and applies to every REST resource.
+/// Salesforce REST endpoints return errors as a JSON array of these objects
+/// (a few per-operation examples print one object without the array; both
+/// parse). The shape is schema-independent and applies to every REST
+/// resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SalesforceError {
     /// Human-readable description of the error.
@@ -71,20 +74,22 @@ pub enum CirrusError {
     Http(#[source] reqwest::Error),
 
     /// Salesforce returned a non-2xx response. `errors` holds the parsed
-    /// Salesforce error array; if the body could not be parsed as the
-    /// canonical shape, the raw body is in `raw`.
+    /// Salesforce error entries (the documented array, or the bare object
+    /// some per-operation pages print); if the body could not be parsed
+    /// as either, the raw body is in `raw`.
     #[error("Salesforce API error (status {status}): {}", display_errors(.errors, .raw))]
     Api {
         /// HTTP status code returned by Salesforce.
         status: u16,
-        /// Parsed Salesforce error entries. Empty if the body was not parseable
-        /// as the canonical error array.
+        /// Parsed Salesforce error entries. Empty if the body was not
+        /// parseable as the error array or as a single error object.
         errors: Vec<SalesforceError>,
         /// Raw response body, capped at 2 KiB (longer bodies are
         /// truncated with a marker — non-Salesforce shapes come from
         /// proxies/gateways, and retaining them unboundedly would let
         /// echoed request data flow into logs). Populated when `errors`
-        /// is empty so callers can see what came back.
+        /// is empty so callers can see what came back; `None` when the
+        /// body was empty too.
         ///
         /// Bearer-token material is replaced with `[redacted]` before
         /// the body is stored, because those intermediary pages tend to

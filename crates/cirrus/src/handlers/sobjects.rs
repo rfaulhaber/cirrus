@@ -1516,6 +1516,54 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn create_with_blob_surfaces_the_documented_bare_error_object() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-sobject-insert-update-blob.html
+            // "Example error response" prints the MALFORMED_ID error as a
+            // single object, not inside the array the Status Codes and
+            // Error Responses page documents.
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/services/data/v66.0/sobjects/Document"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "fields": ["FolderId"],
+                    "message": "Folder ID: id value of incorrect type",
+                    "errorCode": "MALFORMED_ID"
+                })))
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let err = sf
+                .sobject("Document")
+                .create_with_blob(BlobUploadSpec {
+                    json_part_name: "entity_document",
+                    metadata: &json!({"Name": "x", "FolderId": "bad", "Type": "pdf"}),
+                    blob_field_name: "Body",
+                    filename: "x.pdf",
+                    content_type: Some("application/pdf"),
+                    blob: bytes::Bytes::from_static(b"x"),
+                })
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::Api {
+                    status,
+                    errors,
+                    raw,
+                    ..
+                } => {
+                    assert_eq!(status, 400);
+                    assert_eq!(errors.len(), 1);
+                    assert_eq!(errors[0].error_code, "MALFORMED_ID");
+                    assert_eq!(errors[0].fields, vec!["FolderId".to_string()]);
+                    assert!(raw.is_none(), "{raw:?}");
+                }
+                other => panic!("expected Api error, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
         async fn create_with_blob_surfaces_salesforce_error_array() {
             let server = MockServer::start().await;
 
