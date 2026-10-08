@@ -253,6 +253,13 @@ impl<'a> SObjectHandler<'a> {
     ///
     /// Calls `DELETE /services/data/{api_version}/sobjects/{name}/{id}`.
     /// Salesforce returns 204 No Content on success.
+    ///
+    /// A DELETE is replayed after a transient failure (a 5xx from an
+    /// intermediary, a lost response), so when the first attempt had
+    /// already committed the replay finds the record gone and this
+    /// returns a 404 [`crate::CirrusError::Api`] for a delete that
+    /// succeeded. Treat that 404 as "already deleted" in cleanup code,
+    /// or disable replays with [`crate::RetryPolicy`].
     pub async fn delete(&self, id: &str) -> CirrusResult<()> {
         let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         self.client
@@ -295,7 +302,9 @@ impl<'a> SObjectHandler<'a> {
     /// Calls
     /// `DELETE /services/data/{api_version}/sobjects/{name}/{external_field}/{external_value}`.
     /// Salesforce returns 204 No Content on success; a value no record
-    /// carries is a 404 [`crate::CirrusError::Api`]. See
+    /// carries is a 404 [`crate::CirrusError::Api`], which is also what
+    /// a replay after a transient failure returns when the first attempt
+    /// had already committed (see [`delete`](Self::delete)). See
     /// [External IDs](Self#external-ids) for the encoding.
     pub async fn delete_by_external_id(
         &self,

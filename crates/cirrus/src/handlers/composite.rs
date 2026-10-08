@@ -428,6 +428,13 @@ impl CompositeSObjectsHandler<'_> {
     /// `ids` is comma-joined into a single query parameter. `all_or_none`
     /// makes the operation transactional: when `true`, any single
     /// failure rolls back the whole batch.
+    ///
+    /// A DELETE is replayed after a transient failure (a 5xx from an
+    /// intermediary, a lost response), so when the first attempt had
+    /// already committed the replay finds the records gone and every
+    /// entry reports `success: false` for a delete that succeeded. Treat
+    /// those entries as "already deleted" in cleanup code, or disable
+    /// replays with [`crate::RetryPolicy`].
     pub async fn delete(
         &self,
         ids: &[&str],

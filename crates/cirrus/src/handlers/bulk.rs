@@ -237,6 +237,11 @@ impl BulkIngestHandler<'_> {
     /// Returns 204 on success.
     ///
     /// Calls `DELETE /services/data/{api_version}/jobs/ingest/{job_id}`.
+    ///
+    /// A DELETE is replayed after a transient failure (a 5xx from an
+    /// intermediary, a lost response), so when the first attempt had
+    /// already removed the job the replay returns a 404
+    /// [`crate::CirrusError::Api`] for a delete that succeeded.
     pub async fn delete(&self, job_id: &str) -> CirrusResult<()> {
         let path = self.client.versioned_url(&["jobs", "ingest", job_id])?;
         self.client
@@ -407,6 +412,11 @@ impl BulkQueryHandler<'_> {
     /// `Aborted`, or `Failed` state.
     ///
     /// Calls `DELETE /services/data/{api_version}/jobs/query/{job_id}`.
+    ///
+    /// A DELETE is replayed after a transient failure (a 5xx from an
+    /// intermediary, a lost response), so when the first attempt had
+    /// already removed the job the replay returns a 404
+    /// [`crate::CirrusError::Api`] for a delete that succeeded.
     pub async fn delete(&self, job_id: &str) -> CirrusResult<()> {
         let path = self.client.versioned_url(&["jobs", "query", job_id])?;
         self.client
