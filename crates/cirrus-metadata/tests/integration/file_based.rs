@@ -297,7 +297,7 @@ async fn deploy_recent_validation_quick_deploys_or_surfaces_typed_error() {
                 "quick-deploy should produce a *new* deploy id (the docs are explicit on this)",
             );
         }
-        Err(MetadataError::Soap { status: _, fault }) => {
+        Err(MetadataError::Soap { fault, .. }) => {
             // Expected on dev/sandbox orgs where the validation has
             // no Apex tests and no enforced coverage — the server
             // declines. The contract we care about: the fault parses
@@ -448,7 +448,7 @@ async fn cancel_deploy_lands_or_surfaces_already_done() {
                 )
                 .await;
         }
-        Err(MetadataError::Soap { status: _, fault }) => {
+        Err(MetadataError::Soap { fault, .. }) => {
             // Deploy already finalized — server rejects the cancel.
             // We still want the typed fault to carry usable diagnostics.
             assert!(

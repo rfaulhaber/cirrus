@@ -432,7 +432,11 @@ async fn send_with_retries(
                             attempt += 1;
                             continue;
                         }
-                        return Err(MetadataError::Soap { status, fault });
+                        return Err(MetadataError::Soap {
+                            status,
+                            fault,
+                            retry_after: retry::parse_retry_after(&headers),
+                        });
                     }
                     Err((parse_err, raw)) => {
                         // No SOAP envelope means the response came from
@@ -459,6 +463,7 @@ async fn send_with_retries(
                         return Err(MetadataError::Http4xx5xx {
                             status,
                             raw: crate::error::cap_raw_body(&raw),
+                            retry_after: retry::parse_retry_after(&headers),
                         });
                     }
                 }

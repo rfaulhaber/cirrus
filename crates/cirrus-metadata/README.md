@@ -256,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Errors
 
 `MetadataError` covers transport failures (`MetadataError::Http`), SOAP
-faults (`MetadataError::Soap { status, fault }`, where `fault.code()`
+faults (`MetadataError::Soap { status, fault, .. }`, where `fault.code()`
 returns the faultcode with its `sf:` prefix stripped), non-SOAP error
 bodies from proxies and gateways (`MetadataError::Http4xx5xx`), bodies over
 the size limit (`MetadataError::ResponseTooLarge`),
