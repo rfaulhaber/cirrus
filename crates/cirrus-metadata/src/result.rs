@@ -82,7 +82,10 @@ pub struct AsyncResult {
 }
 
 /// Lifecycle state of an async metadata call.
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum AsyncRequestState {
     Queued,
     InProgress,
@@ -491,7 +494,50 @@ fn retrieve_message_line(message: &RetrieveMessage) -> String {
 }
 
 /// State of a deployment job. See [`DeployResult::status`].
+///
+/// The enum is `#[non_exhaustive]`, like every wire enum here that
+/// keeps an [`Unknown`](Self::Unknown) fallback: Salesforce extends
+/// these sets between releases, and a literal promoted from `Unknown`
+/// to a named variant has to stay an additive change. Match with a `_`
+/// arm:
+///
+/// ```
+/// use cirrus_metadata::DeployStatus;
+///
+/// fn label(status: DeployStatus) -> &'static str {
+///     match status {
+///         DeployStatus::Succeeded | DeployStatus::SucceededPartial => "ok",
+///         DeployStatus::Failed
+///         | DeployStatus::FinalizingDeployFailed
+///         | DeployStatus::Canceled => "failed",
+///         _ => "running or unrecognized",
+///     }
+/// }
+/// assert_eq!(label(DeployStatus::Succeeded), "ok");
+/// ```
+///
+/// Naming every variant, `Unknown` included, does not compile outside
+/// this crate:
+///
+/// ```compile_fail
+/// use cirrus_metadata::DeployStatus;
+///
+/// fn label(status: DeployStatus) -> &'static str {
+///     match status {
+///         DeployStatus::Pending
+///         | DeployStatus::InProgress
+///         | DeployStatus::FinalizingDeploy
+///         | DeployStatus::Canceling => "running",
+///         DeployStatus::Succeeded | DeployStatus::SucceededPartial => "ok",
+///         DeployStatus::Failed
+///         | DeployStatus::FinalizingDeployFailed
+///         | DeployStatus::Canceled => "failed",
+///         DeployStatus::Unknown => "unrecognized",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum DeployStatus {
     Pending,
     InProgress,
@@ -592,7 +638,10 @@ pub struct DeployMessage {
 }
 
 /// Whether a [`DeployMessage`] reports an error or a warning.
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum DeployProblemType {
     Warning,
     Error,
@@ -986,7 +1035,11 @@ impl RetrieveResult {
     }
 }
 
+/// State of a retrieve job. See [`RetrieveResult::status`].
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum RetrieveStatus {
     Pending,
     InProgress,
@@ -1042,8 +1095,11 @@ pub struct FileProperties {
 }
 
 /// Distribution / lifecycle state of a packaged component.
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum ManageableState {
     Beta,
     Deleted,
