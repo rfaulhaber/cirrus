@@ -63,8 +63,12 @@ pub enum CirrusError {
     HttpClient(#[source] reqwest::Error),
 
     /// Network or transport-level HTTP failure.
+    ///
+    /// The wrapped error names the request's path but never its query
+    /// string: SOQL travels as `q` and an `executeAnonymous` script as
+    /// `anonymousBody`, and the error is what callers log.
     #[error("HTTP request failed")]
-    Http(#[from] reqwest::Error),
+    Http(#[source] reqwest::Error),
 
     /// Salesforce returned a non-2xx response. `errors` holds the parsed
     /// Salesforce error array; if the body could not be parsed as the
@@ -146,6 +150,20 @@ pub enum CirrusError {
 
 /// Stand-in for credential material removed from a stored error body.
 const REDACTED: &str = "[redacted]";
+
+impl From<reqwest::Error> for CirrusError {
+    /// Every transport error enters the crate here. reqwest attaches the
+    /// request URL to timeout, connect and reset errors and prints it in
+    /// both `Display` and `Debug`; the query string is caller data (a
+    /// SOQL `q`, an `executeAnonymous` script), so it is dropped while
+    /// the path stays for diagnostics.
+    fn from(mut error: reqwest::Error) -> Self {
+        if let Some(url) = error.url_mut() {
+            url.set_query(None);
+        }
+        Self::Http(error)
+    }
+}
 
 impl CirrusError {
     /// Whether this is Salesforce's own report that the bearer token is

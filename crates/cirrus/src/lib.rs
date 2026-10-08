@@ -2163,6 +2163,52 @@ mod tests {
                 other => panic!("expected a transport error, got {other:?}"),
             }
         }
+
+        #[tokio::test]
+        async fn transport_errors_do_not_print_the_query_string() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm
+            // executeAnonymous carries the script as the `anonymousBody`
+            // query parameter, and SOQL travels as `q`. reqwest prints the
+            // request URL in a transport error's Display and Debug, so a
+            // logged timeout would otherwise carry the script — a password
+            // here — into the log sink. The path stays for diagnostics.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/tooling/executeAnonymous"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"compiled": true, "success": true}))
+                        .set_delay(Duration::from_secs(30)),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .read_timeout(Duration::from_millis(50))
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf
+                .tooling()
+                .execute_anonymous("System.setPassword('005xx', 'N3wP@ss');")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CirrusError::Http(ref e) if e.is_timeout()),
+                "{err:?}"
+            );
+            for rendered in [format!("{err}"), format!("{err:?}")] {
+                assert!(!rendered.contains("setPassword"), "leaked: {rendered}");
+                assert!(!rendered.contains("N3wP"), "leaked: {rendered}");
+                assert!(!rendered.contains("anonymousBody"), "leaked: {rendered}");
+            }
+            assert!(
+                format!("{err:?}").contains("/tooling/executeAnonymous"),
+                "path should survive for diagnostics: {err:?}"
+            );
+        }
     }
 
     /// Bounds on how much of a response body the client buffers.
