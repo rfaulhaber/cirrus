@@ -929,14 +929,15 @@ impl std::fmt::Debug for RetrieveResult {
 
 impl RetrieveResult {
     /// Decode the `zip_file` field from base64 into raw zip bytes.
-    /// Returns `Ok(None)` if no zip is present in the result.
-    pub fn zip_bytes(&self) -> Result<Option<bytes::Bytes>, base64::DecodeError> {
+    /// Returns `Ok(None)` if no zip is present in the result, and
+    /// [`MetadataError::ZipDecode`] if the payload is not valid base64.
+    pub fn zip_bytes(&self) -> MetadataResult<Option<bytes::Bytes>> {
         use base64::Engine;
         match &self.zip_file {
             None => Ok(None),
-            Some(b64) => base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .map(|v| Some(bytes::Bytes::from(v))),
+            Some(b64) => Ok(Some(bytes::Bytes::from(
+                base64::engine::general_purpose::STANDARD.decode(b64)?,
+            ))),
         }
     }
 
@@ -1600,6 +1601,27 @@ mod tests {
             .len()
                 < 1024
         );
+    }
+
+    #[test]
+    fn retrieve_result_zip_bytes_reports_invalid_base64_as_zip_decode() {
+        use std::error::Error as _;
+        let r = RetrieveResult {
+            id: "x".into(),
+            done: true,
+            success: true,
+            status: Some(RetrieveStatus::Succeeded),
+            error_status_code: None,
+            error_message: None,
+            file_properties: vec![],
+            messages: vec![],
+            zip_file: Some("not base64!".into()),
+        };
+        let err = r.zip_bytes().unwrap_err();
+        assert!(matches!(err, MetadataError::ZipDecode(_)), "{err:?}");
+        let source = err.source().expect("ZipDecode carries the base64 error");
+        assert!(source.is::<base64::DecodeError>());
+        assert_eq!(err.to_string(), "retrieved zip is not valid base64");
     }
 
     #[test]
