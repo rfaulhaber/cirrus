@@ -119,11 +119,10 @@ impl ClientCredentialsAuth {
         let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Safe).await?;
         check_instance_url(&self.instance_url, &token)?;
 
-        let expires_at = token.cache_expiry(self.token_ttl);
-        Ok(crate::mint::CachedToken {
-            access_token: token.access_token,
-            expires_at,
-        })
+        Ok(crate::mint::CachedToken::from_response(
+            token,
+            self.token_ttl,
+        ))
     }
 }
 
@@ -222,6 +221,13 @@ impl ClientCredentialsAuthBuilder {
     /// re-minting. Defaults to 30 minutes. Raising it does not extend a
     /// token past a shorter `expires_in` advertised by the token
     /// endpoint, which always wins.
+    ///
+    /// A token is re-minted ahead of that bound by a refresh margin of
+    /// 60 seconds, or half the TTL when the TTL is under two minutes, so
+    /// a 30-second TTL caches for 15 seconds rather than for nothing.
+    /// `Duration::ZERO` disables caching and mints on every call;
+    /// `Duration::MAX` keeps the token until
+    /// [`invalidate`](crate::AuthSession::invalidate) clears it.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.token_ttl = Some(ttl);
         self
@@ -448,17 +454,19 @@ mod tests {
 
     #[tokio::test]
     async fn transient_failure_inside_the_margin_falls_back_to_the_cached_token() {
-        // A token_ttl equal to the refresh margin puts the cached token
-        // inside the margin the moment it is minted: still valid at
-        // Salesforce, but due for a proactive refresh. When that refresh
-        // hits a 503, the request must go out with the token Salesforce
-        // would still accept rather than fail on a token-endpoint blip.
+        // An advertised lifetime shorter than the refresh margin puts the
+        // cached token inside the margin the moment it is minted: still
+        // valid at Salesforce, but due for a proactive refresh. When that
+        // refresh hits a 503, the request must go out with the token
+        // Salesforce would still accept rather than fail on a
+        // token-endpoint blip.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "00DXX!FIRST",
                 "instance_url": "https://my-org.my.salesforce.com",
+                "expires_in": 30,
             })))
             .up_to_n_times(1)
             .mount(&server)
@@ -471,7 +479,6 @@ mod tests {
 
         let auth = builder_with_required_fields()
             .login_url(server.uri())
-            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
             .build()
             .unwrap();
         assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");
@@ -492,6 +499,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "00DXX!FIRST",
                 "instance_url": "https://my-org.my.salesforce.com",
+                "expires_in": 30,
             })))
             .up_to_n_times(1)
             .mount(&server)
@@ -507,7 +515,6 @@ mod tests {
 
         let auth = builder_with_required_fields()
             .login_url(server.uri())
-            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
             .build()
             .unwrap();
         assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");
@@ -549,9 +556,72 @@ mod tests {
 
     #[tokio::test]
     async fn token_within_refresh_margin_is_treated_as_expired() {
-        // A configured TTL shorter than the 60s refresh margin means every
-        // cached token is already inside its refresh window, so each call
-        // re-mints. 30s < 60s, so this is deterministic without sleeping.
+        // An advertised lifetime shorter than the 60s refresh margin
+        // means every cached token is already inside its refresh window,
+        // so each call re-mints. 30s < 60s, so this is deterministic
+        // without sleeping.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok",
+                    "instance_url": "https://my-org.my.salesforce.com",
+                    "expires_in": 30
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+
+        let _ = auth.access_token().await.unwrap();
+        let _ = auth.access_token().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_token_ttl_caches_the_token() {
+        // `Duration::MAX` means "never expire locally": the token stays
+        // cached until it is invalidated. It must not collapse into "mint
+        // on every call" because the expiry instant is unrepresentable.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok",
+                    "instance_url": "https://my-org.my.salesforce.com"
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .token_ttl(Duration::MAX)
+            .build()
+            .unwrap();
+
+        let _ = auth.access_token().await.unwrap();
+        let _ = auth.access_token().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_ttl_shorter_than_the_fixed_margin_still_caches_for_half_of_it() {
+        // A 30-second TTL caches for 15 seconds and refreshes 15 seconds
+        // early, rather than treating every freshly minted token as
+        // already inside a 60-second margin and minting on every call.
         let server = MockServer::start().await;
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -575,7 +645,7 @@ mod tests {
 
         let _ = auth.access_token().await.unwrap();
         let _ = auth.access_token().await.unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -636,9 +706,9 @@ mod tests {
 
         let auth = builder_with_required_fields()
             .login_url(server.uri())
-            // Shorter than the 60s refresh margin, so a token cached for
-            // this long is always already stale.
-            .token_ttl(Duration::from_secs(30))
+            // Caches nothing, so the advertised two hours would be the
+            // only thing keeping the token alive.
+            .token_ttl(Duration::ZERO)
             .build()
             .unwrap();
 

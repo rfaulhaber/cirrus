@@ -17,9 +17,10 @@
 //! the token's true lifetime: the connected app's session policy is what
 //! actually expires the token, and when the endpoint advertises an
 //! `expires_in` shorter than the configured TTL the cache honours the
-//! shorter of the two. After that window elapses, the next call mints a
-//! new token regardless of whether the previous one would still have
-//! worked.
+//! shorter of the two. The next call re-mints 60 seconds before that
+//! window elapses (or halfway through a TTL under two minutes),
+//! regardless of whether the previous token would still have worked;
+//! see [`JwtAuthBuilder::token_ttl`].
 //!
 //! Minting is single-flight: callers that arrive while a mint is in
 //! flight wait for it and share its outcome, success or failure, so a slow
@@ -190,11 +191,7 @@ impl JwtAuth {
         let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Safe).await?;
         check_instance_url(&self.instance_url, &token)?;
 
-        let expires_at = token.cache_expiry(self.token_ttl);
-        Ok(CachedToken {
-            access_token: token.access_token,
-            expires_at,
-        })
+        Ok(CachedToken::from_response(token, self.token_ttl))
     }
 }
 
@@ -352,6 +349,13 @@ impl JwtAuthBuilder {
     /// re-minting. Defaults to 30 minutes. Set lower to refresh more
     /// aggressively; raising it does not extend a token past a shorter
     /// `expires_in` advertised by the token endpoint, which always wins.
+    ///
+    /// A token is re-minted ahead of that bound by a refresh margin of
+    /// 60 seconds, or half the TTL when the TTL is under two minutes, so
+    /// a 30-second TTL caches for 15 seconds rather than for nothing.
+    /// `Duration::ZERO` disables caching and mints on every call;
+    /// `Duration::MAX` keeps the token until
+    /// [`invalidate`](crate::AuthSession::invalidate) clears it.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.token_ttl = Some(ttl);
         self

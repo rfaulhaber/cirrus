@@ -34,11 +34,41 @@
 //! [`futures::Stream`]: futures::stream::Stream
 
 use crate::Cirrus;
-use crate::error::CirrusResult;
+use crate::error::{CirrusError, CirrusResult};
+use crate::locator::{self, Segment};
 use crate::pagination::Records;
 use crate::response::QueryResult;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+/// The locator shapes Salesforce documents for `nextRecordsUrl`: a
+/// `query` or `queryAll` response names `query/{locator}` (the QueryAll
+/// resource also accepts `queryAll/{locator}`), and a Tooling query names
+/// `tooling/query/{locator}`.
+const NEXT_RECORDS_URL: &[&[Segment]] = &[
+    &[
+        Segment::Literal("services"),
+        Segment::Literal("data"),
+        Segment::Version,
+        Segment::Literal("query"),
+        Segment::Value,
+    ],
+    &[
+        Segment::Literal("services"),
+        Segment::Literal("data"),
+        Segment::Version,
+        Segment::Literal("queryAll"),
+        Segment::Value,
+    ],
+    &[
+        Segment::Literal("services"),
+        Segment::Literal("data"),
+        Segment::Version,
+        Segment::Literal("tooling"),
+        Segment::Literal("query"),
+        Segment::Value,
+    ],
+];
 
 impl Cirrus {
     /// Runs a SOQL query and returns the first batch of active records.
@@ -92,9 +122,18 @@ impl Cirrus {
     /// [`QueryResult::next_records_url`] locator returned by a prior
     /// [`query`](Self::query) or [`query_all`](Self::query_all) call.
     ///
-    /// The locator is an instance-relative path (e.g.
-    /// `/services/data/v66.0/query/01g…-2000`). Pass it through verbatim;
-    /// the leading `/` is optional.
+    /// The locator is an instance-relative path such as
+    /// `/services/data/v66.0/query/01g…-2000`; pass it through as
+    /// Salesforce returned it. The leading `/` is optional, and the same
+    /// path as a fully-qualified URL on the session's instance is
+    /// accepted too. Only the documented `query/{locator}`,
+    /// `queryAll/{locator}` and `tooling/query/{locator}` shapes are sent:
+    /// a value naming another host or resource, or carrying a query
+    /// string, is refused with [`CirrusError::InvalidInput`] before any
+    /// request, so a stored cursor that was tampered with cannot run an
+    /// arbitrary request with the session's token.
+    ///
+    /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
     pub async fn query_more(&self, next_records_url: &str) -> CirrusResult<QueryResult<Value>> {
         self.query_more_as(next_records_url).await
     }
@@ -104,14 +143,11 @@ impl Cirrus {
         &self,
         next_records_url: &str,
     ) -> CirrusResult<QueryResult<R>> {
-        // The locator may arrive without a leading '/' (callers
-        // assembling fragments). Normalize so resolve_url's three-mode
-        // dispatch always treats it as instance-rooted.
-        let path = if next_records_url.starts_with('/') {
-            next_records_url.to_string()
-        } else {
-            format!("/{next_records_url}")
-        };
+        let path = locator::confine(self.auth.instance_url(), next_records_url, NEXT_RECORDS_URL)
+            .map_err(|message| CirrusError::InvalidInput {
+            field: "next_records_url",
+            message: format!("nextRecordsUrl locator {message}"),
+        })?;
         self.get(&path).await
     }
 
@@ -332,6 +368,127 @@ mod tests {
             .await
             .unwrap();
         assert!(qr.done);
+    }
+
+    #[tokio::test]
+    async fn query_more_accepts_a_queryall_locator() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_queryall_more_results.htm
+        // `queryAll/{queryLocator}` is a documented resource of its own,
+        // even though a QueryAll response's `nextRecordsUrl` carries
+        // `query` rather than `queryAll`.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/queryAll/01g5e00001AH2dOAAT-4000",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 0,
+                "done": true,
+                "records": []
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let qr = sf
+            .query_more("/services/data/v66.0/queryAll/01g5e00001AH2dOAAT-4000")
+            .await
+            .unwrap();
+        assert!(qr.done);
+    }
+
+    #[tokio::test]
+    async fn query_more_accepts_a_same_origin_absolute_locator() {
+        // A caller that stored `format!("{instance}{next}")` as a
+        // resumable cursor gets the same request as the bare path, not
+        // `{instance}/https://...`.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gD0000002HU6KIAW-2000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 0,
+                "done": true,
+                "records": []
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let absolute = format!(
+            "{}/services/data/v66.0/query/01gD0000002HU6KIAW-2000",
+            server.uri()
+        );
+        let qr = sf.query_more(&absolute).await.unwrap();
+        assert!(qr.done);
+    }
+
+    #[tokio::test]
+    async fn query_more_refuses_a_foreign_absolute_locator() {
+        // Salesforce only ever issues instance-relative locators; a URL
+        // on another host is refused without a request rather than
+        // resolved into `{instance}/https://...` and answered with an
+        // opaque 404.
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        let err = sf
+            .query_more("https://other.my.salesforce.com/services/data/v66.0/query/01gXXX-2000")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::CirrusError::InvalidInput {
+                    field: "next_records_url",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_more_refuses_a_locator_naming_another_resource() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_query.htm
+        // "These requests use nextRecordsUrl, and don't include any
+        // parameters." A locator that a client stored and handed back is
+        // confined to the documented `query/{locator}` shapes, so a
+        // substituted path cannot run an arbitrary SOQL query, read a
+        // record, or execute Apex (and have a 5xx replay it) as "the next
+        // page".
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        for locator in [
+            "/services/data/v66.0/query?q=SELECT+Id,Email+FROM+Contact",
+            "/services/data/v66.0/query/01gXXX-2000?foo=bar",
+            "/services/data/v66.0/query/01gXXX-2000#frag",
+            "/services/data/v66.0/tooling/executeAnonymous/?anonymousBody=System.debug(1);",
+            "/services/data/v66.0/sobjects/Contact/003xx",
+            "/services/data/v66.0/query/01gXXX-2000/extra",
+            "/services/data/v66.0/query/..",
+            "/services/data/v66.0/query/%2e%2e",
+            "/services/data/v66.0/query/a\\b",
+            "/services/data/66.0/query/01gXXX-2000",
+            "/services/data/v66.0/query/",
+            "",
+        ] {
+            let err = sf.query_more(locator).await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::CirrusError::InvalidInput {
+                        field: "next_records_url",
+                        ..
+                    }
+                ),
+                "{locator}: {err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

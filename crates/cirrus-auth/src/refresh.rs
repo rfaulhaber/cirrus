@@ -71,6 +71,13 @@
 //! (Minting spawns onto the ambient Tokio runtime — already required by
 //! this crate's HTTP stack — and panics outside one.)
 //!
+//! What the detached task does not survive is the runtime itself: Tokio
+//! drops spawned tasks at their next yield when it shuts down, and a
+//! process crash ends them outright, so a replacement that Salesforce has
+//! already committed but the handler has not yet stored is lost either
+//! way. A shutdown path should await [`RefreshTokenAuth::quiesce`] after
+//! its last `access_token` call and before dropping the runtime.
+//!
 //! The flip side is that a detached mint holds the session's write lock
 //! until it finishes, and abandoning the caller's future does not shorten
 //! that. What bounds it is the token-endpoint client's own timeout, which
@@ -132,9 +139,13 @@ struct AuthState {
 ///
 /// The handler is awaited while the session holds its internal write lock,
 /// before the triggering [`access_token`](AuthSession::access_token) call
-/// returns. That ordering is deliberate — persistence completes before any
-/// further token use, so a crash cannot strand the credential between
-/// rotation and storage. Two consequences follow:
+/// returns. That ordering is deliberate: persistence completes before any
+/// further token use, so no request goes out on a session whose stored
+/// credential is already stale. It is not a durability guarantee — a
+/// crash, or a runtime shutdown, between Salesforce committing the
+/// rotation and the handler's durable write still loses the replacement
+/// (see [`RefreshTokenAuth::quiesce`] for the shutdown half). Two
+/// consequences follow from the ordering:
 ///
 /// - The handler **must not** call back into the same session (for example
 ///   [`access_token`](AuthSession::access_token)): it would deadlock on the
@@ -144,7 +155,8 @@ struct AuthState {
 ///
 /// The handler runs even when the `access_token` call that triggered the
 /// rotation is cancelled mid-flight: the mint executes in a task detached
-/// from the caller, so a dropped future cannot skip persistence.
+/// from the caller, so a dropped future cannot skip persistence. A
+/// dropped runtime can; see [`RefreshTokenAuth::quiesce`].
 ///
 /// The signature is infallible: by the time it runs the rotation has
 /// already taken effect at Salesforce and cannot be undone, so there is
@@ -278,11 +290,26 @@ impl MintConfig {
 
         check_instance_url(&self.instance_url, &token)?;
 
-        let expires_at = token.cache_expiry(self.token_ttl);
-        Ok(CachedToken {
-            access_token: token.access_token,
-            expires_at,
-        })
+        Ok(CachedToken::from_response(token, self.token_ttl))
+    }
+}
+
+impl RefreshTokenAuth {
+    /// Waits for an in-flight refresh to finish, including its
+    /// [`RotationHandler`] call.
+    ///
+    /// A mint runs detached from the `access_token` call that started
+    /// it, so dropping that call never abandons a rotation. Dropping the
+    /// Tokio runtime does: the task is cancelled at its next yield, and a
+    /// rotated refresh token the handler had not yet persisted is lost
+    /// while the stored one is already dead at Salesforce. Await this
+    /// after the last `access_token` call and before the runtime shuts
+    /// down. It takes no action of its own and returns at once when
+    /// nothing is in flight.
+    pub async fn quiesce(&self) {
+        // The detached mint holds the write lock until it has recorded
+        // its outcome, so acquiring it is exactly "wait for the mint".
+        drop(self.state.write().await);
     }
 }
 
@@ -442,6 +469,14 @@ impl RefreshTokenAuthBuilder {
     /// re-minting. Defaults to 30 minutes. Raising it does not extend a
     /// token past a shorter `expires_in` advertised by the token
     /// endpoint, which always wins.
+    ///
+    /// A token is re-minted ahead of that bound by a refresh margin of
+    /// 60 seconds, or half the TTL when the TTL is under two minutes, so
+    /// a 30-second TTL caches for 15 seconds rather than for nothing.
+    /// `Duration::ZERO` disables caching and mints (and, under rotation,
+    /// rotates the refresh token) on every call; `Duration::MAX` keeps
+    /// the token until [`invalidate`](crate::AuthSession::invalidate)
+    /// clears it.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.token_ttl = Some(ttl);
         self
@@ -772,12 +807,15 @@ mod tests {
 
     #[tokio::test]
     async fn transient_failure_inside_the_margin_falls_back_to_the_cached_token() {
+        // An advertised lifetime shorter than the refresh margin puts the
+        // cached token inside the margin the moment it is minted.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "00DXX!FIRST",
                 "instance_url": "https://my-org.my.salesforce.com",
+                "expires_in": 30,
             })))
             .up_to_n_times(1)
             .mount(&server)
@@ -790,7 +828,6 @@ mod tests {
 
         let auth = builder_with_required_fields()
             .login_url(server.uri())
-            .token_ttl(crate::token_endpoint::EXPIRY_MARGIN)
             .build()
             .unwrap();
         assert_eq!(&*auth.access_token().await.unwrap(), "00DXX!FIRST");
@@ -1231,6 +1268,37 @@ mod tests {
             "recovery mint must not reuse the invalidated original: {}",
             bodies[1]
         );
+    }
+
+    #[tokio::test]
+    async fn quiesce_waits_for_a_detached_mint_and_its_handler() {
+        // A detached mint survives its dropped caller but not a runtime
+        // shutdown. `quiesce` is what a shutdown path awaits so the
+        // rotated token has reached the handler before the runtime goes.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(token_response("A1", Some("R2")).set_delay(Duration::from_millis(400)))
+            .mount(&server)
+            .await;
+
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .on_rotation(Arc::new(RecordingHandler { seen: seen.clone() }))
+            .build()
+            .unwrap();
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), auth.access_token()).await;
+        assert!(cancelled.is_err(), "caller must be dropped mid-mint");
+
+        auth.quiesce().await;
+        assert_eq!(*seen.lock().await, ["R2"]);
+
+        // Nothing in flight: returns at once.
+        tokio::time::timeout(Duration::from_millis(50), auth.quiesce())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

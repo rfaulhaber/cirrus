@@ -44,6 +44,7 @@
 
 mod error;
 pub mod handlers;
+mod locator;
 pub mod pagination;
 mod response;
 pub mod retry;
@@ -1507,6 +1508,9 @@ impl CirrusBuilder {
     pub async fn build_with_latest_version(self) -> CirrusResult<Cirrus> {
         let bootstrap = self.build()?;
         let latest = bootstrap.latest_api_version().await?;
+        // The discovered value is server-supplied, so it gets the same
+        // check a configured one does before it becomes a path segment.
+        validate_api_version(&latest)?;
         Ok(Cirrus {
             api_version: latest,
             ..bootstrap
@@ -1553,17 +1557,7 @@ fn check_transport_security(
 /// `/services/data/66.0/query` and every call would come back as a
 /// generic `NOT_FOUND` that never mentions the version.
 fn validate_api_version(version: &str) -> CirrusResult<()> {
-    let numeric = version.strip_prefix('v').and_then(|v| v.split_once('.'));
-    let well_formed = match numeric {
-        Some((major, minor)) => {
-            !major.is_empty()
-                && !minor.is_empty()
-                && major.bytes().all(|b| b.is_ascii_digit())
-                && minor.bytes().all(|b| b.is_ascii_digit())
-        }
-        None => false,
-    };
-    if version == "latest" || well_formed {
+    if version == "latest" || locator::is_api_version_segment(version) {
         return Ok(());
     }
     Err(CirrusError::InvalidInput {
@@ -2162,6 +2156,52 @@ mod tests {
                 CirrusError::Http(e) => assert!(e.is_timeout(), "expected a timeout, got {e}"),
                 other => panic!("expected a transport error, got {other:?}"),
             }
+        }
+
+        #[tokio::test]
+        async fn transport_errors_do_not_print_the_query_string() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm
+            // executeAnonymous carries the script as the `anonymousBody`
+            // query parameter, and SOQL travels as `q`. reqwest prints the
+            // request URL in a transport error's Display and Debug, so a
+            // logged timeout would otherwise carry the script — a password
+            // here — into the log sink. The path stays for diagnostics.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/tooling/executeAnonymous"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"compiled": true, "success": true}))
+                        .set_delay(Duration::from_secs(30)),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .read_timeout(Duration::from_millis(50))
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf
+                .tooling()
+                .execute_anonymous("System.setPassword('005xx', 'N3wP@ss');")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CirrusError::Http(ref e) if e.is_timeout()),
+                "{err:?}"
+            );
+            for rendered in [format!("{err}"), format!("{err:?}")] {
+                assert!(!rendered.contains("setPassword"), "leaked: {rendered}");
+                assert!(!rendered.contains("N3wP"), "leaked: {rendered}");
+                assert!(!rendered.contains("anonymousBody"), "leaked: {rendered}");
+            }
+            assert!(
+                format!("{err:?}").contains("/tooling/executeAnonymous"),
+                "path should survive for diagnostics: {err:?}"
+            );
         }
     }
 
@@ -3247,8 +3287,11 @@ mod property_tests {
         }
 
         /// Fully-qualified URLs pass through `resolve_url` unchanged.
-        /// This is the locator-passthrough contract (`nextRecordsUrl`,
-        /// Bulk 2.0 result locators).
+        /// This is the contract behind `versioned_url` and a caller's
+        /// own absolute URL on the verbs; locators (`nextRecordsUrl`,
+        /// the EventLogFile `LogFile` path) are confined by
+        /// `crate::locator` to an instance-rooted path before they reach
+        /// it, and Bulk 2.0 result locators are query parameters.
         #[test]
         fn resolve_url_passes_through_absolute_urls(host in "[a-z0-9-]{1,20}", path in path_segment()) {
             let sf = fixture("https://my.salesforce.com");

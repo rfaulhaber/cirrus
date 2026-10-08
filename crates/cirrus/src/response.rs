@@ -653,6 +653,13 @@ impl ApiVersion {
     /// this for any sorting/comparison.
     pub fn version_number(&self) -> Option<(u32, u32)> {
         let (major, minor) = self.version.split_once('.')?;
+        // `u32::from_str` tolerates a leading `+`, which is not a path
+        // segment character the builder accepts; both halves must be
+        // bare digits so the two checks agree.
+        let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        if !(digits(major) && digits(minor)) {
+            return None;
+        }
         Some((major.parse().ok()?, minor.parse().ok()?))
     }
 

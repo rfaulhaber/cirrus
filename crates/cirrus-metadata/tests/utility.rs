@@ -673,3 +673,78 @@ async fn describe_value_type_reports_the_parent_field_domain() {
     assert_eq!(parent.name, None);
     assert_eq!(result.value_type_fields.len(), 2);
 }
+
+/// A `describeValueTypeResponse` whose first value-type field nests
+/// `levels` `<fields>` elements, the innermost named `leaf`.
+fn nested_describe_value_type(levels: usize) -> String {
+    let mut xml = String::from(
+        r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <describeValueTypeResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result><valueTypeFields>"#,
+    );
+    for _ in 0..levels {
+        xml.push_str("<fields>");
+    }
+    xml.push_str("<name>leaf</name>");
+    for _ in 0..levels {
+        xml.push_str("</fields>");
+    }
+    xml.push_str(
+        r#"</valueTypeFields></result>
+    </describeValueTypeResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+    );
+    xml
+}
+
+async fn describe_nested(
+    levels: usize,
+) -> Result<cirrus_metadata::DescribeValueTypeResult, MetadataError> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:describeValueType>"))
+        .respond_with(xml_response(&nested_describe_value_type(levels)))
+        .mount(&server)
+        .await;
+    client_against(&server)
+        .describe_value_type("{http://soap.sforce.com/2006/04/metadata}CustomObject")
+        .await
+}
+
+// The response nesting cap is 64 levels, counted from the response
+// element: `<describeValueTypeResponse>`, `<result>`, `<valueTypeFields>`
+// and the innermost `<name>` take four, so 60 nested `<fields>` is the
+// deepest response accepted. These run in the default (debug) test
+// profile on a 2 MiB test thread, which is where quick-xml's recursive
+// deserializer costs the most stack per level: the cap exists so the
+// depth check trips before the deserializer overflows the stack, and
+// this is the test that would abort if it did not.
+const DEEPEST_ACCEPTED_FIELDS: usize = 60;
+
+#[tokio::test]
+async fn describe_value_type_deserializes_nesting_at_the_cap() {
+    let result = describe_nested(DEEPEST_ACCEPTED_FIELDS).await.unwrap();
+
+    let mut depth = 0;
+    let mut field = &result.value_type_fields[0];
+    while let Some(child) = field.fields.first() {
+        depth += 1;
+        field = child;
+    }
+    assert_eq!(depth, DEEPEST_ACCEPTED_FIELDS);
+    assert_eq!(field.name.as_deref(), Some("leaf"));
+}
+
+#[tokio::test]
+async fn describe_value_type_rejects_nesting_past_the_cap() {
+    let err = describe_nested(DEEPEST_ACCEPTED_FIELDS + 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MetadataError::InvalidResponse(ref m) if m.contains("nesting")),
+        "{err:?}"
+    );
+}
