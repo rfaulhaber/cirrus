@@ -331,7 +331,7 @@ fn render_deploy_options(opts: &DeployOptions, out: &mut String) {
     write_opt_bool(out, "singlePackage", opts.single_package);
     if let Some(level) = opts.test_level {
         out.push_str("<met:testLevel>");
-        out.push_str(level.as_wire());
+        out.push_str(level.as_str());
         out.push_str("</met:testLevel>");
     }
 }

@@ -23,7 +23,7 @@
 //! [Metadata API Developer Guide]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/
 
 use crate::error::{MetadataError, MetadataResult};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Adapter that maps blank strings to `None`.
 ///
@@ -105,36 +105,50 @@ pub enum AsyncRequestState {
 /// See the [DeployOptions docs] for field semantics and production-deploy
 /// requirements (e.g. `rollback_on_error` must be `true` for prod).
 ///
+/// Serializes and deserializes under the camelCase names of the
+/// Metadata API's `DeployOptions` (`checkOnly`, `runTests`,
+/// `testLevel`, …), the same keys the REST `DeployOptions` in `cirrus`
+/// uses, so one configuration struct can feed either client. Absent
+/// keys take the field defaults.
+///
 /// [DeployOptions docs]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct DeployOptions {
     /// If `true`, the deployment proceeds even if files listed in
     /// `package.xml` are missing from the zip. **Don't set on
     /// production deploys.**
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_missing_files: Option<bool>,
     /// Whether a file that's in the zip but not listed in
     /// `package.xml` is automatically added to the package. A
     /// `retrieve()` is issued with the updated `package.xml` that
     /// includes the file. **Don't set on production deploys.**
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_update_package: Option<bool>,
     /// If `true`, performs a test deployment (validation) without
     /// actually committing the components. Pair with
     /// `test_level: RunLocalTests` to qualify the result for
     /// `deploy_recent_validation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_only: Option<bool>,
     /// Continue on warnings.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_warnings: Option<bool>,
     /// Whether a `retrieve()` runs immediately after the deployment.
     /// Set `true` to retrieve whatever was deployed; its outcome
     /// arrives in [`DeployDetails::retrieve_result`], which
     /// `check_deploy_status` populates only when called with
     /// `include_details: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub perform_retrieve: Option<bool>,
     /// In dev/sandbox orgs only: skip the Recycle Bin when deleting
     /// components listed in `destructiveChanges.xml`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub purge_on_delete: Option<bool>,
     /// Required `true` for production deployments — roll back the
     /// whole job on any failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_on_error: Option<bool>,
     /// Specific Apex test class names to run, one per entry; a name may
     /// carry a namespace with dot notation. Requires
@@ -144,15 +158,23 @@ pub struct DeployOptions {
     /// [`MetadataError::InvalidArgument`] before uploading the zip.
     ///
     /// [`deploy`]: crate::MetadataClient::deploy
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub run_tests: Vec<String>,
     /// `true` if the zip is a single package; `false` for a set.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub single_package: Option<bool>,
     /// How aggressively to run tests during deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub test_level: Option<TestLevel>,
 }
 
 /// How much of the org's Apex test suite to run during a deployment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Each variant is named after its wire literal: [`as_str`](Self::as_str)
+/// and `Display` give the literal, `FromStr` parses one (case-sensitive,
+/// as the API is) and the serde derives use it, so a value read from a
+/// configuration file or a command line needs no hand-written mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TestLevel {
     /// No tests. Sandbox/dev only.
     NoTestRun,
@@ -168,7 +190,19 @@ pub enum TestLevel {
 }
 
 impl TestLevel {
-    pub(crate) fn as_wire(&self) -> &'static str {
+    /// Every level, in the order the deploy() documentation lists them,
+    /// for `FromStr` and its error message.
+    const ALL: [TestLevel; 5] = [
+        Self::NoTestRun,
+        Self::RunSpecifiedTests,
+        Self::RunLocalTests,
+        Self::RunAllTestsInOrg,
+        Self::RunRelevantTests,
+    ];
+
+    /// The wire literal Salesforce uses for this level, e.g.
+    /// `"RunLocalTests"`.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoTestRun => "NoTestRun",
             Self::RunSpecifiedTests => "RunSpecifiedTests",
@@ -176,6 +210,31 @@ impl TestLevel {
             Self::RunLocalTests => "RunLocalTests",
             Self::RunAllTestsInOrg => "RunAllTestsInOrg",
         }
+    }
+}
+
+impl std::fmt::Display for TestLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TestLevel {
+    type Err = MetadataError;
+
+    /// Parses a wire literal such as `"RunLocalTests"`. Anything else is
+    /// [`MetadataError::InvalidArgument`] naming the accepted literals.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str() == s)
+            .ok_or_else(|| {
+                let valid: Vec<&str> = Self::ALL.iter().map(TestLevel::as_str).collect();
+                MetadataError::InvalidArgument(format!(
+                    "unknown test level {s:?}; expected one of {}",
+                    valid.join(", ")
+                ))
+            })
     }
 }
 
@@ -1407,13 +1466,94 @@ mod tests {
         }
     }
 
+    const EVERY_TEST_LEVEL: [TestLevel; 5] = [
+        TestLevel::NoTestRun,
+        TestLevel::RunSpecifiedTests,
+        TestLevel::RunRelevantTests,
+        TestLevel::RunLocalTests,
+        TestLevel::RunAllTestsInOrg,
+    ];
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+    /// DeployOptions.testLevel is a "TestLevel (enumeration of type
+    /// string)" with the values NoTestRun, RunSpecifiedTests,
+    /// RunLocalTests, RunAllTestsInOrg and (beta) RunRelevantTests.
     #[test]
-    fn test_level_as_wire_matches_doc_strings() {
-        assert_eq!(TestLevel::NoTestRun.as_wire(), "NoTestRun");
-        assert_eq!(TestLevel::RunSpecifiedTests.as_wire(), "RunSpecifiedTests");
-        assert_eq!(TestLevel::RunLocalTests.as_wire(), "RunLocalTests");
-        assert_eq!(TestLevel::RunAllTestsInOrg.as_wire(), "RunAllTestsInOrg");
-        assert_eq!(TestLevel::RunRelevantTests.as_wire(), "RunRelevantTests");
+    fn test_level_as_str_matches_doc_strings() {
+        assert_eq!(TestLevel::NoTestRun.as_str(), "NoTestRun");
+        assert_eq!(TestLevel::RunSpecifiedTests.as_str(), "RunSpecifiedTests");
+        assert_eq!(TestLevel::RunLocalTests.as_str(), "RunLocalTests");
+        assert_eq!(TestLevel::RunAllTestsInOrg.as_str(), "RunAllTestsInOrg");
+        assert_eq!(TestLevel::RunRelevantTests.as_str(), "RunRelevantTests");
+    }
+
+    #[test]
+    fn test_level_round_trips_through_display_and_from_str() {
+        for level in EVERY_TEST_LEVEL {
+            assert_eq!(level.to_string(), level.as_str());
+            assert_eq!(level.as_str().parse::<TestLevel>().unwrap(), level);
+        }
+    }
+
+    #[test]
+    fn test_level_from_str_names_the_valid_literals_on_a_miss() {
+        let err = "RunSomeTests".parse::<TestLevel>().unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("RunSomeTests"), "{msg}");
+        for level in EVERY_TEST_LEVEL {
+            assert!(msg.contains(level.as_str()), "{msg}");
+        }
+        // The literals are case-sensitive on the wire.
+        assert!("runlocaltests".parse::<TestLevel>().is_err());
+    }
+
+    #[test]
+    fn test_level_serializes_as_its_wire_literal() {
+        #[derive(serde::Serialize, Deserialize)]
+        struct Wire {
+            level: TestLevel,
+        }
+        for level in EVERY_TEST_LEVEL {
+            let xml = quick_xml::se::to_string(&Wire { level }).unwrap();
+            assert!(
+                xml.contains(&format!("<level>{}</level>", level.as_str())),
+                "{xml}"
+            );
+            let back: Wire = quick_xml::de::from_str(&xml).unwrap();
+            assert_eq!(back.level, level);
+        }
+    }
+
+    /// `DeployOptions` reads from the same camelCase keys the REST
+    /// `DeployOptions` in `cirrus` serializes, so one config struct can
+    /// drive either client; absent keys take the type's defaults.
+    #[test]
+    fn deploy_options_deserialize_from_camel_case_keys_with_defaults() {
+        let opts: DeployOptions = quick_xml::de::from_str(
+            "<DeployOptions>\
+               <checkOnly>true</checkOnly>\
+               <runTests>AccountTest</runTests>\
+               <runTests>ns.ContactTest</runTests>\
+               <testLevel>RunSpecifiedTests</testLevel>\
+             </DeployOptions>",
+        )
+        .unwrap();
+        assert_eq!(opts.check_only, Some(true));
+        assert_eq!(opts.rollback_on_error, None);
+        assert_eq!(opts.run_tests, ["AccountTest", "ns.ContactTest"]);
+        assert_eq!(opts.test_level, Some(TestLevel::RunSpecifiedTests));
+
+        let empty: DeployOptions = quick_xml::de::from_str("<DeployOptions/>").unwrap();
+        assert!(empty.run_tests.is_empty());
+        assert_eq!(empty.test_level, None);
+
+        let xml = quick_xml::se::to_string(&opts).unwrap();
+        assert!(xml.contains("<checkOnly>true</checkOnly>"), "{xml}");
+        assert!(
+            xml.contains("<testLevel>RunSpecifiedTests</testLevel>"),
+            "{xml}"
+        );
     }
 
     #[test]
