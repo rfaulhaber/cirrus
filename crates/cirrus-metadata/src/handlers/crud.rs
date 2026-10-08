@@ -390,7 +390,8 @@ impl SoapOperation for RenameMetadataOp<'_> {
 impl MetadataClient {
     /// Create one or more metadata components synchronously.
     ///
-    /// All components must be of the same `type_name`. Each entry in
+    /// All components must be of the same `type_name`, given as a
+    /// string or a [`MetadataType`](crate::MetadataType). Each entry in
     /// `components` is the inner XML of one `<metadata>` element — the
     /// SDK wraps each in `<metadata xsi:type="met:{type_name}">…</metadata>`
     /// and handles the SOAP envelope. Inside the wrapper, the
@@ -418,9 +419,9 @@ impl MetadataClient {
     /// possible — inspect each entry's `success` field and per-entry
     /// `errors`. Use [`Self::create_metadata_with`] with
     /// [`CrudOptions::all_or_none`] to roll the whole call back instead.
-    pub async fn create_metadata<S: AsRef<str>>(
+    pub async fn create_metadata<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         components: &[S],
     ) -> MetadataResult<Vec<SaveResult>> {
         self.create_metadata_with(type_name, components, CrudOptions::default())
@@ -429,12 +430,13 @@ impl MetadataClient {
 
     /// [`Self::create_metadata`] with [`CrudOptions`], such as
     /// all-or-nothing saving.
-    pub async fn create_metadata_with<S: AsRef<str>>(
+    pub async fn create_metadata_with<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         components: &[S],
         options: CrudOptions,
     ) -> MetadataResult<Vec<SaveResult>> {
+        let type_name = type_name.as_ref();
         check_component_cap(components.len(), type_name, CrudCall::Create)?;
         let op = CreateMetadataOp {
             type_name,
@@ -452,9 +454,9 @@ impl MetadataClient {
     /// to update. Returns one [`SaveResult`] per component. Partial
     /// success is possible; [`Self::update_metadata_with`] with
     /// [`CrudOptions::all_or_none`] rolls the whole call back instead.
-    pub async fn update_metadata<S: AsRef<str>>(
+    pub async fn update_metadata<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         components: &[S],
     ) -> MetadataResult<Vec<SaveResult>> {
         self.update_metadata_with(type_name, components, CrudOptions::default())
@@ -463,12 +465,13 @@ impl MetadataClient {
 
     /// [`Self::update_metadata`] with [`CrudOptions`], such as
     /// all-or-nothing saving.
-    pub async fn update_metadata_with<S: AsRef<str>>(
+    pub async fn update_metadata_with<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         components: &[S],
         options: CrudOptions,
     ) -> MetadataResult<Vec<SaveResult>> {
+        let type_name = type_name.as_ref();
         check_component_cap(components.len(), type_name, CrudCall::Update)?;
         let op = UpdateMetadataOp {
             type_name,
@@ -487,9 +490,9 @@ impl MetadataClient {
     /// API v31+. Partial success is possible;
     /// [`Self::upsert_metadata_with`] with [`CrudOptions::all_or_none`]
     /// rolls the whole call back instead.
-    pub async fn upsert_metadata<S: AsRef<str>>(
+    pub async fn upsert_metadata<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         components: &[S],
     ) -> MetadataResult<Vec<UpsertResult>> {
         self.upsert_metadata_with(type_name, components, CrudOptions::default())
@@ -498,12 +501,13 @@ impl MetadataClient {
 
     /// [`Self::upsert_metadata`] with [`CrudOptions`], such as
     /// all-or-nothing saving.
-    pub async fn upsert_metadata_with<S: AsRef<str>>(
+    pub async fn upsert_metadata_with<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         components: &[S],
         options: CrudOptions,
     ) -> MetadataResult<Vec<UpsertResult>> {
+        let type_name = type_name.as_ref();
         check_component_cap(components.len(), type_name, CrudCall::Upsert)?;
         let op = UpsertMetadataOp {
             type_name,
@@ -520,9 +524,9 @@ impl MetadataClient {
     /// success is possible — inspect each entry — unless
     /// [`Self::delete_metadata_with`] sets
     /// [`CrudOptions::all_or_none`].
-    pub async fn delete_metadata<S: AsRef<str>>(
+    pub async fn delete_metadata<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         full_names: &[S],
     ) -> MetadataResult<Vec<DeleteResult>> {
         self.delete_metadata_with(type_name, full_names, CrudOptions::default())
@@ -531,12 +535,13 @@ impl MetadataClient {
 
     /// [`Self::delete_metadata`] with [`CrudOptions`], such as
     /// all-or-nothing deletion.
-    pub async fn delete_metadata_with<S: AsRef<str>>(
+    pub async fn delete_metadata_with<S: AsRef<str>, N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         full_names: &[S],
         options: CrudOptions,
     ) -> MetadataResult<Vec<DeleteResult>> {
+        let type_name = type_name.as_ref();
         check_component_cap(full_names.len(), type_name, CrudCall::Delete)?;
         let op = DeleteMetadataOp {
             type_name,
@@ -583,7 +588,7 @@ impl MetadataClient {
     ///
     /// # async fn example(md: &MetadataClient) -> Result<(), MetadataError> {
     /// let classes: Vec<ApexClassRecord> = md
-    ///     .read_metadata::<ApexClassRecord, _>("ApexClass", &["Foo", "Bar"])
+    ///     .read_metadata::<ApexClassRecord, _, _>("ApexClass", &["Foo", "Bar"])
     ///     .await?;
     /// for class in &classes {
     ///     let Some(name) = &class.full_name else {
@@ -596,15 +601,17 @@ impl MetadataClient {
     /// ```
     ///
     /// [`MetadataError::Xml`]: crate::MetadataError::Xml
-    pub async fn read_metadata<T, S>(
+    pub async fn read_metadata<T, S, N>(
         &self,
-        type_name: &str,
+        type_name: N,
         full_names: &[S],
     ) -> MetadataResult<Vec<T>>
     where
         T: DeserializeOwned,
         S: AsRef<str>,
+        N: AsRef<str>,
     {
+        let type_name = type_name.as_ref();
         check_component_cap(full_names.len(), type_name, CrudCall::Read)?;
         let op = ReadMetadataOp::<T, S> {
             type_name,
@@ -619,12 +626,13 @@ impl MetadataClient {
     ///
     /// Returns a single [`SaveResult`] — unlike the array-returning
     /// CRUD calls, `renameMetadata` takes one component at a time.
-    pub async fn rename_metadata(
+    pub async fn rename_metadata<N: AsRef<str>>(
         &self,
-        type_name: &str,
+        type_name: N,
         old_full_name: &str,
         new_full_name: &str,
     ) -> MetadataResult<SaveResult> {
+        let type_name = type_name.as_ref();
         let op = RenameMetadataOp {
             type_name,
             old_full_name,
