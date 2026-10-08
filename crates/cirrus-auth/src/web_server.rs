@@ -104,7 +104,8 @@ pub struct WebServerFlow {
 }
 
 // The connected app's client secret (and the key identifying it) must
-// never reach logs — redact in `{:?}`.
+// never reach logs — redact in `{:?}`. `login_hint` is the end user's
+// username, so it is personal data and gets the same treatment.
 impl std::fmt::Debug for WebServerFlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebServerFlow")
@@ -117,7 +118,10 @@ impl std::fmt::Debug for WebServerFlow {
             .field("login_url", &self.login_url)
             .field("scopes", &self.scopes)
             .field("prompt", &self.prompt)
-            .field("login_hint", &self.login_hint)
+            .field(
+                "login_hint",
+                &self.login_hint.as_ref().map(|_| "[redacted]"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -337,7 +341,7 @@ impl std::fmt::Debug for WebServerFlowBuilder {
             .field("login_url", &self.login_url)
             .field("scopes", &self.scopes)
             .field("prompt", &self.prompt)
-            .field("login_hint", &self.login_hint)
+            .field("login_hint", &self.login_hint.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -570,14 +574,27 @@ mod tests {
     fn flow_debug_redacts_credentials() {
         let flow = flow_with_required_fields()
             .consumer_secret("super-secret-value")
+            .login_hint("user@example.com")
             .build()
             .unwrap();
         let debug = format!("{flow:?}");
         assert!(!debug.contains("super-secret-value"), "leaked: {debug}");
         assert!(!debug.contains("consumer-key-123"), "leaked: {debug}");
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm
+        // `login_hint` "provides a valid username value": it is the end
+        // user's identity, redacted the way the JWT flow redacts `sub`.
+        assert!(!debug.contains("user@example.com"), "leaked: {debug}");
         assert!(debug.contains("[redacted]"));
         // Non-secret config stays visible for diagnostics.
         assert!(debug.contains("https://app.example.com/oauth/callback"));
+    }
+
+    #[test]
+    fn builder_debug_redacts_the_login_hint() {
+        let builder = flow_with_required_fields().login_hint("user@example.com");
+        let debug = format!("{builder:?}");
+        assert!(!debug.contains("user@example.com"), "leaked: {debug}");
+        assert!(debug.contains("login_hint: true"), "{debug}");
     }
 
     #[test]
