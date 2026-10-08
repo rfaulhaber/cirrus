@@ -123,11 +123,12 @@ pub use headers::{
 pub use package_manifest::{MetadataType, PackageManifest};
 pub use result::{
     AsyncRequestState, AsyncResult, CancelDeployResult, CodeCoverageResult, CodeCoverageWarning,
-    DeleteResult, DeployDetails, DeployMessage, DeployOptions, DeployProblemType, DeployResult,
-    DeployStatus, DescribeMetadataObject, DescribeMetadataResult, DescribeValueTypeResult,
-    FileProperties, ListMetadataQuery, ManageableState, MetadataApiError, PicklistEntry,
-    RetrieveMessage, RetrieveRequest, RetrieveResult, RetrieveStatus, RunTestFailure,
-    RunTestSuccess, RunTestsResult, SaveResult, TestLevel, UpsertResult, ValueTypeField,
+    CodeLocation, DeleteResult, DeployDetails, DeployMessage, DeployOptions, DeployProblemType,
+    DeployResult, DeployStatus, DescribeMetadataObject, DescribeMetadataResult,
+    DescribeValueTypeResult, FileProperties, FlowCoverageResult, FlowCoverageWarning,
+    ListMetadataQuery, ManageableState, MetadataApiError, PicklistEntry, RetrieveMessage,
+    RetrieveRequest, RetrieveResult, RetrieveStatus, RunTestFailure, RunTestSuccess,
+    RunTestsResult, SaveResult, TestLevel, UpsertResult, ValueTypeField,
 };
 pub use retry::RetryPolicy;
 pub use transport::SoapOperation;

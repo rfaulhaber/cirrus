@@ -318,7 +318,12 @@ impl DeployResult {
                     tests
                         .into_iter()
                         .flat_map(|t| t.code_coverage_warnings.iter().map(coverage_warning_line)),
-                );
+                )
+                .chain(tests.into_iter().flat_map(|t| {
+                    t.flow_coverage_warnings
+                        .iter()
+                        .map(flow_coverage_warning_line)
+                }));
             push_problems(&mut summary, problems);
         }
         summary
@@ -402,6 +407,14 @@ fn coverage_warning_line(warning: &CodeCoverageWarning) -> String {
     match warning.name.as_deref() {
         Some(name) => format!("coverage {name}: {message}"),
         None => format!("coverage: {message}"),
+    }
+}
+
+fn flow_coverage_warning_line(warning: &FlowCoverageWarning) -> String {
+    let message = warning.message.as_deref().unwrap_or("(no message)");
+    match warning.flow_name.as_deref() {
+        Some(name) => format!("flow coverage {name}: {message}"),
+        None => format!("flow coverage: {message}"),
     }
 }
 
@@ -547,6 +560,16 @@ pub struct RunTestsResult {
     pub code_coverage: Vec<CodeCoverageResult>,
     #[serde(default)]
     pub code_coverage_warnings: Vec<CodeCoverageWarning>,
+    /// Coverage of each flow version the test run executed. Available
+    /// in API version 44.0 and later; empty before that and when no
+    /// test ran a flow.
+    #[serde(default)]
+    pub flow_coverage: Vec<FlowCoverageResult>,
+    /// Flow coverage warnings — one per flow that fell short, plus
+    /// org-wide warnings that name no flow. Available in API version
+    /// 44.0 and later.
+    #[serde(default)]
+    pub flow_coverage_warnings: Vec<FlowCoverageWarning>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -587,19 +610,128 @@ pub struct RunTestFailure {
     pub see_all_data: bool,
 }
 
+/// Code coverage of one Apex class or trigger, inside
+/// [`RunTestsResult::code_coverage`].
+///
+/// The counts say how much was covered; the `CodeLocation` arrays say
+/// where. `locations_not_covered` is what a CI job needs to annotate
+/// the lines a failed 75% check left uncovered.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeCoverageResult {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
+    /// Name of the class or trigger covered.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace: Option<String>,
+    /// Total number of code locations.
     #[serde(default)]
     pub num_locations: i32,
+    /// Number of code locations no test executed.
     #[serde(default)]
     pub num_locations_not_covered: i32,
+    /// Line and column of each location no test executed.
+    #[serde(default)]
+    pub locations_not_covered: Vec<CodeLocation>,
+    /// Line and column of each location a test executed, with the
+    /// execution count. Available in API version 68.0 and later.
+    #[serde(default)]
+    pub locations_covered: Vec<CodeLocation>,
+    /// DML statement locations, with execution counts and cumulative
+    /// time.
+    #[serde(default)]
+    pub dml_info: Vec<CodeLocation>,
+    /// Method invocation locations, with execution counts and
+    /// cumulative time.
+    #[serde(default)]
+    pub method_info: Vec<CodeLocation>,
+    /// SOQL statement locations, with execution counts and cumulative
+    /// time.
+    #[serde(default)]
+    pub soql_info: Vec<CodeLocation>,
+}
+
+/// One position in Apex source, inside the arrays of
+/// [`CodeCoverageResult`].
+// Wire-shape provenance: the CodeLocation table on `meta_deployresult`
+// lists `column`, `line` and `numExecutions` as int and `time` as
+// double. The documented "Do not use" `type` field of CodeCoverageResult
+// and RunTestFailure is left out. `time` is typed like
+// `RunTestSuccess::time`; whether Salesforce ever sends it blank is not
+// documented.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeLocation {
+    #[serde(default)]
+    pub column: i32,
+    #[serde(default)]
+    pub line: i32,
+    /// How many times the test run executed this location. `0` for an
+    /// entry in [`CodeCoverageResult::locations_not_covered`].
+    #[serde(default)]
+    pub num_executions: i32,
+    /// Cumulative time spent at this location, in milliseconds.
+    #[serde(default)]
+    pub time: f64,
+}
+
+/// Coverage of one flow version, inside
+/// [`RunTestsResult::flow_coverage`]. Available in API version 44.0
+/// and later.
+// Wire-shape provenance: the FlowCoverageResult table on
+// `meta_deployresult` types `elementsNotCovered` as `string` but
+// describes it as a "List of elements", so it is modeled as a repeated
+// element. `processType` is a "FlowProcessType (enumeration of type
+// string)" whose set grows with the platform; the literal is kept
+// rather than mapped onto a closed enum.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowCoverageResult {
+    /// API names of the flow elements the test run did not execute.
+    #[serde(default)]
+    pub elements_not_covered: Vec<String>,
+    /// ID of the flow version.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_id: Option<String>,
+    /// API name of the flow.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_name: Option<String>,
+    /// Namespace that contains the flow, if one is specified.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_namespace: Option<String>,
+    /// Total number of elements in the flow version.
+    #[serde(default)]
+    pub num_elements: i32,
+    /// Number of elements the test run did not execute.
+    #[serde(default)]
+    pub num_elements_not_covered: i32,
+    /// The flow version's process type, as Salesforce names it (for
+    /// example `AutoLaunchedFlow` or `Flow`).
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub process_type: Option<String>,
+}
+
+/// A warning about flow coverage, inside
+/// [`RunTestsResult::flow_coverage_warnings`]. Available in API
+/// version 44.0 and later.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowCoverageWarning {
+    /// ID of the flow version that generated the warning. `None` for a
+    /// warning about the org's overall flow coverage.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_id: Option<String>,
+    /// API name of the flow that generated the warning. `None` for a
+    /// warning about the org's overall flow coverage.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_name: Option<String>,
+    /// Namespace that contains the flow, if one was specified.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_namespace: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1441,6 +1573,11 @@ mod tests {
                  <codeCoverageWarnings>\
                    <message>Average test coverage is 61%, at least 75% is required.</message>\
                  </codeCoverageWarnings>\
+                 <flowCoverageWarnings>\
+                   <flowId>301xx00000000AB</flowId>\
+                   <flowName>Lead_Routing</flowName>\
+                   <message>Flow coverage is 60%, at least 75% is required.</message>\
+                 </flowCoverageWarnings>\
                </runTestResult>\
              </details></result>",
         );
@@ -1451,7 +1588,8 @@ mod tests {
              ApexClass Broken: Unexpected token.; \
              objects/Thing__c.object: Invalid field.; \
              test BrokenTest.testIt: Assertion Failed; \
-             coverage: Average test coverage is 61%, at least 75% is required."
+             coverage: Average test coverage is 61%, at least 75% is required.; \
+             flow coverage Lead_Routing: Flow coverage is 60%, at least 75% is required."
         );
     }
 
@@ -1518,5 +1656,113 @@ mod tests {
             r.into_result().unwrap_err().to_string(),
             "retrieve did not succeed: status not reported"
         );
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    /// RunTestsResult carries `flowCoverage` ("FlowCoverageResult[]",
+    /// API 44.0+) and `flowCoverageWarnings` ("FlowCoverageWarning[]");
+    /// each CodeCoverageResult carries `locationsNotCovered`,
+    /// `locationsCovered` (API 68.0+), `dmlInfo`, `methodInfo` and
+    /// `soqlInfo`, all "CodeLocation[]" with `column`, `line`,
+    /// `numExecutions` (int) and `time` (double). FlowCoverageResult
+    /// lists `elementsNotCovered` ("List of elements ... that weren't
+    /// executed"), `flowId`, `flowName`, `flowNamespace`, `numElements`,
+    /// `numElementsNotCovered` and `processType`; FlowCoverageWarning
+    /// lists `flowId`, `flowName` ("If the warning applies to the overall
+    /// test coverage of flows within your org, this value is null"),
+    /// `flowNamespace` and `message`. The page publishes no XML sample
+    /// for these, so the fixture is built from the field tables.
+    #[test]
+    fn run_tests_result_reads_code_locations_and_flow_coverage() {
+        let parsed: RunTestsResult = quick_xml::de::from_str(
+            "<runTestResult>\
+               <numTestsRun>1</numTestsRun>\
+               <codeCoverage>\
+                 <id>01pxx0000000001</id>\
+                 <name>AccountService</name>\
+                 <numLocations>10</numLocations>\
+                 <numLocationsNotCovered>2</numLocationsNotCovered>\
+                 <locationsNotCovered><column>5</column><line>12</line>\
+                   <numExecutions>0</numExecutions><time>0.0</time></locationsNotCovered>\
+                 <locationsNotCovered><column>9</column><line>31</line>\
+                   <numExecutions>0</numExecutions><time>0.0</time></locationsNotCovered>\
+                 <locationsCovered><column>1</column><line>3</line>\
+                   <numExecutions>4</numExecutions><time>1.5</time></locationsCovered>\
+                 <dmlInfo><column>9</column><line>20</line>\
+                   <numExecutions>2</numExecutions><time>12.25</time></dmlInfo>\
+                 <methodInfo><column>17</column><line>8</line>\
+                   <numExecutions>4</numExecutions><time>3.0</time></methodInfo>\
+                 <soqlInfo><column>21</column><line>14</line>\
+                   <numExecutions>1</numExecutions><time>7.75</time></soqlInfo>\
+               </codeCoverage>\
+               <flowCoverage>\
+                 <elementsNotCovered>Decision_1</elementsNotCovered>\
+                 <elementsNotCovered>Assignment_2</elementsNotCovered>\
+                 <flowId>301xx00000000AB</flowId>\
+                 <flowName>Lead_Routing</flowName>\
+                 <flowNamespace></flowNamespace>\
+                 <numElements>6</numElements>\
+                 <numElementsNotCovered>2</numElementsNotCovered>\
+                 <processType>AutoLaunchedFlow</processType>\
+               </flowCoverage>\
+               <flowCoverageWarnings>\
+                 <flowId></flowId>\
+                 <flowName></flowName>\
+                 <message>Flow coverage is 60%, at least 75% is required.</message>\
+               </flowCoverageWarnings>\
+             </runTestResult>",
+        )
+        .unwrap();
+
+        let coverage = &parsed.code_coverage[0];
+        assert_eq!(coverage.num_locations_not_covered, 2);
+        assert_eq!(
+            coverage
+                .locations_not_covered
+                .iter()
+                .map(|l| (l.line, l.column, l.num_executions))
+                .collect::<Vec<_>>(),
+            vec![(12, 5, 0), (31, 9, 0)]
+        );
+        assert_eq!(coverage.locations_covered.len(), 1);
+        assert_eq!(coverage.locations_covered[0].time, 1.5);
+        assert_eq!(coverage.dml_info[0].time, 12.25);
+        assert_eq!(coverage.method_info[0].num_executions, 4);
+        assert_eq!(coverage.soql_info[0].line, 14);
+
+        let flow = &parsed.flow_coverage[0];
+        assert_eq!(flow.flow_id.as_deref(), Some("301xx00000000AB"));
+        assert_eq!(flow.flow_name.as_deref(), Some("Lead_Routing"));
+        assert_eq!(flow.flow_namespace, None);
+        assert_eq!(flow.num_elements, 6);
+        assert_eq!(flow.num_elements_not_covered, 2);
+        assert_eq!(flow.elements_not_covered, ["Decision_1", "Assignment_2"]);
+        assert_eq!(flow.process_type.as_deref(), Some("AutoLaunchedFlow"));
+
+        let warning = &parsed.flow_coverage_warnings[0];
+        assert_eq!(warning.flow_id, None);
+        assert_eq!(warning.flow_name, None, "an org-wide warning names no flow");
+        assert_eq!(
+            warning.message.as_deref(),
+            Some("Flow coverage is 60%, at least 75% is required.")
+        );
+    }
+
+    #[test]
+    fn run_tests_result_defaults_the_coverage_arrays_when_absent() {
+        // Pre-44.0 orgs and Apex-only deploys send none of these.
+        let parsed: RunTestsResult = quick_xml::de::from_str(
+            "<runTestResult><numTestsRun>0</numTestsRun>\
+             <codeCoverage><name>Foo</name></codeCoverage></runTestResult>",
+        )
+        .unwrap();
+        assert!(parsed.flow_coverage.is_empty());
+        assert!(parsed.flow_coverage_warnings.is_empty());
+        let coverage = &parsed.code_coverage[0];
+        assert!(coverage.locations_not_covered.is_empty());
+        assert!(coverage.locations_covered.is_empty());
+        assert!(coverage.dml_info.is_empty());
+        assert!(coverage.method_info.is_empty());
+        assert!(coverage.soql_info.is_empty());
     }
 }
