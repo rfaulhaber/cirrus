@@ -69,7 +69,7 @@ connected app's credentials throughout:
 ```rust,ignore
 let flow = WebServerFlow::builder()
     .consumer_key("3MVG9...")
-    .consumer_secret("28A2...")   // confidential clients only
+    .consumer_secret("28A2...")   // required unless the app waives it
     .redirect_uri("https://app.example.com/oauth/callback")
     .scope("api")
     .scope("refresh_token")
@@ -80,19 +80,39 @@ let (url, pending) = flow.start()?;
 
 // Phase 2 — on callback, with `pending` restored from your store.
 let session = flow.complete(pending, &code, &state).await?;
+
+// Keep the session renewable: the builder inherits this flow's login URL,
+// key, secret and HTTP client, and starts with the access token just issued.
+let auth = flow.refresh_auth(&session)?.build()?;
 ```
 
+Salesforce requires `client_secret` on the code exchange and again on the
+refresh grant unless the app's "Require Secret for Web Server Flow" and
+"Require Secret for Refresh Token Flow" settings are turned off; both are
+on by default and independent, and PKCE does not stand in for either.
+
+`start_with(&AuthorizeOptions)` adds the parameters that vary per attempt:
+`login_hint`, `prompt`, `display`, `immediate`, `sso_provider`, any extra
+pair, and a `nonce` (supplied or generated) that comes back on
+`CompletedSession::nonce` for checking the ID token's claim.
+
 `PendingExchange` carries only the per-attempt PKCE verifier and CSRF
-nonce — never the consumer key or secret. The verifier is still a secret:
-keep it in a server-side session or an encrypted cookie, not a merely
-signed one.
+nonce, plus a digest of the flow configuration that issued it — never the
+consumer key or secret. The verifier is still a secret: keep it in a
+server-side session or an encrypted cookie, not a merely signed one. A
+pending is single-use: take it out of the store, keyed by its state,
+before calling `complete`, so a callback hit twice finds nothing instead
+of presenting the redeemed code again. Both phases must run on a flow with
+the same consumer key, redirect URI and login URL; `complete` checks the
+digest and fails with `FlowMismatch` before any request when they differ.
 
 ## Errors
 
 `AuthError` (re-exported by `cirrus` as `cirrus::AuthError`) covers OAuth
 token-endpoint errors, missing builder fields, transport failures, and
 malformed responses. Failures a caller usually wants to branch on have
-their own variants — `StateMismatch` (a forged or replayed callback),
+their own variants — `StateMismatch` (a forged or crossed callback),
+`FlowMismatch` (a pending completed on a differently configured flow),
 `InstanceUrlMismatch` (wrong org), `UnexpectedResponse` (a non-OAuth
 error body), `InsecureLoginUrl`, `Signing`, `Randomness`, `HttpClient` (a
 client that could not be built, as distinct from `Http`, a request that

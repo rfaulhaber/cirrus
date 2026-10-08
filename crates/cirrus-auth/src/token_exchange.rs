@@ -46,9 +46,11 @@
 //! A [`TokenExchangeSession`] containing the Salesforce `access_token`,
 //! `instance_url`, and (depending on the connected app's scopes and the
 //! request) optional `refresh_token`, `id_token`, `scope`, `issued_at`.
-//! If a `refresh_token` is returned, wire it into a
-//! [`crate::RefreshTokenAuth`] for ongoing API access — the same
-//! pattern as Web Server PKCE.
+//! If a `refresh_token` is returned, build a [`crate::RefreshTokenAuth`]
+//! from it for ongoing API access, giving the builder the same
+//! `login_url`, consumer key and secret this flow used; whether the
+//! refresh grant needs the secret is a connected-app setting of its own,
+//! see the [`refresh`](crate::refresh) module docs.
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
@@ -181,6 +183,8 @@ impl TokenExchangeFlow {
             scope: token.scope,
             id: token.id,
             signature: token.signature,
+            sfdc_site_url: token.sfdc_site_url,
+            sfdc_site_id: token.sfdc_site_id,
         })
     }
 }
@@ -215,10 +219,17 @@ pub struct TokenExchangeSession {
     /// `id`; `access_token` and `instance_url` are not covered by it, so
     /// a valid signature says nothing about their provenance.
     pub signature: Option<String>,
+    /// Experience Cloud site URL, returned when the exchanged user is a
+    /// member of a site. `None` for a direct org login.
+    pub sfdc_site_url: Option<String>,
+    /// Experience Cloud site ID for the same case. Some Connect REST
+    /// requests need it, and nothing else in the response carries it.
+    pub sfdc_site_id: Option<String>,
 }
 
 // Tokens and the HMAC `signature` are secrets — redact in `{:?}`.
-// `instance_url`, `id`, `issued_at`, and `scope` are non-secret.
+// `instance_url`, `id`, `issued_at`, `scope` and the site fields are
+// non-secret.
 impl std::fmt::Debug for TokenExchangeSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenExchangeSession")
@@ -233,6 +244,8 @@ impl std::fmt::Debug for TokenExchangeSession {
             .field("scope", &self.scope)
             .field("id", &self.id)
             .field("signature", &self.signature.as_ref().map(|_| "[redacted]"))
+            .field("sfdc_site_url", &self.sfdc_site_url)
+            .field("sfdc_site_id", &self.sfdc_site_id)
             .finish()
     }
 }
@@ -565,6 +578,45 @@ mod tests {
             session.signature.as_deref(),
             Some("CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=")
         );
+        // The documented sample is a non-site login: no site fields.
+        assert_eq!(session.sfdc_site_url, None);
+        assert_eq!(session.sfdc_site_id, None);
+    }
+
+    #[tokio::test]
+    async fn exchange_surfaces_the_experience_cloud_site_fields() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm
+        // and https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_refresh_token_flow.htm
+        // (release 264) list `sfdc_site_url` and `sfdc_site_id` in the
+        // token response for a site member. The token-exchange page does
+        // not repeat the response table; the response parser is shared
+        // across grants, so an exchange that returns them must surface
+        // them rather than drop them.
+        let server = MockServer::start().await;
+        let mut body = documented_token_response();
+        body["sfdc_site_url"] = serde_json::Value::String("https://acme.my.site.com/portal".into());
+        body["sfdc_site_id"] = serde_json::Value::String("0DB5e000000TN1aGAG".into());
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let session = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap()
+            .exchange()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.sfdc_site_url.as_deref(),
+            Some("https://acme.my.site.com/portal")
+        );
+        assert_eq!(session.sfdc_site_id.as_deref(), Some("0DB5e000000TN1aGAG"));
+        let debug = format!("{session:?}");
+        assert!(debug.contains("0DB5e000000TN1aGAG"), "{debug}");
     }
 
     #[tokio::test]

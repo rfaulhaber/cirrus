@@ -55,14 +55,32 @@ pub enum AuthError {
     },
 
     /// The `state` echoed back on an OAuth callback did not match the
-    /// value the flow issued.
+    /// value carried in the [`PendingExchange`](crate::PendingExchange)
+    /// the caller supplied.
     ///
     /// This is a security event, not a configuration problem: it means
-    /// the callback was forged, replayed, or crossed with another
-    /// authorization attempt. Match on it to answer 400 and raise an
-    /// audit alert rather than retrying.
+    /// the callback was forged, or crossed with another authorization
+    /// attempt's pending. Match on it to answer 400 and raise an audit
+    /// alert rather than retrying. It does not catch the same callback
+    /// hit twice with the same pending; see `PendingExchange` for why a
+    /// pending is single-use.
     #[error("OAuth callback state does not match the value this flow issued")]
     StateMismatch,
+
+    /// The [`PendingExchange`](crate::PendingExchange) handed to
+    /// [`WebServerFlow::complete`](crate::WebServerFlow::complete) was
+    /// issued by a flow with a different consumer key, redirect URI or
+    /// login URL.
+    ///
+    /// An authorization code is bound to the client and redirect URI
+    /// that requested it (RFC 6749 §4.1.3) and to the host that issued
+    /// it, so no other flow can redeem it. This is a configuration
+    /// problem, typically a sandbox authorization completed on a
+    /// production flow, and is caught before any request is sent.
+    #[error(
+        "OAuth callback was started by a flow with a different consumer key, redirect URI or login URL"
+    )]
+    FlowMismatch,
 
     /// The token response reported a different `instance_url` than the
     /// one configured on the builder, which usually means the connected
@@ -187,6 +205,7 @@ impl AuthError {
                 error_description: error_description.clone(),
             },
             Self::StateMismatch => Self::StateMismatch,
+            Self::FlowMismatch => Self::FlowMismatch,
             Self::InstanceUrlMismatch {
                 configured,
                 returned,
@@ -231,6 +250,7 @@ impl std::fmt::Debug for AuthError {
                 )
                 .finish(),
             Self::StateMismatch => f.write_str("StateMismatch"),
+            Self::FlowMismatch => f.write_str("FlowMismatch"),
             Self::InstanceUrlMismatch {
                 configured,
                 returned,

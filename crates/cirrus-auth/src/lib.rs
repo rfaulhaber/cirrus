@@ -31,8 +31,9 @@
 //! - [`client_credentials`] — OAuth 2.0 Client Credentials grant for
 //!   server-to-server integrations that run as a pre-configured user.
 //! - [`web_server`] — OAuth 2.0 Web Server flow with PKCE for
-//!   user-interactive authorization. Yields a [`RefreshTokenAuth`] once the
-//!   user comes back through the redirect URL.
+//!   user-interactive authorization. Yields a [`CompletedSession`] once
+//!   the user comes back through the redirect URL, which
+//!   [`WebServerFlow::refresh_auth`] turns into a [`RefreshTokenAuth`].
 //! - [`token_exchange`] — OAuth 2.0 Token Exchange (RFC 8693).
 //!
 //! [`transport`] holds the https-or-loopback rule that every Cirrus
@@ -95,7 +96,9 @@ pub use token_endpoint::{
 pub use token_exchange::{
     SubjectTokenType, TokenExchangeFlow, TokenExchangeFlowBuilder, TokenExchangeSession,
 };
-pub use web_server::{CompletedSession, PendingExchange, WebServerFlow, WebServerFlowBuilder};
+pub use web_server::{
+    AuthorizeOptions, CompletedSession, PendingExchange, WebServerFlow, WebServerFlowBuilder,
+};
 
 // The README's Rust code blocks are compiled as doctests, so the quick
 // start cannot drift from the API. The item exists only under

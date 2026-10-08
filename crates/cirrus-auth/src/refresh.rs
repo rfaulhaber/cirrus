@@ -38,12 +38,19 @@
 //! access tokens are minted on demand by hitting
 //! `/services/oauth2/token` with `grant_type=refresh_token`.
 //!
-//! ## Confidential vs public clients
+//! ## The consumer secret
 //!
-//! Connected Apps configured as **confidential clients** require a
-//! `client_secret` on every refresh; **public clients** (PKCE-based) do
-//! not. The builder treats `consumer_secret` as optional — set it for
-//! confidential clients, omit it for public.
+//! Whether the refresh grant must carry `client_secret` is the connected
+//! app's "Require Secret for Refresh Token Flow" setting
+//! (`isSecretRequiredForRefreshToken` on the `ConnectedApp` metadata
+//! type, or its external-client-app equivalent). It is on by default and
+//! independent of the web-server flow's "Require Secret for Web Server
+//! Flow", so an app that completed a PKCE code exchange without a secret
+//! can still need one here. The builder sends `consumer_secret` only when
+//! it is set; with the setting on and no secret, every mint fails with an
+//! [`AuthError::OAuth`] from the token endpoint that names no setting.
+//!
+//! (<https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
 //!
 //! ## Token rotation
 //!
@@ -390,6 +397,7 @@ pub struct RefreshTokenAuthBuilder {
     consumer_key: Option<String>,
     consumer_secret: Option<String>,
     refresh_token: Option<String>,
+    initial_access_token: Option<String>,
     login_url: Option<String>,
     instance_url: Option<String>,
     token_ttl: Option<Duration>,
@@ -403,6 +411,7 @@ impl std::fmt::Debug for RefreshTokenAuthBuilder {
             .field("consumer_key", &self.consumer_key.is_some())
             .field("consumer_secret", &self.consumer_secret.is_some())
             .field("refresh_token", &self.refresh_token.is_some())
+            .field("initial_access_token", &self.initial_access_token.is_some())
             .field("login_url", &self.login_url)
             .field("instance_url", &self.instance_url)
             .field("token_ttl", &self.token_ttl)
@@ -418,8 +427,10 @@ impl RefreshTokenAuthBuilder {
         self
     }
 
-    /// Connected App's Consumer Secret (Client Secret). Required for
-    /// confidential clients; omit for public/PKCE clients.
+    /// Connected App's Consumer Secret (Client Secret). Required unless
+    /// the app's "Require Secret for Refresh Token Flow" setting is off,
+    /// which is not the default and is separate from the web-server
+    /// flow's setting; see the [module docs](self). Sent only when set.
     pub fn consumer_secret(mut self, secret: impl Into<String>) -> Self {
         self.consumer_secret = Some(secret.into());
         self
@@ -435,6 +446,25 @@ impl RefreshTokenAuthBuilder {
     /// replacements across restarts.
     pub fn refresh_token(mut self, token: impl Into<String>) -> Self {
         self.refresh_token = Some(token.into());
+        self
+    }
+
+    /// Seeds the cache with the access token that was issued alongside
+    /// the refresh token, so the first
+    /// [`access_token`](crate::AuthSession::access_token) call hands it
+    /// out instead of spending a refresh grant on a token the caller
+    /// already holds. Under Refresh Token Rotation that first grant would
+    /// also replace the refresh token the caller just stored. Optional;
+    /// [`WebServerFlow::refresh_auth`](crate::WebServerFlow::refresh_auth)
+    /// sets it from the completed session.
+    ///
+    /// The token is treated as freshly issued and cached for
+    /// [`token_ttl`](Self::token_ttl), like a minted one. A seed that has
+    /// in fact expired costs one rejected request: the client's 401
+    /// handling calls [`invalidate`](crate::AuthSession::invalidate) and
+    /// the next call mints through the refresh token.
+    pub fn initial_access_token(mut self, token: impl Into<String>) -> Self {
+        self.initial_access_token = Some(token.into());
         self
     }
 
@@ -554,6 +584,10 @@ impl RefreshTokenAuthBuilder {
         require_secure_login_url(&login_url)?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
         let http = self.http.into_client()?;
+        let mint = match self.initial_access_token {
+            Some(token) => MintState::seeded(CachedToken::issued_now(token, token_ttl)),
+            None => MintState::default(),
+        };
 
         Ok(RefreshTokenAuth {
             config: Arc::new(MintConfig {
@@ -567,7 +601,7 @@ impl RefreshTokenAuthBuilder {
             }),
             state: Arc::new(RwLock::new(AuthState {
                 refresh_token,
-                mint: MintState::default(),
+                mint,
             })),
         })
     }
@@ -636,6 +670,51 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn initial_access_token_is_served_without_a_mint() {
+        // A flow that issued the refresh token issued an access token with
+        // it. The first call must hand that one out rather than spend a
+        // grant (and, under rotation, the refresh token) re-minting it.
+        let server = MockServer::start().await; // no mock: a mint fails loudly
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .initial_access_token("ISSUED-WITH-THE-REFRESH-TOKEN")
+            .build()
+            .unwrap();
+
+        let token = auth.access_token().await.unwrap();
+        assert_eq!(token, "ISSUED-WITH-THE-REFRESH-TOKEN");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .is_some_and(|r| r.is_empty()),
+            "the seeded token should not trigger a refresh grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidating_the_initial_access_token_mints_through_the_refresh_token() {
+        // The seed is an ordinary cached token: a 401 on it must clear it
+        // and the next call must mint, like any other stale token.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(token_response("MINTED", None))
+            .mount(&server)
+            .await;
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .initial_access_token("STALE-SEED")
+            .build()
+            .unwrap();
+
+        auth.invalidate("STALE-SEED").await;
+        let token = auth.access_token().await.unwrap();
+        assert_eq!(token, "MINTED");
     }
 
     #[tokio::test]
