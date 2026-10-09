@@ -121,7 +121,7 @@ impl Cirrus {
 /// Discovery (querying the `EventLogFile` sObject) goes through the
 /// regular [`Cirrus::query`] / [`Cirrus::query_as`] methods —
 /// this handler only exposes the binary CSV fetch.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EventMonitoringHandler<'a> {
     client: &'a Cirrus,
 }

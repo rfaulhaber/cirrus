@@ -100,7 +100,7 @@ impl Cirrus {
 /// default retry behaviour.
 ///
 /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ApexHandler<'a> {
     client: &'a Cirrus,
 }

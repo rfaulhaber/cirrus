@@ -27,8 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("SF_INSTANCE_URL")?,
     ));
     let sf = Cirrus::builder().auth(auth).build()?;
-    let bulk = sf.bulk();
-    let ingest = bulk.ingest();
+    let ingest = sf.bulk().ingest();
 
     let spec = BulkIngestSpec::new("Account", BulkOperation::Insert);
     let job = ingest.create(&spec).await?;

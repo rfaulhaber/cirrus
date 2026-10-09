@@ -87,22 +87,41 @@ impl Cirrus {
 }
 
 /// Top-level Bulk API 2.0 handler. Returned by [`Cirrus::bulk`].
-#[derive(Debug)]
+///
+/// The sub-handlers borrow the [`Cirrus`] client, not this value, so
+/// they can be bound straight off a temporary and kept:
+///
+/// ```no_run
+/// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+/// # use std::sync::Arc;
+/// # async fn example() -> Result<(), cirrus::CirrusError> {
+/// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+/// # let sf = Cirrus::builder().auth(auth).build()?;
+/// let ingest = sf.bulk().ingest();
+/// let first = ingest.get("7503gEXAMPLEaaaAAA").await?;
+/// let second = ingest.get("7503gEXAMPLEbbbAAA").await?;
+/// # let _ = (first, second);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy)]
 pub struct BulkHandler<'a> {
     client: &'a Cirrus,
 }
 
-impl BulkHandler<'_> {
+// The sub-handlers carry the client borrow (`'a`), not a borrow of this
+// parent, so `sf.bulk().ingest()` outlives the temporary `BulkHandler`.
+impl<'a> BulkHandler<'a> {
     /// Returns a sub-handler for ingest (CRUD-style) bulk jobs under
     /// `/jobs/ingest`.
-    pub fn ingest(&self) -> BulkIngestHandler<'_> {
+    pub fn ingest(&self) -> BulkIngestHandler<'a> {
         BulkIngestHandler {
             client: self.client,
         }
     }
 
     /// Returns a sub-handler for SOQL query bulk jobs under `/jobs/query`.
-    pub fn query(&self) -> BulkQueryHandler<'_> {
+    pub fn query(&self) -> BulkQueryHandler<'a> {
         BulkQueryHandler {
             client: self.client,
         }
@@ -135,7 +154,7 @@ impl BulkHandler<'_> {
 /// `UploadComplete`.
 ///
 /// [`abort`](Self::abort) cancels a job mid-flight if needed.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct BulkIngestHandler<'a> {
     client: &'a Cirrus,
 }
@@ -402,7 +421,7 @@ impl BulkIngestHandler<'_> {
 /// 4. [`delete`](Self::delete) when done.
 ///
 /// [`list`](Self::list) finds the org's existing query jobs.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct BulkQueryHandler<'a> {
     client: &'a Cirrus,
 }
@@ -1911,8 +1930,7 @@ mod tests {
             .await;
 
         let sf = fixture(server.uri());
-        let bulk = sf.bulk();
-        let ingest = bulk.ingest();
+        let ingest = sf.bulk().ingest();
         let spec = BulkIngestSpec::new("Account", BulkOperation::Insert);
 
         let over = bytes::Bytes::from("a".repeat(MAX_MULTIPART_JOB_DATA_CHARS + 1));

@@ -67,12 +67,14 @@ impl Cirrus {
 /// Handler for `/services/data/{version}/composite/...` resources.
 ///
 /// Returned by [`Cirrus::composite`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CompositeHandler<'a> {
     client: &'a Cirrus,
 }
 
-impl CompositeHandler<'_> {
+// `sobjects` hands out the client borrow (`'a`), not a borrow of this
+// parent, so `sf.composite().sobjects()` outlives the temporary.
+impl<'a> CompositeHandler<'a> {
     /// Executes up to 25 sub-requests in a single batch via
     /// `POST /services/data/{api_version}/composite/batch`.
     ///
@@ -188,7 +190,24 @@ impl CompositeHandler<'_> {
     /// Five operations live under this resource — see
     /// [`CompositeSObjectsHandler`] for create/retrieve/update/upsert/delete
     /// against up to 200 (or 800 for retrieve) records per call.
-    pub fn sobjects(&self) -> CompositeSObjectsHandler<'_> {
+    ///
+    /// The sub-handler borrows the [`Cirrus`] client, not this value, so
+    /// it can be bound straight off a temporary and kept:
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// let collections = sf.composite().sobjects();
+    /// let a = collections.retrieve("Account", &["001a"], &["Name"]).await?;
+    /// let b = collections.retrieve("Contact", &["003b"], &["Email"]).await?;
+    /// # let _ = (a, b);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sobjects(&self) -> CompositeSObjectsHandler<'a> {
         CompositeSObjectsHandler {
             client: self.client,
         }
@@ -348,7 +367,7 @@ pub struct CompositeSubrequest {
 /// records on partial failure (when `allOrNone: false`, which is the
 /// default). Set `allOrNone` on the request body (or query string for
 /// delete) to enable transactional semantics.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CompositeSObjectsHandler<'a> {
     client: &'a Cirrus,
 }

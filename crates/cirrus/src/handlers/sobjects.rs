@@ -12,6 +12,33 @@
 //!   produces a record returns `serde_json::Value` by default, with an
 //!   `_as::<T>()` variant for typed deserialization.
 //!
+//! # Concurrent calls
+//!
+//! A handler is a `Copy` pair of borrows, and each of its methods
+//! borrows the handler for the life of the returned future. To fan
+//! calls out with `join_all` or `buffer_unordered`, hoist the handler
+//! into a local and let each `async move` block take its own copy —
+//! building the handler inside the closure would hand back a future
+//! that outlives it:
+//!
+//! ```no_run
+//! # use cirrus::{Cirrus, auth::StaticTokenAuth};
+//! # use std::sync::Arc;
+//! use futures::future::join_all;
+//! # async fn example() -> Result<(), cirrus::CirrusError> {
+//! # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+//! # let sf = Cirrus::builder().auth(auth).build()?;
+//! let ids = ["001000000000001AAA", "001000000000002AAA"];
+//! let accounts = sf.sobject("Account");
+//! let records = join_all(ids.iter().map(|id| async move { accounts.retrieve(id).await })).await;
+//! for record in records {
+//!     let record = record?;
+//!     println!("{}", record["Name"]);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [`describe_global`]: SObjectsHandler::describe_global
 //! [`Cirrus::sobjects`]: crate::Cirrus::sobjects
 //! [`Cirrus::sobject`]: crate::Cirrus::sobject
@@ -57,7 +84,7 @@ impl Cirrus {
 }
 
 /// Collection-level sObject handler. Returned by [`Cirrus::sobjects`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SObjectsHandler<'a> {
     client: &'a Cirrus,
 }
@@ -119,7 +146,7 @@ impl SObjectsHandler<'_> {
 ///
 /// [Upsert]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_upsert_patch.htm
 /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SObjectHandler<'a> {
     client: &'a Cirrus,
     name: &'a str,
