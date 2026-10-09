@@ -80,9 +80,11 @@ pub use handlers::composite::{
     BatchRequest, BatchSubrequest, CompositeRequest, CompositeSubrequest,
 };
 pub use handlers::metadata::{
-    DeployMessage, DeployOptions, DeployRequest, DeployResultDetails, DeployResultInnerDetails,
-    DeployStatus, MetadataHandler, RunTestResults, TestLevel,
+    DeployDetails, DeployMessage, DeployOptions, DeployRequest, DeployResult, DeployStatus,
+    MetadataHandler, RunTestsResult, TestLevel,
 };
+#[allow(deprecated)]
+pub use handlers::metadata::{DeployResultDetails, DeployResultInnerDetails, RunTestResults};
 pub use handlers::sobjects::{BlobUploadSpec, UpsertOptions};
 pub use pagination::Records;
 pub use response::LimitInfo;
