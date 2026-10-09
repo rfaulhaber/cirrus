@@ -77,7 +77,8 @@ pub use handlers::bulk::{
     BulkIngestSpec, BulkJobListOptions, BulkQuerySpec, MAX_MULTIPART_JOB_DATA_CHARS,
 };
 pub use handlers::composite::{
-    BatchRequest, BatchSubrequest, CompositeRequest, CompositeSubrequest,
+    BatchRequest, BatchSubrequest, COLLECTION_MAX_RECORDS, CollectionRecord, CompositeRequest,
+    CompositeSubrequest, RecordAttributes, SObjectCollection,
 };
 pub use handlers::metadata::{
     DeployDetails, DeployMessage, DeployOptions, DeployRequest, DeployResult, DeployStatus,
