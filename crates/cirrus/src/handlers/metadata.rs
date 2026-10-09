@@ -262,8 +262,9 @@ pub struct DeployOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_on_error: Option<bool>,
 
-    /// Specific Apex test class names to run. Only meaningful when
-    /// `test_level` is [`TestLevel::RunSpecifiedTests`].
+    /// Specific Apex test class names to run, one per entry. Requires
+    /// `test_level: Some(TestLevel::RunSpecifiedTests)`; Salesforce
+    /// rejects a deploy that pairs this list with any other level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_tests: Option<Vec<String>>,
 
@@ -631,7 +632,13 @@ pub struct RunTestResults {
 /// `FinalizingDeploy` / `FinalizingDeployFailed` were added in API
 /// 65.0 — earlier API versions go straight from `InProgress` to
 /// `Succeeded` / `Failed`.
+///
+/// The enum is `#[non_exhaustive]`: Salesforce extends the set between
+/// releases, and a literal promoted from [`Unknown`](Self::Unknown) to
+/// a named variant has to stay an additive change. Match with a `_`
+/// arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum DeployStatus {
     Pending,
     InProgress,

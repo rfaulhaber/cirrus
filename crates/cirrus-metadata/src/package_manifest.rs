@@ -80,9 +80,11 @@ use std::borrow::Cow;
 pub struct MetadataType(Cow<'static, str>);
 
 impl MetadataType {
-    /// Construct from any `&'static str` or `String`.
-    pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
-        Self(name.into())
+    /// Construct from any string: a literal, a `String`, or a borrowed
+    /// name such as the `xml_name` of a
+    /// [`DescribeMetadataObject`](crate::DescribeMetadataObject).
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(Cow::Owned(name.into()))
     }
 
     /// The bare name as it appears in `package.xml`.
@@ -103,15 +105,29 @@ impl std::fmt::Display for MetadataType {
     }
 }
 
-impl From<&'static str> for MetadataType {
-    fn from(s: &'static str) -> Self {
-        Self(Cow::Borrowed(s))
+// A borrowed name is copied rather than held for `'static`, so the
+// names `describe_metadata` returns can feed a manifest directly.
+impl From<&str> for MetadataType {
+    fn from(s: &str) -> Self {
+        Self(Cow::Owned(s.to_owned()))
+    }
+}
+
+impl From<&String> for MetadataType {
+    fn from(s: &String) -> Self {
+        Self(Cow::Owned(s.clone()))
     }
 }
 
 impl From<String> for MetadataType {
     fn from(s: String) -> Self {
         Self(Cow::Owned(s))
+    }
+}
+
+impl From<&MetadataType> for MetadataType {
+    fn from(t: &MetadataType) -> Self {
+        t.clone()
     }
 }
 
@@ -135,7 +151,17 @@ impl MetadataType {
     pub const CUSTOM_FIELD: MetadataType = MetadataType(Cow::Borrowed("CustomField"));
     pub const CUSTOM_TAB: MetadataType = MetadataType(Cow::Borrowed("CustomTab"));
     pub const CUSTOM_APPLICATION: MetadataType = MetadataType(Cow::Borrowed("CustomApplication"));
+    /// The container of every custom label in the org. Salesforce only
+    /// retrieves it whole: use it with [`PackageManifest::all`], since
+    /// named members under `CustomLabels` do not select labels by
+    /// name. Named labels, and the CRUD-based calls, take
+    /// [`CUSTOM_LABEL`](Self::CUSTOM_LABEL).
     pub const CUSTOM_LABELS: MetadataType = MetadataType(Cow::Borrowed("CustomLabels"));
+    /// One custom label. The type for retrieving labels by name
+    /// (`add(MetadataType::CUSTOM_LABEL, ["quoteManual"])`) and for the
+    /// CRUD-based calls; [`CUSTOM_LABELS`](Self::CUSTOM_LABELS) is the
+    /// wildcard-only container.
+    pub const CUSTOM_LABEL: MetadataType = MetadataType(Cow::Borrowed("CustomLabel"));
     pub const CUSTOM_METADATA: MetadataType = MetadataType(Cow::Borrowed("CustomMetadata"));
     pub const CUSTOM_OBJECT_TRANSLATION: MetadataType =
         MetadataType(Cow::Borrowed("CustomObjectTranslation"));
@@ -480,6 +506,42 @@ mod tests {
     fn metadata_type_into_from_static_str() {
         let t: MetadataType = "MyType".into();
         assert_eq!(t.as_str(), "MyType");
+    }
+
+    /// `describe_metadata` hands back owned `xml_name`s; the obvious
+    /// loop over them has to borrow-check without a clone per entry.
+    #[test]
+    fn metadata_type_converts_from_borrowed_strings() {
+        let names = vec![String::from("Bot"), String::from("ApexClass")];
+        let mut pkg = PackageManifest::new("66.0");
+        for name in &names {
+            pkg = pkg.all(name.as_str());
+        }
+        for name in &names {
+            pkg = pkg.add(name, ["Explicit"]);
+        }
+        assert_eq!(pkg.type_count(), 2);
+        let xml = pkg.to_xml();
+        assert!(xml.contains("<name>Bot</name>"), "{xml}");
+        assert!(xml.contains("<members>Explicit</members>"), "{xml}");
+
+        assert_eq!(MetadataType::new(names[0].as_str()).as_str(), "Bot");
+        let from_ref: MetadataType = (&MetadataType::APEX_CLASS).into();
+        assert_eq!(from_ref, MetadataType::APEX_CLASS);
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_customlabels.htm
+    /// "CustomLabels doesn't support retrieving one or more custom
+    /// labels by name. To retrieve specific labels by name, use
+    /// CustomLabel and specify the label names as members."
+    #[test]
+    fn custom_label_is_the_singular_type_for_named_members() {
+        assert_eq!(MetadataType::CUSTOM_LABEL.as_str(), "CustomLabel");
+        assert_eq!(MetadataType::CUSTOM_LABELS.as_str(), "CustomLabels");
+        let xml = PackageManifest::new("66.0")
+            .add(MetadataType::CUSTOM_LABEL, ["quoteManual", "quoteAuto"])
+            .to_xml();
+        assert!(xml.contains("<name>CustomLabel</name>"), "{xml}");
     }
 
     #[test]

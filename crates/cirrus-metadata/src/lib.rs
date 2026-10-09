@@ -103,14 +103,25 @@ pub use reqwest;
 /// way, so naming the type doesn't need a separate `bytes` dependency.
 pub use bytes::Bytes;
 
-/// Re-export of `base64::DecodeError`, the error
-/// [`RetrieveResult::zip_bytes`] returns when the server's
-/// base64-encoded zip can't be decoded.
+/// Re-export of `base64::DecodeError`, the
+/// [`source()`](std::error::Error::source) of
+/// [`MetadataError::ZipDecode`], which [`RetrieveResult::zip_bytes`]
+/// returns when the server's base64-encoded zip can't be decoded.
 ///
 /// Renamed here because "decode error" alone is ambiguous at the crate
-/// root; it is the same type `base64` exports, so a `From` impl written
-/// against it works for `?`-propagation.
+/// root; it is the same type `base64` exports, so downcasting the
+/// source or matching on its variants needs no separate `base64`
+/// dependency.
 pub use base64::DecodeError as Base64DecodeError;
+
+/// Re-export of [`quick_xml`].
+///
+/// [`MetadataError`] converts from `quick_xml::Error` and
+/// `quick_xml::DeError`, so a custom [`SoapOperation`] can `?` either
+/// out of its `render_body` or response handling; this re-export lets
+/// that code name the types without adding `quick-xml` to its own
+/// manifest, and keeps the version aligned with the SDK's.
+pub use quick_xml;
 
 pub use auth::{AuthError, AuthSession, SharedAuth};
 pub use envelope::xml_escape;
@@ -123,11 +134,12 @@ pub use headers::{
 pub use package_manifest::{MetadataType, PackageManifest};
 pub use result::{
     AsyncRequestState, AsyncResult, CancelDeployResult, CodeCoverageResult, CodeCoverageWarning,
-    DeleteResult, DeployDetails, DeployMessage, DeployOptions, DeployProblemType, DeployResult,
-    DeployStatus, DescribeMetadataObject, DescribeMetadataResult, DescribeValueTypeResult,
-    FileProperties, ListMetadataQuery, ManageableState, MetadataApiError, PicklistEntry,
-    RetrieveMessage, RetrieveRequest, RetrieveResult, RetrieveStatus, RunTestFailure,
-    RunTestSuccess, RunTestsResult, SaveResult, TestLevel, UpsertResult, ValueTypeField,
+    CodeLocation, DeleteResult, DeployDetails, DeployMessage, DeployOptions, DeployProblemType,
+    DeployResult, DeployStatus, DescribeMetadataObject, DescribeMetadataResult,
+    DescribeValueTypeResult, FileProperties, FlowCoverageResult, FlowCoverageWarning,
+    ListMetadataQuery, ManageableState, MetadataApiError, PicklistEntry, RetrieveMessage,
+    RetrieveRequest, RetrieveResult, RetrieveStatus, RunTestFailure, RunTestSuccess,
+    RunTestsResult, SaveResult, TestLevel, UpsertResult, ValueTypeField,
 };
 pub use retry::RetryPolicy;
 pub use transport::SoapOperation;
@@ -612,6 +624,11 @@ mod tests {
         let err: Base64DecodeError = base64::DecodeError::InvalidPadding;
         assert_eq!(&zip[..], b"PKzip");
         assert!(matches!(err, base64::DecodeError::InvalidPadding));
+        // The public `From<quick_xml::Error>` / `From<quick_xml::DeError>`
+        // impls are usable by name through the crate's own re-export.
+        let xml_err: MetadataError =
+            <crate::quick_xml::DeError as serde::de::Error>::custom("bad").into();
+        assert!(matches!(xml_err, MetadataError::Xml(_)));
     }
 
     #[test]

@@ -245,7 +245,47 @@ pub struct SObjectMetadata {
 /// `refresh` and `consentImport`, Marketing objects support `insert`,
 /// `upsert` and `refresh`, and consent ingest uses `consentImport`. Query
 /// jobs (`/jobs/query`) take `query` or `queryAll`.
+///
+/// The enum is `#[non_exhaustive]`: it keeps an
+/// [`Unknown`](Self::Unknown) fallback because Salesforce adds
+/// operations between releases, and a literal promoted from `Unknown`
+/// to a named variant has to stay an additive change. Match with a `_`
+/// arm:
+///
+/// ```
+/// use cirrus::BulkOperation;
+///
+/// fn is_query(op: BulkOperation) -> bool {
+///     match op {
+///         BulkOperation::Query | BulkOperation::QueryAll => true,
+///         _ => false,
+///     }
+/// }
+/// assert!(is_query(BulkOperation::QueryAll));
+/// ```
+///
+/// Naming every variant, `Unknown` included, does not compile outside
+/// this crate:
+///
+/// ```compile_fail
+/// use cirrus::BulkOperation;
+///
+/// fn is_query(op: BulkOperation) -> bool {
+///     match op {
+///         BulkOperation::Query | BulkOperation::QueryAll => true,
+///         BulkOperation::Insert
+///         | BulkOperation::Update
+///         | BulkOperation::Upsert
+///         | BulkOperation::Delete
+///         | BulkOperation::HardDelete
+///         | BulkOperation::Refresh
+///         | BulkOperation::ConsentImport
+///         | BulkOperation::Unknown => false,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BulkOperation {
     #[serde(rename = "insert")]
     Insert,

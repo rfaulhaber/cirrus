@@ -59,8 +59,8 @@ impl SoapFault {
 /// a `_` arm, so a new variant in a later release is an additive change.
 ///
 /// Variants that wrap another error ([`HttpClient`](Self::HttpClient),
-/// [`Http`](Self::Http)) expose it through
-/// [`source()`](std::error::Error::source) and do not repeat its text in
+/// [`Http`](Self::Http), [`ZipDecode`](Self::ZipDecode)) expose it
+/// through [`source()`](std::error::Error::source) and do not repeat its text in
 /// their own `Display`, so a reporter that walks the chain prints each
 /// message once. Print the chain (anyhow's `{:#}`, for example) to see
 /// the underlying cause; `{}` alone names only the category.
@@ -199,6 +199,14 @@ pub enum MetadataError {
     /// status, the error fields and the first few per-file problems.
     #[error("{}", .0.failure_summary())]
     RetrieveFailed(Box<RetrieveResult>),
+
+    /// The `zipFile` of a retrieve result was not valid base64.
+    ///
+    /// Produced by [`RetrieveResult::zip_bytes`]. The decoder's error is
+    /// the [`source()`](std::error::Error::source); it is the type
+    /// re-exported as [`Base64DecodeError`](crate::Base64DecodeError).
+    #[error("retrieved zip is not valid base64")]
+    ZipDecode(#[from] base64::DecodeError),
 }
 
 /// Ceiling on how much of a non-SOAP error body is preserved in
@@ -347,6 +355,11 @@ fn redact_session_id_elements(body: &str) -> String {
     out
 }
 
+// These impls are part of the public API: a custom `SoapOperation` can
+// `?` a quick-xml error out of `render_body`, naming the types through
+// the crate's `quick_xml` re-export. Nothing else converts into `Xml`,
+// so a caller's own I/O or parsing failure is never misfiled as a
+// server XML problem.
 impl From<quick_xml::Error> for MetadataError {
     fn from(e: quick_xml::Error) -> Self {
         MetadataError::Xml(cap_text(&e.to_string(), PARSE_MESSAGE_CAP))
@@ -356,14 +369,6 @@ impl From<quick_xml::Error> for MetadataError {
 impl From<quick_xml::DeError> for MetadataError {
     fn from(e: quick_xml::DeError) -> Self {
         MetadataError::Xml(cap_text(&e.to_string(), PARSE_MESSAGE_CAP))
-    }
-}
-
-// Folding I/O failures into the XML variant keeps the public error
-// surface small.
-impl From<std::io::Error> for MetadataError {
-    fn from(e: std::io::Error) -> Self {
-        MetadataError::Xml(e.to_string())
     }
 }
 
@@ -532,6 +537,7 @@ mod tests {
         let errors = [
             MetadataError::HttpClient(client_build_error()),
             MetadataError::Http(client_build_error()),
+            MetadataError::ZipDecode(base64::DecodeError::InvalidPadding),
         ];
         for err in errors {
             let source = err.source().expect("variant carries a source").to_string();

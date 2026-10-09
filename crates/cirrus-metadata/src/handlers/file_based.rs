@@ -25,6 +25,7 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::headers::{DebuggingHeader, DebuggingInfo, render_debugging_header};
 use crate::result::{
     AsyncResult, CancelDeployResult, DeployOptions, DeployResult, RetrieveRequest, RetrieveResult,
+    TestLevel,
 };
 use crate::transport::SoapOperation;
 use crate::{MetadataClient, PackageManifest};
@@ -53,6 +54,18 @@ impl SoapOperation for DeployOp {
     type Response = DeployResponseWire;
 
     fn render_body(&self) -> MetadataResult<String> {
+        // Salesforce accepts runTests only under RunSpecifiedTests and
+        // faults on any other pairing. Checking here, before the zip is
+        // encoded, spares a documented-maximum upload that could only
+        // come back INVALID_OPERATION.
+        if !self.options.run_tests.is_empty()
+            && self.options.test_level != Some(TestLevel::RunSpecifiedTests)
+        {
+            return Err(MetadataError::InvalidArgument(
+                "DeployOptions.run_tests requires test_level == Some(TestLevel::RunSpecifiedTests)"
+                    .into(),
+            ));
+        }
         // The options are rendered first so their exact length is known
         // before the buffer is sized. Everything after the encoded zip
         // has to fit in the initial allocation: a reallocation here
@@ -318,7 +331,7 @@ fn render_deploy_options(opts: &DeployOptions, out: &mut String) {
     write_opt_bool(out, "singlePackage", opts.single_package);
     if let Some(level) = opts.test_level {
         out.push_str("<met:testLevel>");
-        out.push_str(level.as_wire());
+        out.push_str(level.as_str());
         out.push_str("</met:testLevel>");
     }
 }
@@ -849,7 +862,6 @@ impl MetadataClient {
 mod tests {
     use super::*;
     use crate::MetadataType;
-    use crate::result::TestLevel;
 
     fn deploy_op(zip: &'static [u8], options: DeployOptions) -> DeployOp {
         DeployOp {
@@ -876,7 +888,7 @@ mod tests {
         let opts = DeployOptions {
             check_only: Some(true),
             rollback_on_error: Some(true),
-            test_level: Some(TestLevel::RunLocalTests),
+            test_level: Some(TestLevel::RunSpecifiedTests),
             run_tests: vec!["MyTest".into()],
             ..Default::default()
         };
@@ -892,7 +904,53 @@ mod tests {
         assert!(i_rollback < i_runtests);
         assert!(i_runtests < i_testlevel);
         assert!(body.contains("<met:runTests>MyTest</met:runTests>"));
-        assert!(body.contains("<met:testLevel>RunLocalTests</met:testLevel>"));
+        assert!(body.contains("<met:testLevel>RunSpecifiedTests</met:testLevel>"));
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+    /// DeployOptions.runTests: "To use this option, set testLevel to
+    /// RunSpecifiedTests." The server rejects any other pairing, so the
+    /// client refuses it before encoding and uploading the zip.
+    #[test]
+    fn deploy_op_rejects_run_tests_unless_the_level_is_run_specified_tests() {
+        for level in [
+            None,
+            Some(TestLevel::NoTestRun),
+            Some(TestLevel::RunLocalTests),
+            Some(TestLevel::RunAllTestsInOrg),
+            Some(TestLevel::RunRelevantTests),
+        ] {
+            let op = deploy_op(
+                b"PK",
+                DeployOptions {
+                    run_tests: vec!["MyTest".into()],
+                    test_level: level,
+                    ..Default::default()
+                },
+            );
+            let err = op.render_body().unwrap_err();
+            assert!(
+                matches!(err, MetadataError::InvalidArgument(_)),
+                "{level:?}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("run_tests"), "{msg}");
+            assert!(msg.contains("RunSpecifiedTests"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn deploy_op_allows_an_empty_run_tests_at_any_level() {
+        for level in [None, Some(TestLevel::RunLocalTests)] {
+            let op = deploy_op(
+                b"PK",
+                DeployOptions {
+                    test_level: level,
+                    ..Default::default()
+                },
+            );
+            assert!(op.render_body().is_ok(), "{level:?}");
+        }
     }
 
     #[test]

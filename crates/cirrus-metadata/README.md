@@ -50,12 +50,16 @@ you need anything beyond `deployRequest`.
   contract; `create_metadata`, `update_metadata`, `read_metadata` and
   `delete_metadata` raise that to 200 for `CustomMetadata` and
   `CustomApplication`, while `upsert_metadata` is a flat 10 for every
-  type.
+  type. The type name is a `&str` or a `MetadataType`, and the envelope
+  binds `xsi` and `xsd`, so values typed `xsi:type="xsd:boolean"` paste
+  straight from a `-meta.xml` file.
 - **Utility** — `list_metadata`, `describe_metadata`, `describe_value_type`.
 - **Typed `package.xml`** — `PackageManifest` builder with round-trippable
   XML serialization. `MetadataType` carries constants for the common
-  types and `MetadataType::new` accepts any other Salesforce-defined
-  type name.
+  types, converts from borrowed strings (so `describe_metadata`'s
+  `xml_name`s feed it directly) and `MetadataType::new` accepts any other
+  Salesforce-defined type name. `CUSTOM_LABEL` retrieves labels by name;
+  `CUSTOM_LABELS` is the wildcard-only container.
 - **SOAP headers** — `MetadataClientBuilder::call_options_client` sends the
   `CallOptions` header, the `_with` CRUD methods take `CrudOptions` for the
   `AllOrNoneHeader`, and `deploy_with_debugging` sends a `DebuggingHeader`

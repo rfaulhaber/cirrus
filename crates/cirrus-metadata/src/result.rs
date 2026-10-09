@@ -23,7 +23,7 @@
 //! [Metadata API Developer Guide]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/
 
 use crate::error::{MetadataError, MetadataResult};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Adapter that maps blank strings to `None`.
 ///
@@ -82,7 +82,10 @@ pub struct AsyncResult {
 }
 
 /// Lifecycle state of an async metadata call.
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum AsyncRequestState {
     Queued,
     InProgress,
@@ -105,48 +108,76 @@ pub enum AsyncRequestState {
 /// See the [DeployOptions docs] for field semantics and production-deploy
 /// requirements (e.g. `rollback_on_error` must be `true` for prod).
 ///
+/// Serializes and deserializes under the camelCase names of the
+/// Metadata API's `DeployOptions` (`checkOnly`, `runTests`,
+/// `testLevel`, …), the same keys the REST `DeployOptions` in `cirrus`
+/// uses, so one configuration struct can feed either client. Absent
+/// keys take the field defaults.
+///
 /// [DeployOptions docs]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct DeployOptions {
     /// If `true`, the deployment proceeds even if files listed in
     /// `package.xml` are missing from the zip. **Don't set on
     /// production deploys.**
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_missing_files: Option<bool>,
     /// Whether a file that's in the zip but not listed in
     /// `package.xml` is automatically added to the package. A
     /// `retrieve()` is issued with the updated `package.xml` that
     /// includes the file. **Don't set on production deploys.**
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_update_package: Option<bool>,
     /// If `true`, performs a test deployment (validation) without
     /// actually committing the components. Pair with
     /// `test_level: RunLocalTests` to qualify the result for
     /// `deploy_recent_validation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_only: Option<bool>,
     /// Continue on warnings.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ignore_warnings: Option<bool>,
     /// Whether a `retrieve()` runs immediately after the deployment.
     /// Set `true` to retrieve whatever was deployed; its outcome
     /// arrives in [`DeployDetails::retrieve_result`], which
     /// `check_deploy_status` populates only when called with
     /// `include_details: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub perform_retrieve: Option<bool>,
     /// In dev/sandbox orgs only: skip the Recycle Bin when deleting
     /// components listed in `destructiveChanges.xml`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub purge_on_delete: Option<bool>,
     /// Required `true` for production deployments — roll back the
     /// whole job on any failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_on_error: Option<bool>,
-    /// Specific Apex test class names to run. Only meaningful when
-    /// `test_level` is `RunSpecifiedTests`.
+    /// Specific Apex test class names to run, one per entry; a name may
+    /// carry a namespace with dot notation. Requires
+    /// `test_level: Some(TestLevel::RunSpecifiedTests)`: Salesforce
+    /// rejects the deploy under any other level, so [`deploy`] refuses a
+    /// non-empty list paired with another level with
+    /// [`MetadataError::InvalidArgument`] before uploading the zip.
+    ///
+    /// [`deploy`]: crate::MetadataClient::deploy
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub run_tests: Vec<String>,
     /// `true` if the zip is a single package; `false` for a set.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub single_package: Option<bool>,
     /// How aggressively to run tests during deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub test_level: Option<TestLevel>,
 }
 
 /// How much of the org's Apex test suite to run during a deployment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Each variant is named after its wire literal: [`as_str`](Self::as_str)
+/// and `Display` give the literal, `FromStr` parses one (case-sensitive,
+/// as the API is) and the serde derives use it, so a value read from a
+/// configuration file or a command line needs no hand-written mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TestLevel {
     /// No tests. Sandbox/dev only.
     NoTestRun,
@@ -162,7 +193,19 @@ pub enum TestLevel {
 }
 
 impl TestLevel {
-    pub(crate) fn as_wire(&self) -> &'static str {
+    /// Every level, in the order the deploy() documentation lists them,
+    /// for `FromStr` and its error message.
+    const ALL: [TestLevel; 5] = [
+        Self::NoTestRun,
+        Self::RunSpecifiedTests,
+        Self::RunLocalTests,
+        Self::RunAllTestsInOrg,
+        Self::RunRelevantTests,
+    ];
+
+    /// The wire literal Salesforce uses for this level, e.g.
+    /// `"RunLocalTests"`.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoTestRun => "NoTestRun",
             Self::RunSpecifiedTests => "RunSpecifiedTests",
@@ -170,6 +213,31 @@ impl TestLevel {
             Self::RunLocalTests => "RunLocalTests",
             Self::RunAllTestsInOrg => "RunAllTestsInOrg",
         }
+    }
+}
+
+impl std::fmt::Display for TestLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TestLevel {
+    type Err = MetadataError;
+
+    /// Parses a wire literal such as `"RunLocalTests"`. Anything else is
+    /// [`MetadataError::InvalidArgument`] naming the accepted literals.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str() == s)
+            .ok_or_else(|| {
+                let valid: Vec<&str> = Self::ALL.iter().map(TestLevel::as_str).collect();
+                MetadataError::InvalidArgument(format!(
+                    "unknown test level {s:?}; expected one of {}",
+                    valid.join(", ")
+                ))
+            })
     }
 }
 
@@ -318,7 +386,12 @@ impl DeployResult {
                     tests
                         .into_iter()
                         .flat_map(|t| t.code_coverage_warnings.iter().map(coverage_warning_line)),
-                );
+                )
+                .chain(tests.into_iter().flat_map(|t| {
+                    t.flow_coverage_warnings
+                        .iter()
+                        .map(flow_coverage_warning_line)
+                }));
             push_problems(&mut summary, problems);
         }
         summary
@@ -405,6 +478,14 @@ fn coverage_warning_line(warning: &CodeCoverageWarning) -> String {
     }
 }
 
+fn flow_coverage_warning_line(warning: &FlowCoverageWarning) -> String {
+    let message = warning.message.as_deref().unwrap_or("(no message)");
+    match warning.flow_name.as_deref() {
+        Some(name) => format!("flow coverage {name}: {message}"),
+        None => format!("flow coverage: {message}"),
+    }
+}
+
 fn retrieve_message_line(message: &RetrieveMessage) -> String {
     match message.file_name.as_deref() {
         Some(file) => format!("{file}: {}", message.problem),
@@ -413,7 +494,50 @@ fn retrieve_message_line(message: &RetrieveMessage) -> String {
 }
 
 /// State of a deployment job. See [`DeployResult::status`].
+///
+/// The enum is `#[non_exhaustive]`, like every wire enum here that
+/// keeps an [`Unknown`](Self::Unknown) fallback: Salesforce extends
+/// these sets between releases, and a literal promoted from `Unknown`
+/// to a named variant has to stay an additive change. Match with a `_`
+/// arm:
+///
+/// ```
+/// use cirrus_metadata::DeployStatus;
+///
+/// fn label(status: DeployStatus) -> &'static str {
+///     match status {
+///         DeployStatus::Succeeded | DeployStatus::SucceededPartial => "ok",
+///         DeployStatus::Failed
+///         | DeployStatus::FinalizingDeployFailed
+///         | DeployStatus::Canceled => "failed",
+///         _ => "running or unrecognized",
+///     }
+/// }
+/// assert_eq!(label(DeployStatus::Succeeded), "ok");
+/// ```
+///
+/// Naming every variant, `Unknown` included, does not compile outside
+/// this crate:
+///
+/// ```compile_fail
+/// use cirrus_metadata::DeployStatus;
+///
+/// fn label(status: DeployStatus) -> &'static str {
+///     match status {
+///         DeployStatus::Pending
+///         | DeployStatus::InProgress
+///         | DeployStatus::FinalizingDeploy
+///         | DeployStatus::Canceling => "running",
+///         DeployStatus::Succeeded | DeployStatus::SucceededPartial => "ok",
+///         DeployStatus::Failed
+///         | DeployStatus::FinalizingDeployFailed
+///         | DeployStatus::Canceled => "failed",
+///         DeployStatus::Unknown => "unrecognized",
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum DeployStatus {
     Pending,
     InProgress,
@@ -514,7 +638,10 @@ pub struct DeployMessage {
 }
 
 /// Whether a [`DeployMessage`] reports an error or a warning.
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum DeployProblemType {
     Warning,
     Error,
@@ -547,6 +674,16 @@ pub struct RunTestsResult {
     pub code_coverage: Vec<CodeCoverageResult>,
     #[serde(default)]
     pub code_coverage_warnings: Vec<CodeCoverageWarning>,
+    /// Coverage of each flow version the test run executed. Available
+    /// in API version 44.0 and later; empty before that and when no
+    /// test ran a flow.
+    #[serde(default)]
+    pub flow_coverage: Vec<FlowCoverageResult>,
+    /// Flow coverage warnings — one per flow that fell short, plus
+    /// org-wide warnings that name no flow. Available in API version
+    /// 44.0 and later.
+    #[serde(default)]
+    pub flow_coverage_warnings: Vec<FlowCoverageWarning>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -587,19 +724,128 @@ pub struct RunTestFailure {
     pub see_all_data: bool,
 }
 
+/// Code coverage of one Apex class or trigger, inside
+/// [`RunTestsResult::code_coverage`].
+///
+/// The counts say how much was covered; the `CodeLocation` arrays say
+/// where. `locations_not_covered` is what a CI job needs to annotate
+/// the lines a failed 75% check left uncovered.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeCoverageResult {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
+    /// Name of the class or trigger covered.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace: Option<String>,
+    /// Total number of code locations.
     #[serde(default)]
     pub num_locations: i32,
+    /// Number of code locations no test executed.
     #[serde(default)]
     pub num_locations_not_covered: i32,
+    /// Line and column of each location no test executed.
+    #[serde(default)]
+    pub locations_not_covered: Vec<CodeLocation>,
+    /// Line and column of each location a test executed, with the
+    /// execution count. Available in API version 68.0 and later.
+    #[serde(default)]
+    pub locations_covered: Vec<CodeLocation>,
+    /// DML statement locations, with execution counts and cumulative
+    /// time.
+    #[serde(default)]
+    pub dml_info: Vec<CodeLocation>,
+    /// Method invocation locations, with execution counts and
+    /// cumulative time.
+    #[serde(default)]
+    pub method_info: Vec<CodeLocation>,
+    /// SOQL statement locations, with execution counts and cumulative
+    /// time.
+    #[serde(default)]
+    pub soql_info: Vec<CodeLocation>,
+}
+
+/// One position in Apex source, inside the arrays of
+/// [`CodeCoverageResult`].
+// Wire-shape provenance: the CodeLocation table on `meta_deployresult`
+// lists `column`, `line` and `numExecutions` as int and `time` as
+// double. The documented "Do not use" `type` field of CodeCoverageResult
+// and RunTestFailure is left out. `time` is typed like
+// `RunTestSuccess::time`; whether Salesforce ever sends it blank is not
+// documented.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeLocation {
+    #[serde(default)]
+    pub column: i32,
+    #[serde(default)]
+    pub line: i32,
+    /// How many times the test run executed this location. `0` for an
+    /// entry in [`CodeCoverageResult::locations_not_covered`].
+    #[serde(default)]
+    pub num_executions: i32,
+    /// Cumulative time spent at this location, in milliseconds.
+    #[serde(default)]
+    pub time: f64,
+}
+
+/// Coverage of one flow version, inside
+/// [`RunTestsResult::flow_coverage`]. Available in API version 44.0
+/// and later.
+// Wire-shape provenance: the FlowCoverageResult table on
+// `meta_deployresult` types `elementsNotCovered` as `string` but
+// describes it as a "List of elements", so it is modeled as a repeated
+// element. `processType` is a "FlowProcessType (enumeration of type
+// string)" whose set grows with the platform; the literal is kept
+// rather than mapped onto a closed enum.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowCoverageResult {
+    /// API names of the flow elements the test run did not execute.
+    #[serde(default)]
+    pub elements_not_covered: Vec<String>,
+    /// ID of the flow version.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_id: Option<String>,
+    /// API name of the flow.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_name: Option<String>,
+    /// Namespace that contains the flow, if one is specified.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_namespace: Option<String>,
+    /// Total number of elements in the flow version.
+    #[serde(default)]
+    pub num_elements: i32,
+    /// Number of elements the test run did not execute.
+    #[serde(default)]
+    pub num_elements_not_covered: i32,
+    /// The flow version's process type, as Salesforce names it (for
+    /// example `AutoLaunchedFlow` or `Flow`).
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub process_type: Option<String>,
+}
+
+/// A warning about flow coverage, inside
+/// [`RunTestsResult::flow_coverage_warnings`]. Available in API
+/// version 44.0 and later.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowCoverageWarning {
+    /// ID of the flow version that generated the warning. `None` for a
+    /// warning about the org's overall flow coverage.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_id: Option<String>,
+    /// API name of the flow that generated the warning. `None` for a
+    /// warning about the org's overall flow coverage.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_name: Option<String>,
+    /// Namespace that contains the flow, if one was specified.
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub flow_namespace: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nil_string")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -732,14 +978,15 @@ impl std::fmt::Debug for RetrieveResult {
 
 impl RetrieveResult {
     /// Decode the `zip_file` field from base64 into raw zip bytes.
-    /// Returns `Ok(None)` if no zip is present in the result.
-    pub fn zip_bytes(&self) -> Result<Option<bytes::Bytes>, base64::DecodeError> {
+    /// Returns `Ok(None)` if no zip is present in the result, and
+    /// [`MetadataError::ZipDecode`] if the payload is not valid base64.
+    pub fn zip_bytes(&self) -> MetadataResult<Option<bytes::Bytes>> {
         use base64::Engine;
         match &self.zip_file {
             None => Ok(None),
-            Some(b64) => base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .map(|v| Some(bytes::Bytes::from(v))),
+            Some(b64) => Ok(Some(bytes::Bytes::from(
+                base64::engine::general_purpose::STANDARD.decode(b64)?,
+            ))),
         }
     }
 
@@ -788,7 +1035,11 @@ impl RetrieveResult {
     }
 }
 
+/// State of a retrieve job. See [`RetrieveResult::status`].
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub enum RetrieveStatus {
     Pending,
     InProgress,
@@ -844,8 +1095,11 @@ pub struct FileProperties {
 }
 
 /// Distribution / lifecycle state of a packaged component.
+///
+/// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum ManageableState {
     Beta,
     Deleted,
@@ -1269,13 +1523,94 @@ mod tests {
         }
     }
 
+    const EVERY_TEST_LEVEL: [TestLevel; 5] = [
+        TestLevel::NoTestRun,
+        TestLevel::RunSpecifiedTests,
+        TestLevel::RunRelevantTests,
+        TestLevel::RunLocalTests,
+        TestLevel::RunAllTestsInOrg,
+    ];
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+    /// DeployOptions.testLevel is a "TestLevel (enumeration of type
+    /// string)" with the values NoTestRun, RunSpecifiedTests,
+    /// RunLocalTests, RunAllTestsInOrg and (beta) RunRelevantTests.
     #[test]
-    fn test_level_as_wire_matches_doc_strings() {
-        assert_eq!(TestLevel::NoTestRun.as_wire(), "NoTestRun");
-        assert_eq!(TestLevel::RunSpecifiedTests.as_wire(), "RunSpecifiedTests");
-        assert_eq!(TestLevel::RunLocalTests.as_wire(), "RunLocalTests");
-        assert_eq!(TestLevel::RunAllTestsInOrg.as_wire(), "RunAllTestsInOrg");
-        assert_eq!(TestLevel::RunRelevantTests.as_wire(), "RunRelevantTests");
+    fn test_level_as_str_matches_doc_strings() {
+        assert_eq!(TestLevel::NoTestRun.as_str(), "NoTestRun");
+        assert_eq!(TestLevel::RunSpecifiedTests.as_str(), "RunSpecifiedTests");
+        assert_eq!(TestLevel::RunLocalTests.as_str(), "RunLocalTests");
+        assert_eq!(TestLevel::RunAllTestsInOrg.as_str(), "RunAllTestsInOrg");
+        assert_eq!(TestLevel::RunRelevantTests.as_str(), "RunRelevantTests");
+    }
+
+    #[test]
+    fn test_level_round_trips_through_display_and_from_str() {
+        for level in EVERY_TEST_LEVEL {
+            assert_eq!(level.to_string(), level.as_str());
+            assert_eq!(level.as_str().parse::<TestLevel>().unwrap(), level);
+        }
+    }
+
+    #[test]
+    fn test_level_from_str_names_the_valid_literals_on_a_miss() {
+        let err = "RunSomeTests".parse::<TestLevel>().unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("RunSomeTests"), "{msg}");
+        for level in EVERY_TEST_LEVEL {
+            assert!(msg.contains(level.as_str()), "{msg}");
+        }
+        // The literals are case-sensitive on the wire.
+        assert!("runlocaltests".parse::<TestLevel>().is_err());
+    }
+
+    #[test]
+    fn test_level_serializes_as_its_wire_literal() {
+        #[derive(serde::Serialize, Deserialize)]
+        struct Wire {
+            level: TestLevel,
+        }
+        for level in EVERY_TEST_LEVEL {
+            let xml = quick_xml::se::to_string(&Wire { level }).unwrap();
+            assert!(
+                xml.contains(&format!("<level>{}</level>", level.as_str())),
+                "{xml}"
+            );
+            let back: Wire = quick_xml::de::from_str(&xml).unwrap();
+            assert_eq!(back.level, level);
+        }
+    }
+
+    /// `DeployOptions` reads from the same camelCase keys the REST
+    /// `DeployOptions` in `cirrus` serializes, so one config struct can
+    /// drive either client; absent keys take the type's defaults.
+    #[test]
+    fn deploy_options_deserialize_from_camel_case_keys_with_defaults() {
+        let opts: DeployOptions = quick_xml::de::from_str(
+            "<DeployOptions>\
+               <checkOnly>true</checkOnly>\
+               <runTests>AccountTest</runTests>\
+               <runTests>ns.ContactTest</runTests>\
+               <testLevel>RunSpecifiedTests</testLevel>\
+             </DeployOptions>",
+        )
+        .unwrap();
+        assert_eq!(opts.check_only, Some(true));
+        assert_eq!(opts.rollback_on_error, None);
+        assert_eq!(opts.run_tests, ["AccountTest", "ns.ContactTest"]);
+        assert_eq!(opts.test_level, Some(TestLevel::RunSpecifiedTests));
+
+        let empty: DeployOptions = quick_xml::de::from_str("<DeployOptions/>").unwrap();
+        assert!(empty.run_tests.is_empty());
+        assert_eq!(empty.test_level, None);
+
+        let xml = quick_xml::se::to_string(&opts).unwrap();
+        assert!(xml.contains("<checkOnly>true</checkOnly>"), "{xml}");
+        assert!(
+            xml.contains("<testLevel>RunSpecifiedTests</testLevel>"),
+            "{xml}"
+        );
     }
 
     #[test]
@@ -1322,6 +1657,27 @@ mod tests {
             .len()
                 < 1024
         );
+    }
+
+    #[test]
+    fn retrieve_result_zip_bytes_reports_invalid_base64_as_zip_decode() {
+        use std::error::Error as _;
+        let r = RetrieveResult {
+            id: "x".into(),
+            done: true,
+            success: true,
+            status: Some(RetrieveStatus::Succeeded),
+            error_status_code: None,
+            error_message: None,
+            file_properties: vec![],
+            messages: vec![],
+            zip_file: Some("not base64!".into()),
+        };
+        let err = r.zip_bytes().unwrap_err();
+        assert!(matches!(err, MetadataError::ZipDecode(_)), "{err:?}");
+        let source = err.source().expect("ZipDecode carries the base64 error");
+        assert!(source.is::<base64::DecodeError>());
+        assert_eq!(err.to_string(), "retrieved zip is not valid base64");
     }
 
     #[test]
@@ -1441,6 +1797,11 @@ mod tests {
                  <codeCoverageWarnings>\
                    <message>Average test coverage is 61%, at least 75% is required.</message>\
                  </codeCoverageWarnings>\
+                 <flowCoverageWarnings>\
+                   <flowId>301xx00000000AB</flowId>\
+                   <flowName>Lead_Routing</flowName>\
+                   <message>Flow coverage is 60%, at least 75% is required.</message>\
+                 </flowCoverageWarnings>\
                </runTestResult>\
              </details></result>",
         );
@@ -1451,7 +1812,8 @@ mod tests {
              ApexClass Broken: Unexpected token.; \
              objects/Thing__c.object: Invalid field.; \
              test BrokenTest.testIt: Assertion Failed; \
-             coverage: Average test coverage is 61%, at least 75% is required."
+             coverage: Average test coverage is 61%, at least 75% is required.; \
+             flow coverage Lead_Routing: Flow coverage is 60%, at least 75% is required."
         );
     }
 
@@ -1518,5 +1880,113 @@ mod tests {
             r.into_result().unwrap_err().to_string(),
             "retrieve did not succeed: status not reported"
         );
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    /// RunTestsResult carries `flowCoverage` ("FlowCoverageResult[]",
+    /// API 44.0+) and `flowCoverageWarnings` ("FlowCoverageWarning[]");
+    /// each CodeCoverageResult carries `locationsNotCovered`,
+    /// `locationsCovered` (API 68.0+), `dmlInfo`, `methodInfo` and
+    /// `soqlInfo`, all "CodeLocation[]" with `column`, `line`,
+    /// `numExecutions` (int) and `time` (double). FlowCoverageResult
+    /// lists `elementsNotCovered` ("List of elements ... that weren't
+    /// executed"), `flowId`, `flowName`, `flowNamespace`, `numElements`,
+    /// `numElementsNotCovered` and `processType`; FlowCoverageWarning
+    /// lists `flowId`, `flowName` ("If the warning applies to the overall
+    /// test coverage of flows within your org, this value is null"),
+    /// `flowNamespace` and `message`. The page publishes no XML sample
+    /// for these, so the fixture is built from the field tables.
+    #[test]
+    fn run_tests_result_reads_code_locations_and_flow_coverage() {
+        let parsed: RunTestsResult = quick_xml::de::from_str(
+            "<runTestResult>\
+               <numTestsRun>1</numTestsRun>\
+               <codeCoverage>\
+                 <id>01pxx0000000001</id>\
+                 <name>AccountService</name>\
+                 <numLocations>10</numLocations>\
+                 <numLocationsNotCovered>2</numLocationsNotCovered>\
+                 <locationsNotCovered><column>5</column><line>12</line>\
+                   <numExecutions>0</numExecutions><time>0.0</time></locationsNotCovered>\
+                 <locationsNotCovered><column>9</column><line>31</line>\
+                   <numExecutions>0</numExecutions><time>0.0</time></locationsNotCovered>\
+                 <locationsCovered><column>1</column><line>3</line>\
+                   <numExecutions>4</numExecutions><time>1.5</time></locationsCovered>\
+                 <dmlInfo><column>9</column><line>20</line>\
+                   <numExecutions>2</numExecutions><time>12.25</time></dmlInfo>\
+                 <methodInfo><column>17</column><line>8</line>\
+                   <numExecutions>4</numExecutions><time>3.0</time></methodInfo>\
+                 <soqlInfo><column>21</column><line>14</line>\
+                   <numExecutions>1</numExecutions><time>7.75</time></soqlInfo>\
+               </codeCoverage>\
+               <flowCoverage>\
+                 <elementsNotCovered>Decision_1</elementsNotCovered>\
+                 <elementsNotCovered>Assignment_2</elementsNotCovered>\
+                 <flowId>301xx00000000AB</flowId>\
+                 <flowName>Lead_Routing</flowName>\
+                 <flowNamespace></flowNamespace>\
+                 <numElements>6</numElements>\
+                 <numElementsNotCovered>2</numElementsNotCovered>\
+                 <processType>AutoLaunchedFlow</processType>\
+               </flowCoverage>\
+               <flowCoverageWarnings>\
+                 <flowId></flowId>\
+                 <flowName></flowName>\
+                 <message>Flow coverage is 60%, at least 75% is required.</message>\
+               </flowCoverageWarnings>\
+             </runTestResult>",
+        )
+        .unwrap();
+
+        let coverage = &parsed.code_coverage[0];
+        assert_eq!(coverage.num_locations_not_covered, 2);
+        assert_eq!(
+            coverage
+                .locations_not_covered
+                .iter()
+                .map(|l| (l.line, l.column, l.num_executions))
+                .collect::<Vec<_>>(),
+            vec![(12, 5, 0), (31, 9, 0)]
+        );
+        assert_eq!(coverage.locations_covered.len(), 1);
+        assert_eq!(coverage.locations_covered[0].time, 1.5);
+        assert_eq!(coverage.dml_info[0].time, 12.25);
+        assert_eq!(coverage.method_info[0].num_executions, 4);
+        assert_eq!(coverage.soql_info[0].line, 14);
+
+        let flow = &parsed.flow_coverage[0];
+        assert_eq!(flow.flow_id.as_deref(), Some("301xx00000000AB"));
+        assert_eq!(flow.flow_name.as_deref(), Some("Lead_Routing"));
+        assert_eq!(flow.flow_namespace, None);
+        assert_eq!(flow.num_elements, 6);
+        assert_eq!(flow.num_elements_not_covered, 2);
+        assert_eq!(flow.elements_not_covered, ["Decision_1", "Assignment_2"]);
+        assert_eq!(flow.process_type.as_deref(), Some("AutoLaunchedFlow"));
+
+        let warning = &parsed.flow_coverage_warnings[0];
+        assert_eq!(warning.flow_id, None);
+        assert_eq!(warning.flow_name, None, "an org-wide warning names no flow");
+        assert_eq!(
+            warning.message.as_deref(),
+            Some("Flow coverage is 60%, at least 75% is required.")
+        );
+    }
+
+    #[test]
+    fn run_tests_result_defaults_the_coverage_arrays_when_absent() {
+        // Pre-44.0 orgs and Apex-only deploys send none of these.
+        let parsed: RunTestsResult = quick_xml::de::from_str(
+            "<runTestResult><numTestsRun>0</numTestsRun>\
+             <codeCoverage><name>Foo</name></codeCoverage></runTestResult>",
+        )
+        .unwrap();
+        assert!(parsed.flow_coverage.is_empty());
+        assert!(parsed.flow_coverage_warnings.is_empty());
+        let coverage = &parsed.code_coverage[0];
+        assert!(coverage.locations_not_covered.is_empty());
+        assert!(coverage.locations_covered.is_empty());
+        assert!(coverage.dml_info.is_empty());
+        assert!(coverage.method_info.is_empty());
+        assert!(coverage.soql_info.is_empty());
     }
 }

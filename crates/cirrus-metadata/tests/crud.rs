@@ -18,7 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use cirrus_metadata::auth::StaticTokenAuth;
-use cirrus_metadata::{CrudOptions, MetadataClient, MetadataError, RetryPolicy};
+use cirrus_metadata::{CrudOptions, MetadataClient, MetadataError, MetadataType, RetryPolicy};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,6 +122,126 @@ async fn create_metadata_returns_save_results_per_component() {
     assert_eq!(results[1].errors[0].fields, vec!["fullName".to_string()]);
 }
 
+/// The type name is anything `AsRef<str>`, so the `MetadataType`
+/// constants that build manifests name CRUD types too, by value or by
+/// reference, alongside plain strings.
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_custommetadata.htm
+/// CustomMetadata supports the CRUD-based calls; its `fullName` is
+/// `TypeName.RecordName` and it carries a `label`.
+#[tokio::test]
+async fn crud_calls_take_a_metadata_type_for_the_type_name() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:createMetadata>"))
+        .and(body_string_contains(
+            r#"<met:metadata xsi:type="met:CustomMetadata""#,
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <createMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <fullName>Settings.Default</fullName>
+        <success>true</success>
+      </result>
+    </createMetadataResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:readMetadata>"))
+        .and(body_string_contains("<met:type>CustomMetadata</met:type>"))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <readMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <records>
+          <fullName>Settings.Default</fullName>
+          <label>Default</label>
+        </records>
+      </result>
+    </readMetadataResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let results = md
+        .create_metadata(
+            MetadataType::CUSTOM_METADATA,
+            &["<fullName>Settings.Default</fullName><label>Default</label>"],
+        )
+        .await
+        .unwrap();
+    assert!(results[0].success);
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Record {
+        full_name: Option<String>,
+        label: Option<String>,
+    }
+    let records: Vec<Record> = md
+        .read_metadata(&MetadataType::CUSTOM_METADATA, &["Settings.Default"])
+        .await
+        .unwrap();
+    assert_eq!(records[0].full_name.as_deref(), Some("Settings.Default"));
+    assert_eq!(records[0].label.as_deref(), Some("Default"));
+}
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_custommetadata.htm
+/// Every CustomMetadata sample types its values with the `xsd` prefix,
+/// `<value xsi:type="xsd:boolean">false</value>`, declaring
+/// `xmlns:xsd` on the root the CRUD caller strips away. The envelope
+/// binds both `xsi` and `xsd` so the pasted inner XML resolves.
+#[tokio::test]
+async fn create_metadata_envelope_binds_the_xsd_prefix_for_typed_values() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance""#,
+        ))
+        .and(body_string_contains(
+            r#"xmlns:xsd="http://www.w3.org/2001/XMLSchema""#,
+        ))
+        .and(body_string_contains(
+            r#"<value xsi:type="xsd:boolean">false</value>"#,
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <createMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <fullName>Settings.Default</fullName>
+        <success>true</success>
+      </result>
+    </createMetadataResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let record = r#"<fullName>Settings.Default</fullName><label>Default</label>
+        <values><field>Enabled__c</field><value xsi:type="xsd:boolean">false</value></values>"#;
+    let results = md
+        .create_metadata(MetadataType::CUSTOM_METADATA, &[record])
+        .await
+        .unwrap();
+    assert!(results[0].success);
+}
+
 /// An empty component array has nothing to save, so it is rejected
 /// before an envelope is built rather than spending a round trip.
 #[tokio::test]
@@ -131,7 +251,7 @@ async fn create_metadata_rejects_empty_input_before_sending() {
     let md = MetadataClient::builder().auth(auth).build().unwrap();
 
     let err = md
-        .create_metadata::<&str>("ApexClass", &[])
+        .create_metadata::<&str, _>("ApexClass", &[])
         .await
         .unwrap_err();
     match err {

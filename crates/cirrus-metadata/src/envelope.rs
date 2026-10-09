@@ -58,6 +58,12 @@ const METADATA_NS: &str = "http://soap.sforce.com/2006/04/metadata";
 /// (`CustomObject`, `ApexClass`, etc.); declared on every envelope so
 /// individual handlers don't have to repeat the declaration.
 const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+/// XML Schema namespace. Salesforce's CustomMetadata samples type
+/// record values as `xsi:type="xsd:boolean"` and the like, declaring
+/// the prefix on a root element a CRUD caller does not send, so the
+/// envelope binds it for the caller's inner XML. Harmless for every
+/// other operation.
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
 
 /// A parsed SOAP response: the body outcome plus the output headers
 /// carried in `<Header>`.
@@ -142,6 +148,7 @@ pub(crate) fn build_envelope(
         + SOAP_NS.len()
         + METADATA_NS.len()
         + XSI_NS.len()
+        + XSD_NS.len()
         + 2 * operation_name.len()
         + ENVELOPE_WRAPPER_HEADROOM;
     let mut out = String::with_capacity(capacity);
@@ -152,6 +159,8 @@ pub(crate) fn build_envelope(
     out.push_str(METADATA_NS);
     out.push_str(r#"" xmlns:xsi=""#);
     out.push_str(XSI_NS);
+    out.push_str(r#"" xmlns:xsd=""#);
+    out.push_str(XSD_NS);
     out.push_str(r#""><soapenv:Header><met:SessionHeader><met:sessionId>"#);
     out.push_str(&token);
     out.push_str("</met:sessionId></met:SessionHeader>");
@@ -518,6 +527,7 @@ mod tests {
         assert!(env.contains("xmlns:soapenv="));
         assert!(env.contains("xmlns:met="));
         assert!(env.contains("xmlns:xsi="));
+        assert!(env.contains("xmlns:xsd="));
         assert!(env.contains("<met:sessionId>TOKEN</met:sessionId>"));
         assert!(env.contains("<met:ping><inner/></met:ping>"));
     }
@@ -540,7 +550,8 @@ mod tests {
                 r#"<?xml version="1.0" encoding="UTF-8"?>"#,
                 r#"<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" "#,
                 r#"xmlns:met="http://soap.sforce.com/2006/04/metadata" "#,
-                r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+                r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#,
+                r#"xmlns:xsd="http://www.w3.org/2001/XMLSchema">"#,
                 "<soapenv:Header><met:SessionHeader><met:sessionId>TOKEN</met:sessionId>",
                 "</met:SessionHeader></soapenv:Header>",
                 "<soapenv:Body><met:ping><inner/></met:ping></soapenv:Body></soapenv:Envelope>",
