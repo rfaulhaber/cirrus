@@ -18,11 +18,16 @@
 
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
+use crate::locator;
 use crate::response::{DescribeGlobal, SObjectCreateResult};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::SystemTime;
+
+/// The first API version whose upsert-by-external-ID response carries a
+/// body; through v45.0 a successful update is a bare 204.
+const UPSERT_RESULT_SINCE: (u32, u32) = (46, 0);
 
 impl Cirrus {
     /// Returns a handler for collection-level sObject operations
@@ -332,6 +337,14 @@ impl<'a> SObjectHandler<'a> {
     ///
     /// If multiple records match the external ID, Salesforce returns 300
     /// — surfaced as [`crate::CirrusError::Api`].
+    ///
+    /// Needs API v46.0 or later. Through v45.0 Salesforce answers a
+    /// successful update with 204 and no body, which leaves nothing to
+    /// return, so a client built for one of those versions is refused
+    /// with [`crate::CirrusError::InvalidInput`] before any request;
+    /// [`retrieve_by_external_id`](Self::retrieve_by_external_id)
+    /// followed by [`update`](Self::update) or [`create`](Self::create)
+    /// covers them.
     pub async fn upsert<B>(
         &self,
         external_field: &str,
@@ -390,6 +403,19 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
+        // Through v45.0 a successful update is a 204 with no body, so
+        // the write would commit and then surface as InvalidResponse.
+        let version = self.client.api_version();
+        if locator::api_version_number(version).is_some_and(|number| number < UPSERT_RESULT_SINCE) {
+            return Err(CirrusError::InvalidInput {
+                field: "api_version",
+                message: format!(
+                    "upsert by external ID needs API v46.0 or later: `{version}` answers an update \
+                     with 204 and no body, so there is no result to return; use \
+                     retrieve_by_external_id followed by update or create on this version",
+                ),
+            });
+        }
         let url = self.external_id_url(external_field, external_value)?;
         let query = options.update_only.then_some([("updateOnly", "true")]);
         self.client
@@ -867,6 +893,69 @@ mod tests {
             matches!(err, CirrusError::InvalidInput { .. }),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_refuses_a_client_built_for_a_version_that_answers_with_no_body() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+        // "In API version 45.0 and earlier, the HTTP status code is 204
+        // (No Content) and there isn't a response body." Refused before
+        // the request, so the update is never committed and then
+        // reported as an invalid response.
+        let server = MockServer::start().await;
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v45.0")
+            .build()
+            .unwrap();
+
+        let err = sf
+            .sobject("Account")
+            .upsert("Ext__c", "A-1", &json!({"Name": "Acme"}))
+            .await
+            .unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, message } => {
+                assert_eq!(field, "api_version");
+                assert!(message.contains("v46.0"), "{message}");
+                assert!(message.contains("v45.0"), "{message}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_runs_on_the_first_version_that_answers_with_a_body() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+        // "In API version 46.0 and later, the HTTP status code is 200
+        // (OK)" with the documented {id, success, errors, created} body.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/services/data/v46.0/sobjects/Account/Ext__c/A-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "001xx000003DGb2AAG",
+                "success": true,
+                "errors": [],
+                "created": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v46.0")
+            .build()
+            .unwrap();
+
+        let result = sf
+            .sobject("Account")
+            .upsert("Ext__c", "A-1", &json!({"Name": "Acme"}))
+            .await
+            .unwrap();
+        assert_eq!(result.created, Some(false));
     }
 
     #[tokio::test]

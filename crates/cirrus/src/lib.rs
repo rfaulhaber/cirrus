@@ -113,6 +113,25 @@ pub struct ReadmeDoctests;
 /// Default Salesforce REST API version when the caller doesn't override it.
 pub const DEFAULT_API_VERSION: &str = "v66.0";
 
+/// Oldest API version a client can be built for.
+///
+/// Salesforce's [API End-of-Life Policy] lists 41.0 and later as
+/// supported with no retirement scheduled, 31.0 through 40.0 as
+/// deprecated from Summer '27 and retired from Summer '28, and anything
+/// older as gone (a request to it answers `410 GONE`). The client tracks
+/// the supported tier: [`CirrusBuilder::build`] refuses an older version
+/// with [`CirrusError::InvalidInput`], and the response shapes this crate
+/// models are the ones documented from this version on (search, for
+/// one, answered a bare array instead of `searchRecords` before 37.0).
+/// The `latest` alias is never below the floor.
+///
+/// [API End-of-Life Policy]: https://developer.salesforce.com/docs/platform/api-rest/guide/api-rest-eol.html
+pub const MIN_API_VERSION: &str = "v41.0";
+
+/// [`MIN_API_VERSION`] as the `(major, minor)` pair the floor check
+/// compares against.
+const MIN_API_VERSION_NUMBER: (u32, u32) = (41, 0);
+
 /// Connect-phase timeout applied to the HTTP client the builder
 /// creates. Override with [`CirrusBuilder::connect_timeout`].
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1328,7 +1347,8 @@ impl CirrusBuilder {
     /// `latest` to track the org's newest release. Anything else — the
     /// bare `"66.0"` that [`ApiVersion::version`] carries, for instance
     /// — is rejected by [`build`](Self::build) rather than turning every
-    /// later call into a `NOT_FOUND`.
+    /// later call into a `NOT_FOUND`, and so is a version older than
+    /// [`MIN_API_VERSION`].
     pub fn api_version(mut self, version: impl Into<String>) -> Self {
         self.api_version = Some(version.into());
         self
@@ -1431,8 +1451,9 @@ impl CirrusBuilder {
     ///
     /// Fails when no [`auth`](Self::auth) session was supplied, when
     /// [`api_version`](Self::api_version) isn't a version segment
-    /// Salesforce recognizes, or when the auth session's instance URL
-    /// would send the session token in the clear.
+    /// Salesforce recognizes or is older than [`MIN_API_VERSION`], or
+    /// when the auth session's instance URL would send the session token
+    /// in the clear.
     pub fn build(self) -> CirrusResult<Cirrus> {
         let auth = self.auth.ok_or(CirrusError::MissingField("auth"))?;
         let api_version = self
@@ -1559,23 +1580,36 @@ fn check_transport_security(
 }
 
 /// Accepts the two forms Salesforce documents for the version segment
-/// of a REST URI: `vXX.X` and the alias `latest`.
+/// of a REST URI, `vXX.X` and the alias `latest`, and only a numbered
+/// version at or above [`MIN_API_VERSION`].
 ///
 /// The bare numeric form (`"66.0"`) is what `GET /services/data`
 /// reports in `ApiVersion::version`, and it is the mistake worth
 /// catching here: the SDK would happily build
 /// `/services/data/66.0/query` and every call would come back as a
-/// generic `NOT_FOUND` that never mentions the version.
+/// generic `NOT_FOUND` that never mentions the version. A number too
+/// long for `u32` is still a version segment and cannot be below the
+/// floor, so it passes.
 fn validate_api_version(version: &str) -> CirrusResult<()> {
-    if version == "latest" || locator::is_api_version_segment(version) {
-        return Ok(());
+    if !(version == "latest" || locator::is_api_version_segment(version)) {
+        return Err(CirrusError::InvalidInput {
+            field: "api_version",
+            message: format!(
+                "expected `vXX.X` (for example `{DEFAULT_API_VERSION}`) or `latest`, got `{version}`",
+            ),
+        });
     }
-    Err(CirrusError::InvalidInput {
-        field: "api_version",
-        message: format!(
-            "expected `vXX.X` (for example `{DEFAULT_API_VERSION}`) or `latest`, got `{version}`",
-        ),
-    })
+    if locator::api_version_number(version).is_some_and(|number| number < MIN_API_VERSION_NUMBER) {
+        return Err(CirrusError::InvalidInput {
+            field: "api_version",
+            message: format!(
+                "`{version}` is older than `{MIN_API_VERSION}`, the oldest version the client supports: \
+                 Salesforce has scheduled 31.0 through 40.0 for retirement, and the response shapes \
+                 modeled here are the ones documented from `{MIN_API_VERSION}` on",
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1763,6 +1797,45 @@ mod tests {
             .unwrap();
         assert_eq!(sf.api_version(), "v61.0");
         assert!(sf.resolve_url("x").contains("/v61.0/"));
+    }
+
+    #[test]
+    fn build_refuses_an_api_version_below_the_floor() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/api-rest-eol.html
+        // "Versions 41.0 through 67.0: Supported." "Versions 31.0 through
+        // 40.0: Deprecated and unsupported from Summer '27. Retired from
+        // Summer '28." The floor is the start of the supported tier.
+        for old in ["v40.0", "v36.0", "v9.0", "v0.0", "v040.9"] {
+            let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+            let err = Cirrus::builder()
+                .auth(auth)
+                .api_version(old)
+                .build()
+                .unwrap_err();
+            match err {
+                CirrusError::InvalidInput { field, message } => {
+                    assert_eq!(field, "api_version");
+                    assert!(message.contains(MIN_API_VERSION), "{old}: {message}");
+                }
+                other => panic!("expected InvalidInput for {old:?}, got {other:?}"),
+            }
+        }
+        // The floor itself, a minor above it, a zero-padded major, and a
+        // major too long for u32 (a version segment that cannot be old).
+        for fine in [MIN_API_VERSION, "v41.1", "v067.0", "v99999999999.0"] {
+            let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .api_version(fine)
+                .build()
+                .unwrap_or_else(|e| panic!("{fine}: {e}"));
+            assert_eq!(sf.api_version(), fine);
+        }
+        assert_eq!(
+            locator::api_version_number(MIN_API_VERSION),
+            Some(MIN_API_VERSION_NUMBER),
+            "the documented floor and the compared number must agree"
+        );
     }
 
     mod escape_hatch {

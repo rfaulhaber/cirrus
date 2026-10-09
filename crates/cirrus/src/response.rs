@@ -79,7 +79,10 @@ pub struct SObjectCreateResult {
     #[serde(default)]
     pub errors: Vec<SalesforceError>,
     /// `true` if an upsert created a new record, `false` if it updated an
-    /// existing one. Absent on plain creates.
+    /// existing one. Absent on plain creates. Salesforce added the field
+    /// in API 46.0, the oldest version
+    /// [`SObjectHandler::upsert`](crate::handlers::sobjects::SObjectHandler::upsert)
+    /// runs on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<bool>,
 }
