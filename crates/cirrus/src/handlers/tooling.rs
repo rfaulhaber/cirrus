@@ -66,7 +66,7 @@
 //!   reachable via the open-ended client escape hatch.
 
 use crate::Cirrus;
-use crate::error::CirrusResult;
+use crate::error::{CirrusError, CirrusResult};
 use crate::response::{
     CompositeResponse, DescribeGlobal, ExecuteAnonymousResult, QueryResult, SObjectCreateResult,
     SearchResult,
@@ -245,6 +245,72 @@ impl<'a> ToolingHandler<'a> {
         self.client
             .get_with_query_no_replay("tooling/executeAnonymous", &query)
             .await
+    }
+
+    /// Fetches the raw debug log of an `ApexLog` record as text.
+    ///
+    /// Calls
+    /// `GET /services/data/{api_version}/tooling/sobjects/ApexLog/{id}/Body`
+    /// with `Accept: */*`. The [Tooling REST Resources] page lists this
+    /// resource as "Retrieves a raw debug log by ID. Available in API
+    /// version 28.0 and later."
+    ///
+    /// A typical use runs [`execute_anonymous`](Self::execute_anonymous),
+    /// queries `ApexLog` for the newest record's `Id`, then fetches its
+    /// body. [`sobject("ApexLog").retrieve(id)`](ToolingSObjectHandler::retrieve)
+    /// returns the log's metadata record (operation, start time, length);
+    /// this returns the log text itself, which a JSON verb such as
+    /// [`Cirrus::get`] cannot read because the body is plain text.
+    ///
+    /// The request runs inside the request loop, so the retry policy, the
+    /// 401 session refresh and `Sforce-Limit-Info` capture apply, and the
+    /// body is bounded by
+    /// [`CirrusBuilder::max_response_size`](crate::CirrusBuilder::max_response_size).
+    /// A body that is not valid UTF-8 is a
+    /// [`CirrusError::InvalidResponse`] that names the byte offset of the
+    /// first invalid byte and quotes none of the log, since a debug log
+    /// can carry record data.
+    ///
+    /// [Tooling REST Resources]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// sf.tooling().execute_anonymous("System.debug('hello');").await?;
+    /// let newest = sf
+    ///     .tooling()
+    ///     .query("SELECT Id FROM ApexLog ORDER BY StartTime DESC LIMIT 1")
+    ///     .await?;
+    /// if let Some(id) = newest.records.first().and_then(|log| log["Id"].as_str()) {
+    ///     let log = sf.tooling().apex_log_body(id).await?;
+    ///     println!("{log}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn apex_log_body(&self, id: &str) -> CirrusResult<String> {
+        // The Tooling REST Resources page prints a trailing slash on every
+        // resource (`/sobjects/`, `/sobjects/{name}/describe/`,
+        // `/sobjects/{name}/{id}/`) and this crate sends none for any of
+        // them, so the log body follows suit.
+        let url = self
+            .client
+            .versioned_url(&["tooling", "sobjects", "ApexLog", id, "Body"])?;
+        let (_headers, bytes) = self
+            .client
+            .fetch_raw(reqwest::Method::GET, &url, "*/*", None)
+            .await?;
+        String::from_utf8(Vec::from(bytes)).map_err(|err| {
+            CirrusError::InvalidResponse(format!(
+                "ApexLog Body is not valid UTF-8 (valid up to byte {})",
+                err.utf8_error().valid_up_to()
+            ))
+        })
     }
 }
 
@@ -1005,5 +1071,112 @@ mod tests {
             raw.contains("%25%2B1%23%25"),
             "`%`, `+` and `#` must be encoded: {raw}"
         );
+    }
+
+    #[tokio::test]
+    async fn apex_log_body_returns_the_log_text() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm
+        // "/sobjects/ApexLog/id/Body/ — Supported methods: GET. Retrieves
+        // a raw debug log by ID."
+        //
+        // Wire-shape provenance: no page publishes an example body or
+        // response headers for this resource, so the `text/plain` content
+        // type and the two log lines are illustrative. The page prints a
+        // trailing slash on every resource, this one included; the
+        // exact-path matcher pins the crate's slash-less form.
+        const LOG: &str = "66.0 APEX_CODE,DEBUG\n10:15:02.1 (1234)|USER_DEBUG|[1]|DEBUG|hello\n";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/tooling/sobjects/ApexLog/07L5f00000ABCDEFGH/Body",
+            ))
+            .and(header("accept", "*/*"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(LOG),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let log = sf
+            .tooling()
+            .apex_log_body("07L5f00000ABCDEFGH")
+            .await
+            .unwrap();
+        assert_eq!(log, LOG);
+    }
+
+    #[tokio::test]
+    async fn apex_log_body_reports_invalid_utf8_without_echoing_the_log() {
+        // Wire-shape provenance: the page publishes no body for this
+        // resource; the bytes are a deliberately malformed log. A debug
+        // log can carry record data, so the error names the resource and
+        // the offset of the first bad byte and quotes none of the body,
+        // not even the valid prefix.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/tooling/sobjects/ApexLog/07L5f00000ABCDEFGH/Body",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_bytes(&b"SECRET\xff\xfe"[..]),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .tooling()
+            .apex_log_body("07L5f00000ABCDEFGH")
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::InvalidResponse(message) => {
+                assert!(message.contains("ApexLog"), "{message}");
+                assert!(message.contains("byte 6"), "{message}");
+                assert!(!message.contains("SECRET"), "{message}");
+                assert!(!message.contains("255"), "{message}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apex_log_body_surfaces_the_error_array_on_404() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+        // The page's 404 body for an unknown resource, wrapped in the
+        // error array the REST API returns for a non-2xx response; the
+        // Tooling page prints no error body of its own.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/tooling/sobjects/ApexLog/07L5f00000ABCDEFGH/Body",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!([{
+                "message": "The requested resource does not exist",
+                "errorCode": "NOT_FOUND"
+            }])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .tooling()
+            .apex_log_body("07L5f00000ABCDEFGH")
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::Api { status, errors, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(errors[0].error_code, "NOT_FOUND");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
     }
 }
