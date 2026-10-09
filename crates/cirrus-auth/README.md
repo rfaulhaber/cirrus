@@ -31,7 +31,11 @@ REST client.
 - **Refresh Token** (RFC 6749 §6) — `RefreshTokenAuth::builder()`
 - **Client Credentials** (RFC 6749 §4.4) — `ClientCredentialsAuth::builder()`
 - **Web Server with PKCE** (RFC 6749 §4.1 + RFC 7636) — `WebServerFlow::builder()`
-- **Token Exchange** (RFC 8693) — `TokenExchangeFlow::builder()`
+- **Token Exchange** (RFC 8693) — `TokenExchangeFlow::builder()`, built
+  once per connected app and reused: `exchange(subject_token, type)` takes
+  each IdP token, `TokenExchangeGrantType::HybridTokenExchange` selects the
+  grant Salesforce documents for hybrid mobile apps, and a `subject_token`
+  over 10,000 characters is refused before any request
 - **Static token** — `StaticTokenAuth::new(token, instance_url)` for
   paste-from-`sf-org-display` workflows or tests; surrounding whitespace on
   the token is trimmed
@@ -61,6 +65,11 @@ default.
 `SharedAuth` is a convenience alias for `Arc<dyn AuthSession>` — the
 shape the Cirrus client stores.
 
+The `async_trait` macro is re-exported, so a session that obtains its
+token elsewhere (a secrets manager, a sidecar, a test double) implements
+the trait under `#[cirrus_auth::async_trait]` with no dependency of its
+own; the trait's docs carry a compiled example.
+
 ## Web Server flow
 
 `WebServerFlow` drives both halves of the interactive flow and holds the
@@ -89,7 +98,27 @@ let auth = flow.refresh_auth(&session)?.build()?;
 Salesforce requires `client_secret` on the code exchange and again on the
 refresh grant unless the app's "Require Secret for Web Server Flow" and
 "Require Secret for Refresh Token Flow" settings are turned off; both are
-on by default and independent, and PKCE does not stand in for either.
+on by default and independent, and PKCE does not stand in for either. A
+host that must not hold the secret sets `private_key_pem_bytes` (or
+`private_key_pem_file`) instead, with the private key behind the app's
+uploaded certificate: both requests then carry a freshly signed RS256
+`client_assertion` and no `client_secret`. The same two setters exist on
+`RefreshTokenAuthBuilder`. Because Salesforce ignores the assertion when
+a secret is present, a builder given both fails with
+`AuthError::InvalidArgument`.
+
+## Signing out
+
+`RefreshTokenAuth::revoke` posts the session's live refresh token — under
+Refresh Token Rotation, the replacement adopted last, which nothing else
+holds — to `/services/oauth2/revoke`, which revokes every access token
+issued through it, and clears the local cache; drop the session
+afterwards. `WebServerFlow::revoke` and `TokenExchangeFlow::revoke`
+revoke a token their login host issued with the flow's own client, and
+`revoke_token(&client, login_url, token)` does the same for a token held
+elsewhere. Salesforce answers 200 on success and 400 with
+`unsupported_token_type` or `invalid_token` otherwise, surfaced as
+`AuthError::OAuth`; the request is sent once.
 
 `start_with(&AuthorizeOptions)` adds the parameters that vary per attempt:
 `login_hint`, `prompt`, `display`, `immediate`, `sso_provider`, any extra
@@ -109,17 +138,25 @@ digest and fails with `FlowMismatch` before any request when they differ.
 ## Errors
 
 `AuthError` (re-exported by `cirrus` as `cirrus::AuthError`) covers OAuth
-token-endpoint errors, missing builder fields, transport failures, and
-malformed responses. Failures a caller usually wants to branch on have
-their own variants — `StateMismatch` (a forged or crossed callback),
-`FlowMismatch` (a pending completed on a differently configured flow),
-`InstanceUrlMismatch` (wrong org), `UnexpectedResponse` (a non-OAuth
-error body), `InsecureLoginUrl`, `Signing`, `Randomness`, `HttpClient` (a
-client that could not be built, as distinct from `Http`, a request that
-failed) — so no one has to match on message text. Variants that wrap
-another error expose it through `source()` and don't repeat it in
-`Display`; print the chain (anyhow's `{:#}`) to see the cause. It's
-`#[non_exhaustive]` so future variants don't break downstream `match` arms.
+token-endpoint errors, missing or unusable builder fields, transport
+failures, and malformed responses. Failures a caller usually wants to
+branch on have their own variants — `StateMismatch` (a forged or crossed
+callback), `FlowMismatch` (a pending completed on a differently configured
+flow), `InstanceUrlMismatch` (wrong org), `UnexpectedResponse` (a non-OAuth
+error body), `InvalidArgument` (a value a flow cannot use: the shared
+login hosts on the client-credentials builder, a PEM that holds no private
+key, a secret alongside a client-assertion key, an oversized
+`subject_token`), `InsecureLoginUrl`, `Signing`, `Randomness`,
+`HttpClient` (a client that could not be built, as distinct from `Http`, a
+request that failed) — so no one has to match on message text. `OAuth`
+prints Salesforce's `error_description` after the code, so an
+`invalid_grant` says which of the dozen documented causes it was; before
+the description is stored, every non-public value the failing request sent
+(secret, token, assertion, consumer key) is replaced with `[redacted]` and
+the text is capped at 256 characters. Variants that wrap another error
+expose it through `source()` and don't repeat it in `Display`; print the
+chain (anyhow's `{:#}`) to see the cause. It's `#[non_exhaustive]` so
+future variants don't break downstream `match` arms.
 
 ## Transport defaults
 
@@ -214,6 +251,14 @@ let shared: Arc<dyn AuthSession> = Arc::new(auth);
 
 Hand `shared` to `cirrus::Cirrus::builder().auth(shared)` to build a REST
 client, or to any other crate that consumes `Arc<dyn AuthSession>`.
+
+`private_key_pem_file` takes a `camino::Utf8PathBuf` or anything that
+converts into one; `camino` is re-exported as `cirrus_auth::camino`, and a
+`std::path::PathBuf` converts with `Utf8PathBuf::try_from`. Both PEM
+setters read the first block and refuse anything but an `RSA PRIVATE KEY`
+or `PRIVATE KEY`, naming what they found, so passing `server.crt` in place
+of `server.key` fails at build time rather than at the first token
+request.
 
 ## License
 

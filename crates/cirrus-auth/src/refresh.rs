@@ -50,7 +50,16 @@
 //! it is set; with the setting on and no secret, every mint fails with an
 //! [`AuthError::OAuth`] from the token endpoint that names no setting.
 //!
-//! (<https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
+//! The alternative to the secret is a `client_assertion`. Give the
+//! builder the private key behind the app's uploaded certificate through
+//! [`RefreshTokenAuthBuilder::private_key_pem_bytes`] or its file form,
+//! and every grant carries a freshly signed RS256 JWT in
+//! `client_assertion` with its `client_assertion_type`, and no
+//! `client_secret`. Salesforce checks the assertion only when no secret
+//! is present, so the builder refuses both.
+//!
+//! (<https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>,
+//! <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_refresh_token_flow.htm&type=5>)
 //!
 //! ## Token rotation
 //!
@@ -101,19 +110,34 @@
 //! stored token must back exactly one session: share a single
 //! `Arc<RefreshTokenAuth>` across clients rather than building several
 //! sessions from the same token.
+//!
+//! ## Signing out
+//!
+//! [`RefreshTokenAuth::revoke`] posts the live refresh token to the
+//! revocation endpoint, which also revokes the access tokens issued
+//! through it, and clears the local cache. Under rotation the live token
+//! is the one the session adopted last, so this is the only way to end a
+//! rotated session without a handler having recorded every replacement.
 
 use crate::AuthSession;
+use crate::assertion::{
+    CLIENT_ASSERTION_TYPE_JWT_BEARER, check_client_authentication, client_assertion,
+    private_key_from_pem, private_key_from_pem_file,
+};
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
     GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
-    require_secure_login_url,
+    require_secure_login_url, revoke_token,
 };
 use async_trait::async_trait;
+use camino::Utf8PathBuf;
+use jsonwebtoken::EncodingKey;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 /// Salesforce production login URL — also the default token-exchange host.
 pub const PRODUCTION_LOGIN_URL: &str = "https://login.salesforce.com";
@@ -183,6 +207,7 @@ pub trait RotationHandler: Send + Sync {
 struct MintConfig {
     consumer_key: String,
     consumer_secret: Option<String>,
+    client_assertion_key: Option<EncodingKey>,
     login_url: String,
     instance_url: String,
     token_ttl: Duration,
@@ -207,6 +232,10 @@ impl std::fmt::Debug for RefreshTokenAuth {
             .field("instance_url", &self.config.instance_url)
             .field("token_ttl", &self.config.token_ttl)
             .field("confidential", &self.config.consumer_secret.is_some())
+            .field(
+                "client_assertion",
+                &self.config.client_assertion_key.is_some(),
+            )
             .field("rotation_handler", &self.config.rotation_handler.is_some())
             .finish_non_exhaustive()
     }
@@ -263,8 +292,11 @@ impl MintConfig {
         // replacement is written back below.
         let current_refresh = state.refresh_token.clone();
 
-        // Compose the form body. consumer_secret is conditional on whether
-        // the connected app is confidential.
+        // Compose the form body. The client authenticates with its secret
+        // or with a freshly signed assertion, never both: Salesforce reads
+        // the assertion only when no secret is present, and `build`
+        // refuses the pair.
+        let assertion;
         let mut body: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
             ("client_id", self.consumer_key.as_str()),
@@ -272,6 +304,11 @@ impl MintConfig {
         ];
         if let Some(secret) = self.consumer_secret.as_deref() {
             body.push(("client_secret", secret));
+        }
+        if let Some(key) = &self.client_assertion_key {
+            assertion = client_assertion(&self.consumer_key, &self.login_url, key)?;
+            body.push(("client_assertion", assertion.as_str()));
+            body.push(("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER));
         }
 
         let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
@@ -318,6 +355,33 @@ impl RefreshTokenAuth {
         // its outcome, so acquiring it is exactly "wait for the mint".
         drop(self.state.write().await);
     }
+
+    /// Revokes the session's refresh token at Salesforce, which revokes
+    /// every access token issued through it as well, and clears the cached
+    /// access token. This is the sign-out for a session: once it returns
+    /// `Ok`, nothing the session holds is valid, and the next
+    /// [`access_token`](AuthSession::access_token) call would present the
+    /// dead refresh token and fail with `invalid_grant`. Drop the session,
+    /// and the copy of the token a [`RotationHandler`] persisted.
+    ///
+    /// The token revoked is the live one, which under Refresh Token
+    /// Rotation is the latest replacement the session adopted rather than
+    /// the token the builder was given. The call waits for an in-flight
+    /// mint first, like [`quiesce`](Self::quiesce), so a rotation cannot
+    /// slip in between. On an error nothing is cleared locally and the
+    /// call can be repeated; see [`revoke_token`] for
+    /// the wire contract.
+    pub async fn revoke(&self) -> AuthResult<()> {
+        let mut guard = self.state.write().await;
+        revoke_token(
+            &self.config.http,
+            &self.config.login_url,
+            &guard.refresh_token,
+        )
+        .await?;
+        guard.mint = MintState::default();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -349,15 +413,23 @@ impl AuthSession for RefreshTokenAuth {
         // finishes, and the cache write stays inside the task so a cancelled
         // caller still leaves the outcome behind for the callers queued
         // after it.
+        //
+        // The task carries the caller's span: the mint and rotation events
+        // and the `RotationHandler` call all happen inside it, and an
+        // operator filtering logs by a request-scoped field has to find
+        // them under the request that triggered them.
         let mut guard = Arc::clone(&self.state).write_owned().await;
         if let Some(outcome) = guard.mint.shared_outcome(started) {
             return outcome.map(Cow::Owned);
         }
         let config = Arc::clone(&self.config);
-        let task = tokio::spawn(async move {
-            let minted = config.mint_token(&mut guard).await;
-            guard.mint.record("refresh-token", minted)
-        });
+        let task = tokio::spawn(
+            async move {
+                let minted = config.mint_token(&mut guard).await;
+                guard.mint.record("refresh-token", minted)
+            }
+            .in_current_span(),
+        );
         match task.await {
             Ok(result) => result.map(Cow::Owned),
             // Report only *that* the task failed. `JoinError`'s `Display`
@@ -396,6 +468,7 @@ impl AuthSession for RefreshTokenAuth {
 pub struct RefreshTokenAuthBuilder {
     consumer_key: Option<String>,
     consumer_secret: Option<String>,
+    private_key: Option<EncodingKey>,
     refresh_token: Option<String>,
     initial_access_token: Option<String>,
     login_url: Option<String>,
@@ -410,6 +483,7 @@ impl std::fmt::Debug for RefreshTokenAuthBuilder {
         f.debug_struct("RefreshTokenAuthBuilder")
             .field("consumer_key", &self.consumer_key.is_some())
             .field("consumer_secret", &self.consumer_secret.is_some())
+            .field("private_key", &self.private_key.is_some())
             .field("refresh_token", &self.refresh_token.is_some())
             .field("initial_access_token", &self.initial_access_token.is_some())
             .field("login_url", &self.login_url)
@@ -430,9 +504,45 @@ impl RefreshTokenAuthBuilder {
     /// Connected App's Consumer Secret (Client Secret). Required unless
     /// the app's "Require Secret for Refresh Token Flow" setting is off,
     /// which is not the default and is separate from the web-server
-    /// flow's setting; see the [module docs](self). Sent only when set.
+    /// flow's setting, or the grant authenticates with a
+    /// [`client_assertion`](Self::private_key_pem_bytes) instead; see the
+    /// [module docs](self). Sent only when set.
     pub fn consumer_secret(mut self, secret: impl Into<String>) -> Self {
         self.consumer_secret = Some(secret.into());
+        self
+    }
+
+    /// Authenticates the refresh grant with a `client_assertion` signed by
+    /// this RSA private key instead of with `consumer_secret`, for a host
+    /// that must not hold the secret. The key is the one behind the
+    /// certificate uploaded to the connected app, the same key the JWT
+    /// Bearer flow signs with. Every request carries a fresh RS256 JWT
+    /// naming the consumer key as `iss` and `sub` and the token endpoint
+    /// as `aud`, plus `client_assertion_type`, and no `client_secret`.
+    ///
+    /// Set this or `consumer_secret`, not both: Salesforce reads the
+    /// assertion only when no secret is present, so
+    /// [`build`](Self::build) refuses the pair with
+    /// [`AuthError::InvalidArgument`]. Accepts the same PEM as
+    /// [`JwtAuthBuilder::private_key_pem_bytes`](crate::JwtAuthBuilder::private_key_pem_bytes):
+    /// an `RSA PRIVATE KEY` or `PRIVATE KEY` block first.
+    pub fn private_key_pem_bytes(mut self, bytes: &[u8]) -> AuthResult<Self> {
+        self.private_key = Some(private_key_from_pem(bytes)?);
+        Ok(self)
+    }
+
+    /// The file form of
+    /// [`private_key_pem_bytes`](Self::private_key_pem_bytes). The path
+    /// is a [`camino::Utf8PathBuf`] or anything that converts into one.
+    pub fn private_key_pem_file(mut self, path: impl Into<Utf8PathBuf>) -> AuthResult<Self> {
+        self.private_key = Some(private_key_from_pem_file(&path.into())?);
+        Ok(self)
+    }
+
+    /// Carries a key another flow already loaded, for
+    /// [`WebServerFlow::refresh_auth`](crate::WebServerFlow::refresh_auth).
+    pub(crate) fn client_assertion_key(mut self, key: EncodingKey) -> Self {
+        self.private_key = Some(key);
         self
     }
 
@@ -582,6 +692,7 @@ impl RefreshTokenAuthBuilder {
                 .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string()),
         );
         require_secure_login_url(&login_url)?;
+        check_client_authentication(self.consumer_secret.as_deref(), self.private_key.as_ref())?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
         let http = self.http.into_client()?;
         let mint = match self.initial_access_token {
@@ -593,6 +704,7 @@ impl RefreshTokenAuthBuilder {
             config: Arc::new(MintConfig {
                 consumer_key,
                 consumer_secret: self.consumer_secret,
+                client_assertion_key: self.private_key,
                 login_url,
                 instance_url,
                 token_ttl,
@@ -611,6 +723,7 @@ impl RefreshTokenAuthBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::test_support::decode_jwt_segment;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{body_string_contains, method, path};
@@ -749,6 +862,94 @@ mod tests {
         let t2 = auth.access_token().await.unwrap();
         assert_eq!(&*t2, "00DXX!ACCESS");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Throwaway RSA key shared with the JWT tests; see
+    /// `tests/fixtures/test_rsa_key.pem`.
+    const TEST_PEM: &[u8] = include_bytes!("../tests/fixtures/test_rsa_key.pem");
+
+    #[tokio::test]
+    async fn a_private_key_signs_a_client_assertion_in_place_of_the_secret() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_refresh_token_flow.htm&type=5
+        // (release 264): "Instead of passing a client_secret, you can
+        // provide a client_assertion and client_assertion_type", the type
+        // being urn:ietf:params:oauth:client-assertion-type:jwt-bearer.
+        // The Web Server flow page defines the assertion: iss and sub are
+        // the client_id, aud the token servlet URL, exp within 5 minutes,
+        // signed RS256 with the key of the app's uploaded certificate.
+        let server = MockServer::start().await;
+        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(BodyCapturingResponder {
+                captured: captured.clone(),
+                response: token_response("at-1", None),
+            })
+            .mount(&server)
+            .await;
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .private_key_pem_bytes(TEST_PEM)
+            .unwrap()
+            .build()
+            .unwrap();
+        auth.access_token().await.unwrap();
+
+        let body = captured.lock().await;
+        let params: Vec<(String, String)> = serde_urlencoded::from_str(&body).unwrap();
+        let field = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name} missing from body: {body}"))
+        };
+        assert!(params.iter().all(|(k, _)| k != "client_secret"), "{body}");
+        assert_eq!(
+            field("client_assertion_type"),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        );
+        let assertion = field("client_assertion");
+        let mut parts = assertion.split('.');
+        let header = decode_jwt_segment(parts.next().unwrap());
+        let claims = decode_jwt_segment(parts.next().unwrap());
+        assert!(parts.next().is_some(), "assertion must carry a signature");
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(claims["iss"], "consumer-key-123");
+        assert_eq!(claims["sub"], "consumer-key-123");
+        assert_eq!(
+            claims["aud"],
+            format!("{}/services/oauth2/token", server.uri())
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let exp = claims["exp"].as_i64().expect("exp must be a number");
+        assert!(exp > now && exp <= now + 300, "exp={exp} now={now}");
+    }
+
+    #[test]
+    fn builder_refuses_a_private_key_alongside_a_consumer_secret() {
+        // Salesforce ignores the assertion when a client_secret is present,
+        // so sending both would authenticate with the secret the caller
+        // meant to keep off the host.
+        let err = builder_with_required_fields()
+            .consumer_secret("hunter2")
+            .private_key_pem_bytes(TEST_PEM)
+            .unwrap()
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::InvalidArgument {
+                    name: "private_key",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1119,6 +1320,90 @@ mod tests {
         async fn on_rotation(&self, new_refresh_token: &str) {
             self.seen.lock().await.push(new_refresh_token.to_string());
         }
+    }
+
+    /// Records the span that is current when the rotation handler runs.
+    struct SpanRecordingHandler {
+        seen: Arc<std::sync::Mutex<Option<tracing::span::Id>>>,
+    }
+
+    #[async_trait]
+    impl RotationHandler for SpanRecordingHandler {
+        async fn on_rotation(&self, _: &str) {
+            *self.seen.lock().unwrap() = tracing::Span::current().id();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_detached_mint_runs_in_the_callers_span() {
+        use tracing::Instrument;
+        // The mint, its events and the rotation handler run in a task
+        // detached from the caller. An operator filtering logs by a
+        // request-scoped field must still find the rotation event for that
+        // request, so the task has to carry the caller's span.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(token_response("at-1", Some("rt-2")))
+            .mount(&server)
+            .await;
+        let _recording = crate::test_support::Capture::record();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .on_rotation(Arc::new(SpanRecordingHandler { seen: seen.clone() }))
+            .build()
+            .unwrap();
+
+        let span = tracing::info_span!("request", tenant = "acme");
+        let expected = span
+            .id()
+            .expect("the test subscriber enables spans under cirrus_auth");
+        auth.access_token().instrument(span).await.unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn revoke_sends_the_live_refresh_token_and_clears_the_cached_access_token() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_revoke_token.htm&type=5
+        // (release 264): "If a refresh token is included, Salesforce
+        // revokes it and any associated access tokens." Under rotation the
+        // live token is the rotated one, which only the session holds.
+        let server = MockServer::start().await;
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: token_hits.clone(),
+                response: token_response("at-1", Some("rt-2")),
+            })
+            .mount(&server)
+            .await;
+        let revoked = Arc::new(tokio::sync::Mutex::new(String::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .respond_with(BodyCapturingResponder {
+                captured: revoked.clone(),
+                response: ResponseTemplate::new(200),
+            })
+            .mount(&server)
+            .await;
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        auth.access_token().await.unwrap();
+
+        auth.revoke().await.unwrap();
+
+        assert_eq!(*revoked.lock().await, "token=rt-2");
+        auth.access_token().await.unwrap();
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            2,
+            "the cached access token outlived the revoke"
+        );
     }
 
     #[tokio::test]

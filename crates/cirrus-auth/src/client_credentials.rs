@@ -23,7 +23,10 @@
 //! supported. Use your My Domain URL instead."* The builder therefore has
 //! no `PRODUCTION_LOGIN_URL`/`SANDBOX_LOGIN_URL` defaults — `login_url` is
 //! required and must be the org's My Domain (e.g.
-//! `https://my-org.my.salesforce.com`).
+//! `https://my-org.my.salesforce.com`). Either shared host is refused at
+//! [`build`](ClientCredentialsAuthBuilder::build) with
+//! [`AuthError::InvalidArgument`], because the token endpoint would only
+//! answer `invalid_grant`, a code Salesforce lists a dozen causes for.
 //!
 //! ## No refresh token
 //!
@@ -48,6 +51,32 @@ use tokio::sync::RwLock;
 
 /// Default cache TTL for an access token after it's issued.
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// The shared login hosts Salesforce documents as unsupported for this
+/// grant.
+const UNSUPPORTED_LOGIN_HOSTS: [&str; 2] = ["login.salesforce.com", "test.salesforce.com"];
+
+/// Refuses a login URL on either shared host. The token endpoint there
+/// answers `invalid_grant` on the first mint, which names neither the
+/// host nor the fix; refusing at build time does both.
+fn require_my_domain_login_url(url: &str) -> AuthResult<()> {
+    let host = url::Url::parse(url)?
+        .host_str()
+        .map(str::to_ascii_lowercase);
+    if host
+        .as_deref()
+        .is_some_and(|host| UNSUPPORTED_LOGIN_HOSTS.contains(&host))
+    {
+        return Err(AuthError::InvalidArgument {
+            name: "login_url",
+            reason: format!(
+                "{url} is not supported by the client credentials flow; use the org's My Domain \
+                 URL, such as https://MyDomainName.my.salesforce.com"
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Client-credentials-grant auth session.
 ///
@@ -202,8 +231,9 @@ impl ClientCredentialsAuthBuilder {
     /// must be the org's My Domain URL (e.g.
     /// `https://my-org.my.salesforce.com`). Salesforce explicitly rejects
     /// this flow at `https://login.salesforce.com` and
-    /// `https://test.salesforce.com`. Must be `https` (loopback hosts
-    /// excepted, for local test servers).
+    /// `https://test.salesforce.com`, so [`build`](Self::build) refuses
+    /// both with [`AuthError::InvalidArgument`]. Must be `https` (loopback
+    /// hosts excepted, for local test servers).
     pub fn login_url(mut self, url: impl Into<String>) -> Self {
         self.login_url = Some(url.into());
         self
@@ -292,6 +322,7 @@ impl ClientCredentialsAuthBuilder {
         );
         let login_url = normalize_url(&self.login_url.ok_or(AuthError::MissingField("login_url"))?);
         require_secure_login_url(&login_url)?;
+        require_my_domain_login_url(&login_url)?;
         let token_ttl = self.token_ttl.unwrap_or(DEFAULT_TOKEN_TTL);
         let http = self.http.into_client()?;
 
@@ -367,6 +398,37 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, AuthError::MissingField("login_url")));
+    }
+
+    #[test]
+    fn builder_rejects_the_shared_login_hosts() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_client_credentials_flow.htm&type=5
+        // (release 264): "For this flow, requests to
+        // https://login.salesforce.com and https://test.salesforce.com
+        // aren't supported. Use your My Domain URL instead." The endpoint
+        // would answer `invalid_grant`, one of thirteen causes behind that
+        // code, so the builder refuses the hosts up front.
+        for url in [
+            "https://login.salesforce.com",
+            "https://test.salesforce.com/",
+            "https://Login.Salesforce.com",
+        ] {
+            let err = builder_with_required_fields()
+                .login_url(url)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    AuthError::InvalidArgument {
+                        name: "login_url",
+                        ..
+                    }
+                ),
+                "{url}: {err:?}"
+            );
+            assert!(err.to_string().contains("My Domain"), "{url}: {err}");
+        }
     }
 
     #[test]

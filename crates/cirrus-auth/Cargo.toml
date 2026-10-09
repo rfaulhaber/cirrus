@@ -41,6 +41,7 @@ flate2.workspace = true
 # individual request parameters instead of substring-matching.
 serde_urlencoded.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-core.workspace = true
 wiremock.workspace = true
 
 [lints]

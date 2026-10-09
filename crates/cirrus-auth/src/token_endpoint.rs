@@ -11,7 +11,7 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::transport::{CollectBodyError, collect_body};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 /// Margin subtracted from a cached token's lifetime when deciding whether
@@ -314,27 +314,66 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
     error: String,
     #[serde(default)]
     error_description: Option<String>,
 }
 
-// `error_description` is server-supplied free text and has historically
-// contained partial token material in some Salesforce error paths.
-// Redact the description so the OAuth error code is the only thing that
-// surfaces in `{:?}`.
-impl std::fmt::Debug for OAuthErrorResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OAuthErrorResponse")
-            .field("error", &self.error)
-            .field(
-                "error_description",
-                &self.error_description.as_ref().map(|_| "[redacted]"),
-            )
-            .finish()
+/// Longest `error_description` kept on an [`AuthError::OAuth`], in
+/// characters. Salesforce's descriptions are one sentence; anything much
+/// longer is an intermediary's page that happened to parse as the error
+/// shape, and the error is printed by loggers.
+const OAUTH_ERROR_DESCRIPTION_CAP: usize = 256;
+
+/// Form parameters whose values are not credentials and may stay readable
+/// when a description echoes them. Every other value the request carried
+/// (`client_id` included, since the crate treats the consumer key as a
+/// credential identifier everywhere else) is scrubbed.
+const PUBLIC_FORM_PARAMETERS: [&str; 6] = [
+    "grant_type",
+    "scope",
+    "redirect_uri",
+    "subject_token_type",
+    "token_handler",
+    "client_assertion_type",
+];
+
+const REDACTED: &str = "[redacted]";
+
+/// The [`AuthError::OAuth`] for a parsed error body: the description is
+/// scrubbed of the request's own form values and capped before it is
+/// stored, so no later `Display` or `Debug` can leak what the request
+/// sent.
+fn oauth_error(response: OAuthErrorResponse, form: &[(&str, &str)]) -> AuthError {
+    AuthError::OAuth {
+        error: response.error,
+        error_description: response
+            .error_description
+            .map(|description| scrub_description(description, form)),
     }
+}
+
+/// Replaces every non-public form value that appears verbatim in
+/// `description` with [`REDACTED`], then cuts the text to
+/// [`OAUTH_ERROR_DESCRIPTION_CAP`] characters. Scrubbing runs first so a
+/// value straddling the cut cannot survive it in part.
+fn scrub_description(description: String, form: &[(&str, &str)]) -> String {
+    let mut text = description;
+    for (name, value) in form {
+        if value.is_empty() || PUBLIC_FORM_PARAMETERS.contains(name) {
+            continue;
+        }
+        if text.contains(value) {
+            text = text.replace(value, REDACTED);
+        }
+    }
+    if let Some((cut, _)) = text.char_indices().nth(OAUTH_ERROR_DESCRIPTION_CAP) {
+        text.truncate(cut);
+        text.push_str("...");
+    }
+    text
 }
 
 /// Whether a grant may be presented again after an attempt whose outcome
@@ -400,21 +439,19 @@ fn status_is_retryable(status: u16) -> bool {
 /// a 429, a 5xx and an ambiguous transport failure are retried only for a
 /// [`GrantReplay::Safe`] grant, up to [`TOKEN_REQUEST_BACKOFF`]'s budget.
 /// On a terminal non-2xx, the body is parsed as the OAuth error shape if
-/// possible; otherwise only the status is surfaced as
+/// possible, with its description scrubbed of the form's own values (see
+/// [`scrub_description`]); otherwise only the status is surfaced as
 /// [`AuthError::UnexpectedResponse`]. Such a body is neither carried nor
 /// logged, since non-standard error pages can echo credentials. A body
 /// over [`TOKEN_RESPONSE_BODY_CAP`] decoded bytes is refused as
 /// [`AuthError::ResponseTooLarge`]; on a 429 or 5xx a replay-safe grant
 /// retries it first, exactly as it would the status alone.
-pub(super) async fn exchange<B>(
+pub(super) async fn exchange(
     http: &reqwest::Client,
     login_url: &str,
-    body: &B,
+    body: &[(&str, &str)],
     replay: GrantReplay,
-) -> AuthResult<TokenResponse>
-where
-    B: Serialize + ?Sized,
-{
+) -> AuthResult<TokenResponse> {
     let url = format!("{login_url}/services/oauth2/token");
     let mut attempt = 0usize;
     let (status, content_type, bytes) = loop {
@@ -501,10 +538,7 @@ where
 
     if !(200..300).contains(&status) {
         if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
-            return Err(AuthError::OAuth {
-                error: oauth_err.error,
-                error_description: oauth_err.error_description,
-            });
+            return Err(oauth_error(oauth_err, body));
         }
         // A body outside the OAuth error shape came from an intermediary
         // (an HTML error page, a proxy), and those tend to echo the form
@@ -543,6 +577,65 @@ pub(super) fn check_instance_url(expected: &str, response: &TokenResponse) -> Au
         });
     }
     Ok(())
+}
+
+/// Revokes an access or refresh token at `{login_url}/services/oauth2/revoke`.
+///
+/// Salesforce invalidates an access token outright and, given a refresh
+/// token, revokes it together with every access token issued through it,
+/// which is what a sign-out needs. `login_url` is the host that issued
+/// the token, normally the org's My Domain login URL; it must be `https`
+/// (loopback excepted) like every login URL in this crate, and the token
+/// travels in the form body.
+///
+/// A 200 is success. Salesforce answers every failure with a 400 and an
+/// OAuth error body whose code is `unsupported_token_type` or
+/// `invalid_token`, surfaced as [`AuthError::OAuth`]; a body in any other
+/// shape is [`AuthError::UnexpectedResponse`]. The request is sent once:
+/// repeating a revocation whose answer was lost is harmless, but a repeat
+/// of one that landed answers `invalid_token`, so the caller decides
+/// whether to retry.
+///
+/// The flows that hold a client offer this as
+/// [`RefreshTokenAuth::revoke`](crate::RefreshTokenAuth::revoke), which
+/// knows the live refresh token, [`WebServerFlow::revoke`](crate::WebServerFlow::revoke)
+/// and [`TokenExchangeFlow::revoke`](crate::TokenExchangeFlow::revoke).
+/// Use this function with [`token_client_builder`] for a token held
+/// outside them.
+///
+/// (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_revoke_token.htm&type=5>)
+pub async fn revoke_token(http: &reqwest::Client, login_url: &str, token: &str) -> AuthResult<()> {
+    let login_url = normalize_url(login_url);
+    require_secure_login_url(&login_url)?;
+    let form = [("token", token)];
+    let response = http
+        .post(format!("{login_url}/services/oauth2/revoke"))
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let bytes = match collect_body(response, TOKEN_RESPONSE_BODY_CAP).await {
+        Ok(bytes) => bytes,
+        Err(CollectBodyError::TooLarge { limit }) => {
+            return Err(AuthError::ResponseTooLarge { status, limit });
+        }
+        Err(CollectBodyError::Transport(e)) => return Err(e.into()),
+    };
+    if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
+        return Err(oauth_error(oauth_err, &form));
+    }
+    // Same rule as `exchange`: a body outside the OAuth error shape is an
+    // intermediary's page and may echo the token it was sent.
+    tracing::trace!(
+        target: "cirrus_auth::token_endpoint",
+        status,
+        body_len = bytes.len(),
+        "revoke endpoint returned a non-2xx body that did not parse as an OAuth error",
+    );
+    Err(AuthError::UnexpectedResponse { status })
 }
 
 #[cfg(test)]
@@ -867,6 +960,159 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
+    async fn oauth_error_description(
+        server_body: serde_json::Value,
+        form: &[(&str, &str)],
+    ) -> String {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(server_body))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(&http, &server.uri(), form, GrantReplay::Safe)
+            .await
+            .unwrap_err();
+        match err {
+            AuthError::OAuth {
+                error_description: Some(description),
+                ..
+            } => description,
+            other => panic!("expected an OAuth error with a description, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oauth_error_description_is_scrubbed_of_the_values_the_request_sent() {
+        // The description is free text, so a value echoed from the form
+        // (the secret here, or a token) must not reach a log line through
+        // the error's Display. Public parameters stay readable.
+        let description = oauth_error_description(
+            serde_json::json!({
+                "error": "invalid_client",
+                "error_description":
+                    "secret hunter2 is not the secret of consumer-key-123 for grant client_credentials",
+            }),
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", "consumer-key-123"),
+                ("client_secret", "hunter2"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            description,
+            "secret [redacted] is not the secret of [redacted] for grant client_credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oauth_error_description_is_capped_on_a_character_boundary() {
+        let description = oauth_error_description(
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "é".repeat(2_000),
+            }),
+            &[("grant_type", "client_credentials")],
+        )
+        .await;
+        assert!(description.chars().count() <= 300, "{}", description.len());
+        assert!(description.starts_with("éééé"), "{description}");
+        assert!(description.ends_with("..."), "{description}");
+    }
+
+    // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_revoke_token.htm&type=5
+    // (release 264): a form POST to `/services/oauth2/revoke` with a single
+    // `token` field; "Salesforce indicates successful processing of the
+    // request by returning an HTTP 200 status code. For all error
+    // conditions, Salesforce returns a 400 status code along with one of
+    // these error responses": `unsupported_token_type` or `invalid_token`.
+    #[tokio::test]
+    async fn revoke_token_posts_the_token_as_a_form_and_accepts_200() {
+        use wiremock::matchers::{body_string, header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string("token=5Aep861KIwKdekr...refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        revoke_token(
+            &http,
+            &format!("{}/", server.uri()),
+            "5Aep861KIwKdekr...refresh",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_token_maps_the_documented_400_to_a_scrubbed_oauth_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_token",
+                "error_description": "token 5Aep861KIwKdekr...refresh was invalid",
+            })))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = revoke_token(&http, &server.uri(), "5Aep861KIwKdekr...refresh")
+            .await
+            .unwrap_err();
+        match err {
+            AuthError::OAuth {
+                error,
+                error_description,
+            } => {
+                assert_eq!(error, "invalid_token");
+                assert_eq!(
+                    error_description.as_deref(),
+                    Some("token [redacted] was invalid")
+                );
+            }
+            other => panic!("expected an OAuth error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_token_reports_an_unrecognized_body_by_status_without_retrying() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("<html>gateway</html>"))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = revoke_token(&http, &server.uri(), "t").await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnexpectedResponse { status: 503 }),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoke_token_refuses_a_cleartext_login_url() {
+        let http = token_client_builder().build().unwrap();
+        let err = revoke_token(&http, "http://example.com", "t")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
+    }
+
     #[test]
     fn https_and_loopback_login_urls_are_accepted() {
         require_secure_login_url("https://my-org.my.salesforce.com").unwrap();
@@ -946,92 +1192,7 @@ mod tests {
         assert_eq!(refresh_margin(Duration::ZERO), Duration::ZERO);
     }
 
-    /// Records, as `target LEVEL field=value ...` lines, every event the
-    /// recording thread emits under a `cirrus_auth` target while a
-    /// [`Recording`] is alive.
-    ///
-    /// Installed once per process as the global subscriber, never as a
-    /// scoped one: `tracing` caches each callsite's `Interest` process-wide,
-    /// and the cache is filled by whichever thread reaches the callsite
-    /// first. Under a scoped subscriber, a test running concurrently on
-    /// another thread registers the callsite against the no-op dispatcher
-    /// and caches `never`, after which this thread's events are dropped
-    /// before any subscriber sees them. The global subscriber answers
-    /// `Interest::sometimes()`, so every event consults `enabled`, which
-    /// admits only a thread that is recording.
-    struct Capture;
-
-    thread_local! {
-        static RECORDING: std::cell::RefCell<Option<Vec<String>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Collects the recording thread's events until it is dropped.
-    struct Recording;
-
-    impl Capture {
-        fn record() -> Recording {
-            static INSTALL: std::sync::Once = std::sync::Once::new();
-            INSTALL.call_once(|| {
-                tracing::subscriber::set_global_default(Capture)
-                    .expect("no other global subscriber is installed in the test binary");
-            });
-            RECORDING.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
-            Recording
-        }
-    }
-
-    impl Recording {
-        fn lines(self) -> Vec<String> {
-            RECORDING.with(|lines| lines.borrow_mut().take().unwrap_or_default())
-        }
-    }
-
-    impl Drop for Recording {
-        fn drop(&mut self) {
-            RECORDING.with(|lines| *lines.borrow_mut() = None);
-        }
-    }
-
-    impl tracing::Subscriber for Capture {
-        fn register_callsite(
-            &self,
-            _: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::sometimes()
-        }
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target().starts_with("cirrus_auth")
-                && RECORDING.with(|lines| lines.borrow().is_some())
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Line(String);
-            impl tracing::field::Visit for Line {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!(" {}={value:?}", field.name()));
-                }
-            }
-            let metadata = event.metadata();
-            let mut line = Line(format!("{} {}", metadata.target(), metadata.level()));
-            event.record(&mut line);
-            RECORDING.with(|lines| {
-                if let Some(lines) = lines.borrow_mut().as_mut() {
-                    lines.push(line.0);
-                }
-            });
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
+    use crate::test_support::Capture;
 
     #[tokio::test]
     async fn a_non_oauth_error_body_is_logged_by_shape_only() {

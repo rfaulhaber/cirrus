@@ -63,6 +63,9 @@ dotenvy = "0.15"
 flate2 = "1.1"
 proptest = "1.6"
 wiremock = "0.6"
+# Test-only: names the span::Current type that tracing itself does not
+# re-export, for the unit tests' span-tracking subscriber.
+tracing-core = "0.1"
 # `zip` is used only by integration tests that build a minimal deploy
 # zip (cirrus-metadata). Pulling it into dev-dependencies keeps the
 # published crate's dependency surface unchanged.
