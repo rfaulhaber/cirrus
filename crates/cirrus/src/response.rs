@@ -1299,8 +1299,10 @@ impl CompositeSubresponse {
 /// generic composite request under `allOrNone`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeGraphResponse {
-    /// One entry per graph in the request.
-    #[serde(default = "Vec::new")]
+    /// One entry per graph in the request. A 2xx body without the
+    /// documented `graphs` array does not parse, so an empty list here
+    /// means the request carried no graphs, never that the verdicts
+    /// went missing.
     pub graphs: Vec<CompositeGraphResult>,
 }
 
@@ -1315,7 +1317,8 @@ pub struct CompositeGraphResult {
     #[serde(rename = "graphResponse", default)]
     pub graph_response: CompositeResponse,
     /// Whether the whole graph was processed successfully. `false` means
-    /// the graph was rolled back.
+    /// nothing in the graph was committed, whether it was rolled back or
+    /// never ran because processing had halted.
     #[serde(rename = "isSuccessful")]
     pub is_successful: bool,
 }

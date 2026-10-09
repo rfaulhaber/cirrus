@@ -14,14 +14,17 @@
 //!   rolled back as a unit and reporting its own
 //!   [`CompositeGraphResult::is_successful`](crate::CompositeGraphResult::is_successful).
 //!
-//! # Sub-request URL shape
+//! # Batch sub-request URL shape
 //!
-//! Sub-request URLs are *not* instance-rooted and they do *not* go through
-//! [`Cirrus::resolve_url`]. Salesforce dispatches them under the
+//! Batch sub-request URLs are *not* instance-rooted and they do *not* go
+//! through [`Cirrus::resolve_url`]. Salesforce dispatches them under the
 //! configured `/services/data/` tree, so the expected form is
 //! `vXX.X/sobjects/Account/001…` — the API version prefix is mandatory.
 //! Each sub-request can target a different version, subject to the rule
-//! `v34.0 ≤ subrequest_version ≤ batch_version`.
+//! `v34.0 ≤ subrequest_version ≤ batch_version`. The generic composite
+//! call and a graph's nodes differ: their `url` carries the full
+//! `/services/data/vXX.X/…` prefix, as [`CompositeSubrequest::url`]
+//! documents.
 //!
 //! [`Cirrus::resolve_url`]: crate::Cirrus
 
@@ -286,8 +289,8 @@ impl<'a> CompositeHandler<'a> {
     /// subrequests, one request here carries up to 500 nodes, spread
     /// over as many as 75 graphs of at most 15 levels of `@{ref}`
     /// dependency depth. The graphs in one request are independent;
-    /// after 14 graphs have failed Salesforce stops, and the remaining
-    /// graphs report `PROCESSING_HALTED`.
+    /// once more than 14 of them have failed Salesforce stops, and the
+    /// remaining graphs report `PROCESSING_HALTED`.
     ///
     /// Nodes are confined to record resources: `sobjects/{type}` with
     /// POST, `sobjects/{type}/{id}` with GET, PATCH or DELETE, and
@@ -1800,7 +1803,7 @@ mod tests {
 
     /// The request and response bodies printed on the Composite Graph
     /// resource page, trimmed to the first graph's first two nodes and
-    /// the whole second graph.
+    /// the second graph's first node.
     //
     // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-graph.html
     fn documented_graph_request() -> serde_json::Value {
@@ -2037,6 +2040,9 @@ mod tests {
     async fn graph_top_level_400_surfaces_as_api_error() {
         // A request the endpoint refuses as a whole answers with the
         // standard error array, like every other composite resource.
+        // Salesforce prints no graph-specific example of that array, so
+        // the message text here is illustrative; the shape is the
+        // documented one.
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))

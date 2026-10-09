@@ -484,16 +484,6 @@ impl BulkQueryHandler<'_> {
     /// about the end of the result set — keep draining until
     /// [`BulkQueryResults::locator`] returns `None`.
     ///
-    /// # Errors
-    ///
-    /// Salesforce marks the last page with the literal `Sforce-Locator:
-    /// null`, and that literal is the only thing read as the end of the
-    /// results. A 2xx page with no `Sforce-Locator` header, or one whose
-    /// value is not text, is [`CirrusError::InvalidResponse`]: it is the
-    /// shape an intermediary produces when it strips or rewrites
-    /// headers, and treating it as the last page would end a drain loop
-    /// early with the export reported as complete.
-    ///
     /// The request goes out at this client's API version, which must be
     /// the version the job was created with — Salesforce returns a 409
     /// error for any other ([`BulkQueryJob::api_version`] records the
@@ -502,6 +492,16 @@ impl BulkQueryHandler<'_> {
     /// Calls
     /// `GET /services/data/{api_version}/jobs/query/{job_id}/results`
     /// with optional `?locator=&maxRecords=` query parameters.
+    ///
+    /// # Errors
+    ///
+    /// Salesforce marks the last page with the literal `Sforce-Locator:
+    /// null`, and that literal is the only thing read as the end of the
+    /// results. A 2xx page with no `Sforce-Locator` header, or one whose
+    /// value is empty or not text, is [`CirrusError::InvalidResponse`]:
+    /// it is the shape an intermediary produces when it strips or
+    /// rewrites headers, and treating it as the last page would end a
+    /// drain loop early with the export reported as complete.
     ///
     /// [Get Results for a Query Job]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/query_get_job_results.htm
     pub async fn results(
@@ -950,7 +950,7 @@ fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Str
 /// Reads the cursor for the next results page off a 2xx response.
 ///
 /// Only the documented end marker, the literal string `null`, becomes
-/// `None`. An absent or unreadable header is refused: it would otherwise
+/// `None`. An absent, empty or unreadable header is refused: it would otherwise
 /// be indistinguishable from the last page, and a drain loop would stop
 /// with the export incomplete. The message names the response's content
 /// type and size rather than quoting the body, which is the caller's
@@ -972,6 +972,11 @@ fn next_locator(
         ))),
         Some(value) => match value.to_str() {
             Ok("null") => Ok(None),
+            Ok("") => Err(CirrusError::InvalidResponse(format!(
+                "Bulk query results page carries an empty {SFORCE_LOCATOR} header {}; Salesforce \
+                 marks the last page with the literal value `null`",
+                describe()
+            ))),
             Ok(locator) => Ok(Some(locator.to_owned())),
             Err(_) => Err(CirrusError::InvalidResponse(format!(
                 "Bulk query results page carries a {SFORCE_LOCATOR} header that is not text {}",
@@ -1742,6 +1747,36 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, CirrusError::InvalidResponse(m) if m.contains("Sforce-Locator")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_results_rejects_an_empty_locator_header() {
+        // An empty value is neither the documented end marker nor a
+        // cursor that can be sent back; passing it on as `Some("")`
+        // would request `?locator=` and the first page over again.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/750xx/results"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Id\n")
+                    .insert_header("Sforce-Locator", ""),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .bulk()
+            .query()
+            .results("750xx", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CirrusError::InvalidResponse(m) if m.contains("empty Sforce-Locator")),
             "{err:?}"
         );
     }

@@ -320,6 +320,33 @@ enum Settled<T> {
     Transport(CirrusError),
 }
 
+/// Collects a body under `cap` and settles the attempt with `parse`: the
+/// finish step shared by every path that reads a body whole, and by the
+/// streaming path for the error bodies it still reads.
+async fn settle_collected<T>(
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    response: reqwest::Response,
+    cap: usize,
+    parse: impl FnOnce(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
+) -> Settled<T> {
+    // A terminal 429 or 5xx hands its hint to the caller, who may own
+    // the retries this policy does not make. Read before the headers
+    // move into the parser.
+    let retry_after = retry::parse_retry_after(&headers);
+    match collect_body(response, cap).await {
+        Ok(bytes) => Settled::Final(
+            parse(status, headers, bytes).map_err(|e| e.with_retry_after(retry_after)),
+        ),
+        Err(CollectBodyError::TooLarge { limit }) => {
+            Settled::Final(Err(CirrusError::ResponseTooLarge { status, limit }))
+        }
+        Err(CollectBodyError::Transport(e)) => Settled::Transport(e.into()),
+        // `CollectBodyError` is `non_exhaustive`.
+        Err(other) => Settled::Transport(CirrusError::InvalidResponse(other.to_string())),
+    }
+}
+
 /// Outcome of the shared 401 auth-refresh decision run at the tail of
 /// every send path.
 enum AuthRetry<'a> {
@@ -1151,41 +1178,10 @@ impl Cirrus {
         Ok(AuthRetry::Retry(fresh))
     }
 
-    /// Shared request loop behind every send path.
-    ///
-    /// Two nested retry layers, each with its own budget:
-    ///
-    /// - **Inner loop** — the [`RetryPolicy`]-driven transient retry
-    ///   (429/5xx and network errors), counted by `attempt`.
-    /// - **Outer loop** — the 401 auth-refresh retry, latched to at most
-    ///   two passes via [`Self::auth_retry_decision`].
-    ///
-    /// `attempt` resets to zero when the outer loop re-enters with the
-    /// token the refresh obtained: transient flakiness and credential
-    /// staleness are independent failure classes, so retries burned on
-    /// throttling before a 401 must not starve the post-refresh request.
-    /// The reset
-    /// also restarts the backoff schedule from `base_delay`. Total work
-    /// stays bounded at `2 * (max_retries + 1)` requests because the
-    /// outer loop is latched.
-    ///
-    /// `make_request` builds a fresh request from the current bearer
-    /// token, once per attempt ([`reqwest::RequestBuilder`] is consumed
-    /// by `send`); an `Err` from it aborts the whole call without
-    /// retrying. `headers` are the caller's request headers, checked
-    /// here before any request and attached to every attempt, so a
-    /// malformed pair is [`CirrusError::InvalidHeader`] rather than the
-    /// builder failure reqwest would defer to `send`. `parse` maps the
-    /// terminal response into the caller's result shape, and receives
-    /// the bearer token the attempt carried so a path that keeps body
-    /// text on success can scrub it as the error path does.
-    /// `Sforce-Limit-Info` capture happens here, on every response, so
-    /// no send path can forget it.
-    ///
-    /// `replay` replaces the method-derived idempotency assumption where
-    /// the HTTP method misstates an endpoint's effect: Apex REST,
-    /// anonymous Apex and the Bulk job-data upload opt out, the sObject
-    /// Collections `POST` retrieve opts in.
+    /// [`Self::dispatch_with`] for a body read whole: collects it under
+    /// the 2xx cap, or the fixed non-2xx cap, and hands the bytes to
+    /// `parse` with the bearer token the attempt carried, so a path that
+    /// keeps body text on success can scrub it as the error path does.
     async fn dispatch<T, MakeReq, Parse>(
         &self,
         method: &reqwest::Method,
@@ -1212,38 +1208,53 @@ impl Cirrus {
                 } else {
                     NON_SUCCESS_BODY_CAP
                 };
-                // A terminal 429 or 5xx hands its hint to the caller,
-                // who may own the retries this policy does not make.
-                // Read before the headers move into the parser.
-                let retry_after = retry::parse_retry_after(&headers);
-                match collect_body(response, cap).await {
-                    Ok(bytes) => Settled::Final(
-                        parse(status, headers, bytes, &token)
-                            .map_err(|e| e.with_retry_after(retry_after)),
-                    ),
-                    Err(CollectBodyError::TooLarge { limit }) => {
-                        Settled::Final(Err(CirrusError::ResponseTooLarge { status, limit }))
-                    }
-                    Err(CollectBodyError::Transport(e)) => Settled::Transport(e.into()),
-                    // `CollectBodyError` is `non_exhaustive`.
-                    Err(other) => {
-                        Settled::Transport(CirrusError::InvalidResponse(other.to_string()))
-                    }
-                }
+                settle_collected(status, headers, response, cap, |status, headers, bytes| {
+                    parse(status, headers, bytes, &token)
+                })
+                .await
             },
         )
         .await
     }
 
-    /// The request loop under every send path: transport security,
-    /// header validation, status and network retries, the refresh after
-    /// an `INVALID_SESSION_ID` 401, and `Sforce-Limit-Info` capture.
-    /// `finish` decides what a response that is not being retried
-    /// becomes; it is where the body is read, or deliberately not read.
-    /// It receives the attempt's token owned, so the future it returns
-    /// borrows nothing from its arguments: an `AsyncFn` taking `&str`
-    /// would leave that future's `Send` unprovable for every lifetime,
-    /// and every public send path has to stay `Send`.
+    /// Shared request loop behind every send path.
+    ///
+    /// Two nested retry layers, each with its own budget:
+    ///
+    /// - **Inner loop** — the [`RetryPolicy`]-driven transient retry
+    ///   (429/5xx and network errors), counted by `attempt`.
+    /// - **Outer loop** — the 401 auth-refresh retry, latched to at most
+    ///   two passes via [`Self::auth_retry_decision`].
+    ///
+    /// `attempt` resets to zero when the outer loop re-enters with the
+    /// token the refresh obtained: transient flakiness and credential
+    /// staleness are independent failure classes, so retries burned on
+    /// throttling before a 401 must not starve the post-refresh request.
+    /// The reset
+    /// also restarts the backoff schedule from `base_delay`. Total work
+    /// stays bounded at `2 * (max_retries + 1)` requests because the
+    /// outer loop is latched.
+    ///
+    /// `make_request` builds a fresh request from the current bearer
+    /// token, once per attempt ([`reqwest::RequestBuilder`] is consumed
+    /// by `send`); an `Err` from it aborts the whole call without
+    /// retrying. `headers` are the caller's request headers, checked
+    /// here before any request and attached to every attempt, so a
+    /// malformed pair is [`CirrusError::InvalidHeader`] rather than the
+    /// builder failure reqwest would defer to `send`. `finish` decides
+    /// what a response that is not being retried becomes: it is where
+    /// the body is read ([`Self::dispatch`]), or deliberately left
+    /// unread ([`Self::fetch_stream`]). It receives the attempt's token
+    /// owned, so the future it returns borrows nothing from its
+    /// arguments: an `AsyncFn` taking `&str` would leave that future's
+    /// `Send` unprovable for every lifetime, and every public send path
+    /// has to stay `Send`. `Sforce-Limit-Info` capture happens here, on
+    /// every response, so no send path can forget it.
+    ///
+    /// `replay` replaces the method-derived idempotency assumption where
+    /// the HTTP method misstates an endpoint's effect: Apex REST,
+    /// anonymous Apex and the Bulk job-data upload opt out, the sObject
+    /// Collections `POST` retrieve opts in.
     async fn dispatch_with<T, MakeReq, Finish, Fut>(
         &self,
         method: &reqwest::Method,
@@ -1661,21 +1672,14 @@ impl Cirrus {
                 if (200..300).contains(&status) {
                     return Settled::Final(Ok(ByteStream::new(status, headers, response)));
                 }
-                let retry_after = retry::parse_retry_after(&headers);
-                match collect_body(response, NON_SUCCESS_BODY_CAP).await {
-                    Ok(bytes) => {
-                        Settled::Final(Err(response::parse_error_response(status, &bytes)
-                            .with_retry_after(retry_after)))
-                    }
-                    Err(CollectBodyError::TooLarge { limit }) => {
-                        Settled::Final(Err(CirrusError::ResponseTooLarge { status, limit }))
-                    }
-                    Err(CollectBodyError::Transport(e)) => Settled::Transport(e.into()),
-                    // `CollectBodyError` is `non_exhaustive`.
-                    Err(other) => {
-                        Settled::Transport(CirrusError::InvalidResponse(other.to_string()))
-                    }
-                }
+                settle_collected(
+                    status,
+                    headers,
+                    response,
+                    NON_SUCCESS_BODY_CAP,
+                    |status, _headers, bytes| Err(response::parse_error_response(status, &bytes)),
+                )
+                .await
             },
         )
         .await
@@ -1897,8 +1901,10 @@ impl CirrusBuilder {
     /// [`CirrusError::ResponseTooLarge`] without being buffered.
     ///
     /// Bodies of non-2xx responses are capped at a fixed 256 KiB
-    /// regardless of this setting, and [`Cirrus::execute`] hands back
-    /// the raw response, outside any cap.
+    /// regardless of this setting. Two paths sit outside any cap:
+    /// [`Cirrus::execute`] hands back the raw response, and the
+    /// streaming Event Monitoring downloads hand the body over as a
+    /// [`ByteStream`] of chunks that the client never holds whole.
     pub fn max_response_size(mut self, limit: impl Into<Option<usize>>) -> Self {
         self.max_response_size = Some(limit.into());
         self

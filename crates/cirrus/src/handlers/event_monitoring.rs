@@ -654,8 +654,77 @@ mod tests {
         let handler = sf.event_monitoring();
         drop(require_send(handler.download_stream("0ATD000000001bROAQ")));
         drop(require_send(handler.download_url_stream(LOG_PATH)));
-        drop(require_send(sf.get::<serde_json::Value>("limits")));
         require_send_unpin::<ByteStream>();
+        // One caller of each of the other paths through the loop.
+        drop(require_send(sf.get::<serde_json::Value>("limits")));
+        drop(require_send(sf.send_raw(
+            reqwest::Method::GET,
+            "limits",
+            None,
+            &[],
+            None,
+            crate::Replay::ByMethod,
+        )));
+        drop(require_send(sf.bulk().query().results("750xx", None, None)));
+        drop(require_send(
+            sf.bulk().ingest().upload("750xx", bytes::Bytes::new()),
+        ));
+        drop(require_send(
+            sf.composite().graph(&serde_json::json!({"graphs": []})),
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_stream_ends_with_an_error_when_the_body_stops_and_never_replays() {
+        // wiremock always sends a complete body, so the truncated
+        // response comes from a raw socket: headers promising 40 bytes,
+        // 5 bytes of body, then a hang-up. The buffering download would
+        // replay the GET; the stream must hand over the bytes it got,
+        // end with an `Http` error, and leave the retry policy out of
+        // it, since the caller may already have consumed the prefix.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 40\r\n\r\nA,B\n1",
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            drop(sock);
+            // A replay would open a second connection. Give it the
+            // chance; the test wants it never to come.
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                .await
+                .is_err()
+        });
+
+        let sf = fixture_with_fast_retries(format!("http://{addr}"));
+        let mut stream = sf
+            .event_monitoring()
+            .download_stream("0ATD000000001bROAQ")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        let err = loop {
+            match stream.try_next().await {
+                Ok(Some(chunk)) => received.extend_from_slice(&chunk),
+                Ok(None) => panic!("the stream ended cleanly after a truncated body"),
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(received, b"A,B\n1");
+        assert!(matches!(err, CirrusError::Http(_)), "{err:?}");
+        assert!(stream.try_next().await.unwrap().is_none());
+        assert!(
+            server.await.unwrap(),
+            "a second connection means the truncated body was replayed"
+        );
     }
 
     #[tokio::test]

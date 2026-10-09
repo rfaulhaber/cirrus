@@ -174,7 +174,9 @@ boundary between auth and REST without extra plumbing.
   2xx bodies up to `CirrusBuilder::max_response_size` (1 GiB by default,
   above the 1 GB Bulk result file; `None` lifts it), anything else up to
   256 KiB. A larger body fails with `CirrusError::ResponseTooLarge`.
-  `Cirrus::execute` returns the raw response and is outside the cap.
+  `Cirrus::execute` returns the raw response and the streaming Event
+  Monitoring downloads hand the body over chunk by chunk; both are outside
+  the cap.
 
 ### The escape hatch
 
