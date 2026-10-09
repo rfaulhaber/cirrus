@@ -152,7 +152,10 @@ impl<'a> ToolingHandler<'a> {
     /// Calls `GET /services/data/{api_version}/tooling/query?q={soql}`.
     /// Tooling SOQL targets the metadata tier — regular sObjects
     /// (`Account`, `Contact`) are *not* visible here; reach for them via
-    /// [`Cirrus::query`] instead.
+    /// [`Cirrus::query`] instead. The escaping and request-size notes on
+    /// that method apply here too: a value interpolated into the
+    /// statement goes through [`soql::quote`](crate::soql::quote) first,
+    /// and the encoded statement has to fit the 16,384-byte URI cap.
     pub async fn query(&self, soql: &str) -> CirrusResult<QueryResult<Value>> {
         self.query_as(soql).await
     }
@@ -196,7 +199,9 @@ impl<'a> ToolingHandler<'a> {
     /// Calls `GET /services/data/{api_version}/tooling/search?q={sosl}`.
     /// Returns the same [`SearchResult<R>`] envelope as the regular
     /// REST search; per-object SOSL restrictions on the Tooling tier
-    /// are listed in the [SOSL Operation Limitations] doc page.
+    /// are listed in the [SOSL Operation Limitations] doc page. As with
+    /// [`Cirrus::search`], a term from outside the program goes through
+    /// [`sosl::escape_term`](crate::sosl::escape_term) first.
     ///
     /// [SOSL Operation Limitations]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/reference_objects_sosl_limits.htm
     pub async fn search(&self, sosl: &str) -> CirrusResult<SearchResult<Value>> {
@@ -924,5 +929,36 @@ mod tests {
             }
             other => panic!("expected Api error, got {other:?}"),
         }
+    }
+
+    /// The Tooling query sends `q` through the same encoder as the data
+    /// query: a `+`, `&`, `%` or `#` in the statement is percent-encoded
+    /// rather than read as query-string syntax.
+    #[tokio::test]
+    async fn tooling_query_percent_encodes_reserved_characters_in_q() {
+        const SOQL: &str = "SELECT Id FROM ApexClass WHERE Name = 'A&B' AND Body LIKE '%+1#%'";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/tooling/query"))
+            .and(query_param("q", SOQL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 0,
+                "done": true,
+                "records": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.tooling().query(SOQL).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let raw = requests[0].url.query().unwrap();
+        assert!(raw.contains("A%26B"), "`&` must be encoded: {raw}");
+        assert!(
+            raw.contains("%25%2B1%23%25"),
+            "`%`, `+` and `#` must be encoded: {raw}"
+        );
     }
 }

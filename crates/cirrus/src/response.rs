@@ -50,13 +50,50 @@ pub struct QueryResult<R> {
 /// `/parameterizedSearch`).
 ///
 /// Generic over the record type `R`. Every record carries a Salesforce
-/// `attributes` object identifying the object type and self-URL — surface
-/// it on your `R` if you need it (e.g. `#[serde(flatten)] attributes:
-/// HashMap<String, Value>`).
+/// `attributes` object with the record's sObject `type` and self `url`,
+/// which is how hits from a multi-object `RETURNING` clause are told
+/// apart. Model it as its own field — `attributes: serde_json::Value`, or
+/// a small struct with `type` (renamed, since it is a keyword) and `url`
+/// — rather than through `#[serde(flatten)]`: a flattened map collects
+/// every key the struct does not name, so the type would land at
+/// `attributes["attributes"]["type"]`. Keep `#[serde(flatten)] rest:
+/// HashMap<String, Value>` for a catch-all of the other fields.
 ///
-/// `metadata` is populated only when the caller explicitly requests it
-/// (`metadata=LABELS` on the search call). Surfaced as raw JSON because
-/// its shape varies across versions.
+/// ```
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Attributes {
+///     #[serde(rename = "type")]
+///     sobject_type: String,
+///     url: String,
+/// }
+///
+/// #[derive(Deserialize)]
+/// struct Hit {
+///     attributes: Attributes,
+///     #[serde(rename = "Id")]
+///     id: String,
+/// }
+///
+/// let hit: Hit = serde_json::from_value(serde_json::json!({
+///     "attributes": {"type": "Account", "url": "/services/data/v66.0/sobjects/Account/001xx"},
+///     "Id": "001xx"
+/// })).unwrap();
+/// assert_eq!(hit.attributes.sobject_type, "Account");
+/// ```
+///
+/// `metadata` is populated only when the request asks for field labels:
+/// `WITH METADATA='LABELS'` at the end of the SOSL passed to
+/// [`Cirrus::search`](crate::Cirrus::search), or `"metadata": "LABELS"`
+/// in the body of
+/// [`Cirrus::parameterized_search`](crate::Cirrus::parameterized_search).
+/// It is surfaced as raw JSON because its shape varies across versions.
+///
+/// The `searchRecords` object is the shape Salesforce has documented
+/// since API 37.0; 31.0 through 36.0 answered a bare array of hits, a
+/// version range [`CirrusBuilder::build`](crate::CirrusBuilder::build)
+/// refuses.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResult<R> {
     /// Hit records, in Salesforce-defined relevance order.
@@ -79,7 +116,10 @@ pub struct SObjectCreateResult {
     #[serde(default)]
     pub errors: Vec<SalesforceError>,
     /// `true` if an upsert created a new record, `false` if it updated an
-    /// existing one. Absent on plain creates.
+    /// existing one. Absent on plain creates. Salesforce added the field
+    /// in API 46.0, the oldest version
+    /// [`SObjectHandler::upsert`](crate::handlers::sobjects::SObjectHandler::upsert)
+    /// runs on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<bool>,
 }

@@ -1572,17 +1572,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sobjects_retrieve_uri_stays_under_the_documented_800_id_ceiling() {
-        // 800 18-character ids joined by literal commas is the batch size
-        // Salesforce calls out as roughly the maximum; the resulting URI
-        // has to fit the 16,384-byte limit that produces HTTP 414.
-        let ids: Vec<String> = (0..800).map(|i| format!("001xx{i:013}")).collect();
-        let query = format!("ids={}&fields=Id,Name", ids.join(","));
-        assert_eq!(query.len(), 15_218);
+    #[tokio::test]
+    async fn sobjects_retrieve_uri_stays_under_the_documented_800_id_ceiling() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/salesforce-app-limits-cheatsheet/guide/salesforce-app-limits-platform-api.html
+        // "the allowed length for the combined URI and headers is 16,384
+        // bytes ... For URIs exceeding this limit, requests can return a
+        // 414 URI Too Long error". 800 18-character ids is the batch the
+        // retrieve docs call the practical maximum, so the request target
+        // the client sends for one, on a realistic My Domain origin, has
+        // to fit. Encoding the 799 separators as `%2C` would add 1,598
+        // bytes and push it over.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let percent_encoded_len = query.len() + ids.len().saturating_sub(1) * 2;
-        assert!(percent_encoded_len > 16_384);
+        let ids: Vec<String> = (0..800).map(|i| format!("001xx{i:013}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let sf = fixture(server.uri());
+        sf.composite()
+            .sobjects()
+            .retrieve("Account", &ids, &["Id", "Name"])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let url = &requests[0].url;
+        let origin = "https://mycompany--staging.sandbox.my.salesforce.com";
+        let request_target = origin.len() + url.path().len() + 1 + url.query().unwrap().len();
+        assert!(request_target <= 16_384, "{request_target} bytes");
     }
 
     #[tokio::test]

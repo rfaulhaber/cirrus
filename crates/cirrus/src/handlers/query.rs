@@ -24,6 +24,32 @@
 //! [`pagination`](crate::pagination) module docs for the full
 //! contract.
 //!
+//! # Escaping values
+//!
+//! The query resources have no bind parameters: the statement goes out as
+//! the `q` parameter, percent-encoded for transport and nothing more. A
+//! value that comes from outside the program and is interpolated into a
+//! statement goes through [`soql::quote`](crate::soql::quote) (a string
+//! literal) or [`soql::escape_like`](crate::soql::escape_like) (part of a
+//! `LIKE` pattern) first; an unescaped `'` ends the literal early and lets
+//! the rest of the value rewrite the `WHERE` clause. SOQL is read-only and
+//! runs under the user's sharing and field-level security, so the exposure
+//! is every record the integration user can see. The same applies to the
+//! Tooling query and to SOSL, which has its own
+//! [`sosl::escape_term`](crate::sosl::escape_term).
+//!
+//! # Request size
+//!
+//! Salesforce caps the combined URI and headers of a REST call at 16,384
+//! bytes and answers a longer one with HTTP 414, which surfaces as a
+//! [`CirrusError::Api`] with no error entries. The statement travels in
+//! the URI, and a quote, comma or parenthesis costs three bytes once
+//! encoded, so an `IN` list of about 500 18-character IDs reaches the cap
+//! long before SOQL's own 100,000-character limit. Chunk the list across
+//! calls, or submit the statement as a Bulk 2.0 query job
+//! ([`BulkQueryHandler::create`](crate::handlers::bulk::BulkQueryHandler::create)),
+//! which carries it in a JSON body, runs asynchronously, and returns CSV.
+//!
 //! [`query`]: Cirrus::query
 //! [`query_all`]: Cirrus::query_all
 //! [`query_more`]: Cirrus::query_more
@@ -73,8 +99,14 @@ const NEXT_RECORDS_URL: &[&[Segment]] = &[
 impl Cirrus {
     /// Runs a SOQL query and returns the first batch of active records.
     ///
-    /// Calls `GET /services/data/{api_version}/query?q={soql}`. The query
-    /// string is URL-encoded automatically — pass plain SOQL.
+    /// Calls `GET /services/data/{api_version}/query?q={soql}`. Pass plain
+    /// SOQL: the statement is percent-encoded for the URI here, which is
+    /// transport encoding only. A value interpolated into the statement
+    /// goes through [`soql::quote`](crate::soql::quote) or
+    /// [`soql::escape_like`](crate::soql::escape_like) first (see
+    /// [Escaping values](crate::handlers::query#escaping-values)), and
+    /// the encoded statement has to fit the 16,384-byte URI cap (see
+    /// [Request size](crate::handlers::query#request-size)).
     ///
     /// # Example
     ///
@@ -105,6 +137,8 @@ impl Cirrus {
     /// archived records. The returned envelope still uses
     /// [`QueryResult`] — soft-deleted rows are surfaced via the
     /// `IsDeleted` field on each record (when included in the SELECT).
+    /// The escaping and request-size notes on [`query`](Self::query)
+    /// apply here too.
     pub async fn query_all(&self, soql: &str) -> CirrusResult<QueryResult<Value>> {
         self.query_all_as(soql).await
     }
@@ -325,7 +359,10 @@ mod tests {
         let server = MockServer::start().await;
 
         // Locator carries v66.0 — this is what `nextRecordsUrl` returns
-        // after a v66.0 query, regardless of the client's configured version.
+        // after a v66.0 query. The client is built for v61.0 to pin that
+        // the locator is followed as issued rather than rebuilt from the
+        // client's version: the cursor belongs to the query that opened
+        // it.
         Mock::given(method("GET"))
             .and(path("/services/data/v66.0/query/01gD0000002HU6KIAW-2000"))
             .and(header("authorization", "Bearer tok"))
@@ -336,10 +373,22 @@ mod tests {
                     {"attributes": {"type": "Account"}, "Id": "001yy"}
                 ]
             })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v61.0/query/01gD0000002HU6KIAW-2000"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
             .mount(&server)
             .await;
 
-        let sf = fixture(server.uri());
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v61.0")
+            .build()
+            .unwrap();
         let qr = sf
             .query_more("/services/data/v66.0/query/01gD0000002HU6KIAW-2000")
             .await
@@ -542,6 +591,51 @@ mod tests {
                 assert_eq!(errors[0].error_code, "MALFORMED_QUERY");
             }
             other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    /// Characters that mean something in a query string have to be
+    /// percent-encoded inside `q`: a literal `+` arrives as a space, a
+    /// literal `&` splits the parameter, a literal `#` ends the URI.
+    /// wiremock form-decodes the value it matches, so a statement sent
+    /// with any of them unencoded fails the match; the raw query string
+    /// pins the encoding itself.
+    #[tokio::test]
+    async fn query_and_query_all_percent_encode_reserved_characters_in_q() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-query.html
+        // "To create a valid URI, replace spaces in the query string with
+        // a plus sign + or with %20" — so a `+` in the statement itself
+        // cannot travel as a `+`.
+        const SOQL: &str = "SELECT Id FROM Contact WHERE Phone = '+1 555' AND Name LIKE 'A&B%#'";
+        let server = MockServer::start().await;
+        for resource in ["query", "queryAll"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/services/data/v66.0/{resource}")))
+                .and(query_param("q", SOQL))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "totalSize": 0,
+                    "done": true,
+                    "records": []
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let sf = fixture(server.uri());
+        sf.query(SOQL).await.unwrap();
+        sf.query_all(SOQL).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let raw = request.url.query().unwrap();
+            assert!(raw.contains("%2B1"), "`+` must be encoded: {raw}");
+            assert!(
+                raw.contains("A%26B%25%23"),
+                "`&`, `%` and `#` must be encoded: {raw}"
+            );
+            assert!(!raw.contains("&B"), "{raw}");
         }
     }
 }
