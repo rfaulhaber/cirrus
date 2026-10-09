@@ -2592,10 +2592,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sobject_collection_with_a_non_object_record_fails_as_a_request_builder_error() {
+    async fn sobject_collection_with_a_non_object_record_fails_as_serialization() {
         // Used directly, `CollectionRecord` flattens its record into the
-        // body; the body is attached with reqwest's `json`, which records a
-        // serialization failure on the request builder.
+        // body, which only an object can be; the body is serialized
+        // before any request, so the failure is a local one.
         let server = MockServer::start().await;
         expect_no_requests(&server).await;
         let collection = SObjectCollection {
@@ -2611,7 +2611,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, crate::CirrusError::Http(source) if source.is_builder()),
+            matches!(err, crate::CirrusError::Serialization(_)),
             "{err:?}"
         );
     }

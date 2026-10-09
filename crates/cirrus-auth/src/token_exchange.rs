@@ -403,8 +403,8 @@ impl TokenExchangeFlowBuilder {
 
     /// Supplies a pre-configured `reqwest::Client` for the exchange.
     ///
-    /// The client built by default applies connect and request timeouts
-    /// and refuses to follow redirects, so a redirect cannot replay the
+    /// The client built by default applies connect and request timeouts,
+    /// uses no proxy and refuses to follow redirects, so a redirect cannot replay the
     /// IdP-issued `subject_token` to another host. A client supplied here
     /// replaces those defaults wholesale, the timeout setters included;
     /// start from [`token_client_builder`](crate::token_client_builder) to

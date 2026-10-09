@@ -6,6 +6,11 @@
 //! RFC 6750 §5.3 requires TLS for every request that carries a bearer
 //! token. The one exemption is a loopback host, where the hop never
 //! leaves the machine, so local mock servers work without certificates.
+//! That holds only for a client that uses no proxy, which is why every
+//! client the crates build is created with `no_proxy()` rather than
+//! reqwest's default of obeying `HTTP_PROXY` and the system proxy; the
+//! REST and Metadata clients withdraw the exemption again when a proxy
+//! is configured on their builders, through [`is_secure_transport_for`].
 //! Defining the rule once keeps the clients from disagreeing about which
 //! URLs qualify.
 //!
@@ -33,10 +38,21 @@ pub fn is_loopback_host(url: &url::Url) -> bool {
     }
 }
 
-/// Whether a bearer token may be sent to `url`: the scheme is `https`,
-/// or the host is loopback (see [`is_loopback_host`]).
+/// Whether a bearer token may be sent to `url` by a client that uses no
+/// proxy: the scheme is `https`, or the host is loopback (see
+/// [`is_loopback_host`]). [`is_secure_transport_for`] is the same rule
+/// for a client that may route through a proxy.
 pub fn is_secure_transport(url: &url::Url) -> bool {
-    url.scheme() == "https" || is_loopback_host(url)
+    is_secure_transport_for(url, false)
+}
+
+/// Whether a bearer token may be sent to `url` by a client that routes
+/// through a proxy when `proxied`: `https` always, and a loopback host
+/// only when `proxied` is false, since the hop then leaves the machine
+/// for the proxy. The REST and Metadata clients apply this with the
+/// proxy their builders installed.
+pub fn is_secure_transport_for(url: &url::Url, proxied: bool) -> bool {
+    url.scheme() == "https" || (!proxied && is_loopback_host(url))
 }
 
 /// Why [`collect_body`] did not return a body.
@@ -148,6 +164,21 @@ mod tests {
     }
 
     #[test]
+    fn a_proxied_client_loses_the_loopback_exemption_but_not_https() {
+        assert!(is_secure_transport_for(
+            &parse("http://localhost:8080"),
+            false
+        ));
+        assert!(!is_secure_transport_for(
+            &parse("http://localhost:8080"),
+            true
+        ));
+        assert!(!is_secure_transport_for(&parse("http://[::1]"), true));
+        assert!(is_secure_transport_for(&parse("https://192.0.2.1"), true));
+        assert!(!is_secure_transport_for(&parse("http://192.0.2.1"), true));
+    }
+
+    #[test]
     fn a_url_without_a_host_is_not_loopback() {
         assert!(!is_loopback_host(&parse("mailto:someone@example.com")));
         assert!(!is_secure_transport(&parse("mailto:someone@example.com")));
@@ -165,9 +196,12 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            // The default client decodes gzip, like every client the SDK
+            // Decodes gzip and uses no proxy, like every client the SDK
             // builds.
-            let response = reqwest::Client::new()
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
                 .get(server.uri())
                 .send()
                 .await

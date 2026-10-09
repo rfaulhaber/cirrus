@@ -171,11 +171,16 @@ built: a `FROM scratch` or distroless image without `ca-certificates` fails
 at `build()` with `AuthError::HttpClient`, so install a CA bundle or add the
 roots yourself. `token_client_builder()` returns a `reqwest::ClientBuilder`
 with the same settings, for adding a private root CA, a proxy or a shared
-connection pool without losing them. Login URLs must be `https`; exact
-`localhost` and the
-loopback literals are excepted for local test servers, and `*.localhost`
-names are not. The same rule, `cirrus_auth::transport::is_secure_transport`,
-governs instance URLs in `cirrus` and `cirrus-metadata`.
+connection pool without losing them. The client uses no proxy: `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY` and the system proxy are ignored, where a stock
+`reqwest::Client` obeys them, so a deployment that needs one adds it with
+`token_client_builder().proxy(..)`. Login URLs must be `https`; exact
+`localhost` and the loopback literals are excepted for local test servers,
+which the no-proxy default is what keeps on the machine, and `*.localhost`
+names are not. The same rule, `cirrus_auth::transport::is_secure_transport`
+(and `is_secure_transport_for`, which withdraws the loopback exemption for a
+client that routes through a proxy), governs instance URLs in `cirrus` and
+`cirrus-metadata`.
 
 A token-endpoint response body is read through
 `cirrus_auth::transport::collect_body`, which stops at 64 KiB of decoded

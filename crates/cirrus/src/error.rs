@@ -343,6 +343,43 @@ fn redact_body(body: &str, token: &str) -> String {
     redact_bearer_credentials(&mask_token(body, token))
 }
 
+/// [`redact_body`] for a body kept as bytes: the non-2xx body a raw
+/// send returns, which is an intermediary's page as often as the
+/// endpoint's own answer. A body that is text gets both passes; one
+/// that is not (a PDF, say) gets the exact token replaced wherever its
+/// bytes occur. A body with nothing to replace is returned as it was.
+pub(crate) fn redact_raw_body(body: bytes::Bytes, token: &str) -> bytes::Bytes {
+    if let Ok(text) = std::str::from_utf8(&body) {
+        let scrubbed = redact_body(text, token);
+        return if scrubbed == text {
+            body
+        } else {
+            bytes::Bytes::from(scrubbed)
+        };
+    }
+    let needle = token.as_bytes();
+    if needle.is_empty() {
+        return body;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut rest: &[u8] = &body;
+    let mut changed = false;
+    while let Some(at) = rest
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(REDACTED.as_bytes());
+        rest = &rest[at + needle.len()..];
+        changed = true;
+    }
+    if !changed {
+        return body;
+    }
+    out.extend_from_slice(rest);
+    bytes::Bytes::from(out)
+}
+
 /// Applies [`mask_token`] to every string leaf of `value`. Object keys
 /// and non-string leaves pass through unchanged. The `Bearer <credential>`
 /// pass of [`redact_body`] is left out because `value` is record data,

@@ -20,7 +20,8 @@
 //!    job-data upload never replay, so only 429 and connect-phase
 //!    failures retry there, and the sObject Collections `POST`
 //!    retrieve always replays because it is a read.
-//!    [`Cirrus::send_with_replay`] gives callers the same choice.
+//!    [`Cirrus::send_with_replay`] and [`Cirrus::send_json_with_replay`]
+//!    give callers the same choice.
 //!
 //!    Note on Salesforce specifics: the REST API's documented
 //!    rate-limit signal is **403 with `errorCode:
@@ -51,6 +52,7 @@
 //!
 //! [`Retry-After`]: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
 //! [`Cirrus::send_with_replay`]: crate::Cirrus::send_with_replay
+//! [`Cirrus::send_json_with_replay`]: crate::Cirrus::send_json_with_replay
 //! [API request limits]: https://developer.salesforce.com/docs/platform/salesforce-app-limits-cheatsheet/guide/salesforce-app-limits-platform-api.html
 
 use crate::error::CirrusError;
@@ -157,10 +159,12 @@ impl RetryPolicy {
 /// because in both cases the request was never processed. The variant
 /// only decides what happens once a request has reached the server.
 /// Every typed verb and handler picks a value; pass one yourself
-/// through [`Cirrus::send_with_replay`] when the HTTP method says
-/// something different from what the endpoint does.
+/// through [`Cirrus::send_with_replay`] (or
+/// [`Cirrus::send_json_with_replay`] for a JSON body) when the HTTP
+/// method says something different from what the endpoint does.
 ///
 /// [`Cirrus::send_with_replay`]: crate::Cirrus::send_with_replay
+/// [`Cirrus::send_json_with_replay`]: crate::Cirrus::send_json_with_replay
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Replay {
@@ -480,7 +484,10 @@ mod tests {
         // before any request bytes are written — a real connect-phase
         // reqwest::Error without touching the network.
         let p = RetryPolicy::default();
-        let err: CirrusError = reqwest::Client::new()
+        let err: CirrusError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post("http://127.0.0.1:1/")
             .send()
             .await
@@ -522,7 +529,10 @@ mod tests {
         // An unparseable URL is latched by the builder and returned
         // from send(); replaying it can only fail the same way.
         let p = RetryPolicy::default();
-        let err: CirrusError = reqwest::Client::new()
+        let err: CirrusError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get("not a url/services/data/v66.0/limits")
             .send()
             .await
@@ -600,7 +610,10 @@ mod tests {
     #[tokio::test]
     async fn never_replay_keeps_connect_retries_but_drops_ambiguous_ones() {
         let p = RetryPolicy::default();
-        let connect_err: CirrusError = reqwest::Client::new()
+        let connect_err: CirrusError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get("http://127.0.0.1:1/")
             .send()
             .await
@@ -625,6 +638,7 @@ mod tests {
             .mount(&server)
             .await;
         let stalled: CirrusError = reqwest::Client::builder()
+            .no_proxy()
             .read_timeout(Duration::from_millis(50))
             .build()
             .unwrap()

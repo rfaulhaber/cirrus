@@ -86,6 +86,7 @@ pub use handlers::metadata::{
 };
 #[allow(deprecated)]
 pub use handlers::metadata::{DeployResultDetails, DeployResultInnerDetails, RunTestResults};
+pub use handlers::query::QueryOptions;
 pub use handlers::sobjects::{BlobUploadSpec, UpsertOptions};
 pub use pagination::Records;
 pub use response::LimitInfo;
@@ -95,13 +96,14 @@ pub use response::{
     BulkQueryJob, BulkQueryResults, BulkResultPage, BulkResultPages, CompositeError,
     CompositeResponse, CompositeSubresponse, CompositeTreeResponse, CompositeTreeResult,
     DescribeGlobal, EventLogFileRecord, ExecuteAnonymousResult, Limit, OrgLimits, QueryResult,
-    SObjectCollectionResult, SObjectCreateResult, SObjectMetadata, SearchResult,
+    RawBody, RawResponse, SObjectCollectionResult, SObjectCreateResult, SObjectMetadata,
+    SearchResult,
 };
 pub use retry::{Replay, RetryPolicy};
 
 use cirrus_auth::transport::{CollectBodyError, collect_body};
 use percent_encoding::{AsciiSet, CONTROLS};
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::borrow::Cow;
@@ -261,8 +263,9 @@ pub fn encode_path_segment(segment: &str) -> Cow<'_, str> {
 /// modes.
 ///
 /// Whichever mode applies, the resolved target has to be `https` (or a
-/// loopback host) before the session token is attached — see
-/// [`CirrusBuilder::allow_insecure_transport`] for the opt-out.
+/// loopback host, when no proxy is configured) before the session token
+/// is attached — see [`CirrusBuilder::allow_insecure_transport`] for the
+/// opt-out and [`CirrusBuilder::proxy`] for the proxy rule.
 #[derive(Clone)]
 pub struct Cirrus {
     client: reqwest::Client,
@@ -270,6 +273,10 @@ pub struct Cirrus {
     api_version: String,
     retry_policy: RetryPolicy,
     allow_insecure_transport: bool,
+    /// Whether the client this crate built routes through a configured
+    /// proxy, which withdraws the loopback exemption from the transport
+    /// rule: the hop then does leave the machine.
+    proxied: bool,
     max_response_size: Option<usize>,
     /// Most recent `Sforce-Limit-Info` header value, parsed. Wrapped
     /// in `Arc<RwLock<...>>` so updates are visible across cloned
@@ -286,6 +293,7 @@ impl std::fmt::Debug for Cirrus {
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("proxied", &self.proxied)
             .field("max_response_size", &self.max_response_size)
             .finish_non_exhaustive()
     }
@@ -302,10 +310,10 @@ struct JsonRequest<'a, Q: ?Sized, B: ?Sized> {
 
 /// Outcome of the shared 401 auth-refresh decision run at the tail of
 /// every send path.
-enum AuthRetry {
+enum AuthRetry<'a> {
     /// The cached token was invalidated and a genuinely new one obtained;
-    /// the caller should loop and retry the request.
-    Retry,
+    /// the caller should loop and retry the request with that token.
+    Retry(Cow<'a, str>),
     /// Not a refreshable 401 — already retried once, the result wasn't an
     /// `INVALID_SESSION_ID` 401, or the auth session couldn't produce a
     /// different token (static auth, scope/permission issue). The caller
@@ -429,7 +437,12 @@ impl Cirrus {
     /// Refuses to put the session token on a target that isn't
     /// TLS-protected. See [`check_transport_security`].
     fn check_transport_security(&self, url: &str) -> CirrusResult<()> {
-        check_transport_security("request URL", url, self.allow_insecure_transport)
+        check_transport_security(
+            "request URL",
+            url,
+            self.allow_insecure_transport,
+            self.proxied,
+        )
     }
 
     /// Builds the fully-qualified URL of a versioned resource from its path
@@ -534,23 +547,79 @@ impl Cirrus {
             .await
     }
 
-    /// Sends a request carrying extra request headers, deserializing
-    /// the response into `R`.
+    /// Sends a bodiless request carrying extra request headers,
+    /// deserializing the response into `R`.
     ///
     /// Salesforce defines a family of request headers that change how a
     /// call behaves — `Sforce-Auto-Assign`,
     /// `Sforce-Duplicate-Rule-Header`, `Sforce-Call-Options`,
-    /// `Sforce-Query-Options`, `Sforce-Mru` — and this attaches one
+    /// `Sforce-Query-Options`, `Sforce-Mru` — and this attaches them
     /// while keeping the retry policy, the 401 auto-refresh and the
     /// `Sforce-Limit-Info` capture that the typed verb methods provide.
+    /// [`Self::send_json_with_headers`] is the same call with a JSON
+    /// body.
     ///
-    /// `query` and `body` are optional; path resolution follows
-    /// [`Cirrus`]'s three-mode semantics.
+    /// `query` is optional; path resolution follows [`Cirrus`]'s
+    /// three-mode semantics. A header name or value that is not valid
+    /// HTTP is refused with [`CirrusError::InvalidHeader`] before any
+    /// request.
     ///
     /// Replay follows the method: under the default [`RetryPolicy`] a
     /// GET, PUT or DELETE is re-sent after a 5xx or a lost response and
     /// a POST or PATCH is not. [`Self::send_with_replay`] takes an
     /// explicit [`Replay`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::Value;
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // Ask for smaller pages, and let the org resolve the `acme`
+    /// // package's field names without their namespace prefix.
+    /// let page: Value = sf
+    ///     .send_with_headers(
+    ///         cirrus::reqwest::Method::GET,
+    ///         "query",
+    ///         Some(&[("q", "SELECT Id, Rating__c FROM Account")]),
+    ///         &[
+    ///             ("Sforce-Query-Options", "batchSize=500"),
+    ///             ("Sforce-Call-Options", "defaultNamespace=acme"),
+    ///         ],
+    ///     )
+    ///     .await?;
+    /// # let _ = page;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_with_headers<R>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+    {
+        let url = self.resolve_url(path);
+        self.send_resolved::<R, _, ()>(method, &url, query, headers, None, Replay::ByMethod)
+            .await
+    }
+
+    /// Sends a JSON body with extra request headers, deserializing the
+    /// response into `R`.
+    ///
+    /// [`Self::send_with_headers`] without the body; everything said
+    /// there about the headers, the request loop and replay holds here.
+    /// `body` is any [`Serialize`] value and is sent as
+    /// `application/json` unless `headers` names a `Content-Type` of
+    /// its own; a body that fails to serialize is
+    /// [`CirrusError::Serialization`] with no request made.
     ///
     /// # Example
     ///
@@ -564,37 +633,37 @@ impl Cirrus {
     /// # let sf = Cirrus::builder().auth(auth).build()?;
     /// // Create a Lead without running the org's assignment rules.
     /// let created: Value = sf
-    ///     .send_with_headers(
+    ///     .send_json_with_headers(
     ///         cirrus::reqwest::Method::POST,
     ///         "sobjects/Lead",
     ///         None,
     ///         &[("Sforce-Auto-Assign", "FALSE")],
-    ///         Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+    ///         &json!({"LastName": "Chen", "Company": "Initech"}),
     ///     )
     ///     .await?;
     /// # let _ = created;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_with_headers<R, B>(
+    pub async fn send_json_with_headers<R, B>(
         &self,
         method: reqwest::Method,
         path: &str,
         query: Option<&[(&str, &str)]>,
         headers: &[(&str, &str)],
-        body: Option<&B>,
+        body: &B,
     ) -> CirrusResult<R>
     where
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
         let url = self.resolve_url(path);
-        self.send_resolved(method, &url, query, headers, body, Replay::ByMethod)
+        self.send_resolved(method, &url, query, headers, Some(body), Replay::ByMethod)
             .await
     }
 
-    /// Sends a request with an explicit [`Replay`] choice, deserializing
-    /// the response into `R`.
+    /// Sends a bodiless request with an explicit [`Replay`] choice,
+    /// deserializing the response into `R`.
     ///
     /// Same request loop as [`Self::send_with_headers`] — retry policy,
     /// 401 auto-refresh and `Sforce-Limit-Info` capture included — but
@@ -602,10 +671,11 @@ impl Cirrus {
     /// request whose outcome is unknown. Reach for it when the HTTP
     /// method says something different from what the endpoint does: a
     /// `GET` that writes takes [`Replay::Never`]; a read that has to be
-    /// a `POST` takes [`Replay::Always`].
+    /// a `POST` takes [`Replay::Always`]. [`Self::send_json_with_replay`]
+    /// is the same call with a JSON body.
     ///
-    /// `query` and `body` are optional; path resolution follows
-    /// [`Cirrus`]'s three-mode semantics.
+    /// `query` is optional; path resolution follows [`Cirrus`]'s
+    /// three-mode semantics.
     ///
     /// # Example
     ///
@@ -625,7 +695,6 @@ impl Cirrus {
     ///         "/services/apexrest/Health",
     ///         None,
     ///         &[],
-    ///         None::<&()>,
     ///         Replay::ByMethod,
     ///     )
     ///     .await?;
@@ -633,13 +702,61 @@ impl Cirrus {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_with_replay<R, B>(
+    pub async fn send_with_replay<R>(
         &self,
         method: reqwest::Method,
         path: &str,
         query: Option<&[(&str, &str)]>,
         headers: &[(&str, &str)],
-        body: Option<&B>,
+        replay: Replay,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+    {
+        let url = self.resolve_url(path);
+        self.send_resolved::<R, _, ()>(method, &url, query, headers, None, replay)
+            .await
+    }
+
+    /// Sends a JSON body with an explicit [`Replay`] choice,
+    /// deserializing the response into `R`.
+    ///
+    /// [`Self::send_with_replay`] with a body; the body is sent as
+    /// [`Self::send_json_with_headers`] sends it.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, Replay, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::{Value, json};
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // A custom Apex REST POST that only reads, which its author
+    /// // documents, so a lost response may be re-sent.
+    /// let report: Value = sf
+    ///     .send_json_with_replay(
+    ///         cirrus::reqwest::Method::POST,
+    ///         "/services/apexrest/Report",
+    ///         None,
+    ///         &[],
+    ///         &json!({"ids": ["001xx000003DGb2"]}),
+    ///         Replay::Always,
+    ///     )
+    ///     .await?;
+    /// # let _ = report;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_json_with_replay<R, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: &B,
         replay: Replay,
     ) -> CirrusResult<R>
     where
@@ -647,8 +764,128 @@ impl Cirrus {
         B: Serialize + ?Sized,
     {
         let url = self.resolve_url(path);
-        self.send_resolved(method, &url, query, headers, body, replay)
+        self.send_resolved(method, &url, query, headers, Some(body), replay)
             .await
+    }
+
+    /// Sends a request with an optional raw body and returns the
+    /// response as it arrived: status, headers and body bytes.
+    ///
+    /// The same request loop as the typed verbs — the [`RetryPolicy`],
+    /// the 401 auto-refresh and the `Sforce-Limit-Info` capture — for
+    /// a body that is not JSON (a CSV upload, say) or a response that
+    /// is not (a file, text, a body an Apex REST class wrote). Nothing
+    /// is parsed: every status the loop lets through, a 4xx or 5xx
+    /// included, comes back as `Ok` with that status on
+    /// [`RawResponse::status`]. A 2xx body is as sent. A non-2xx body
+    /// has bearer-token material replaced with `[redacted]`, as
+    /// [`CirrusError::Api`]'s `raw` has, and is otherwise as sent rather
+    /// than cut to the 2 KiB that `raw` keeps. The one status the loop
+    /// keeps for itself is a 401 carrying `INVALID_SESSION_ID`, which is
+    /// refreshed and retried like any other call and, when the retry
+    /// gets the same answer, is `Err(CirrusError::Api)`. The response
+    /// size limits apply: a 2xx body up to
+    /// [`CirrusBuilder::max_response_size`], any other up to 256 KiB,
+    /// past which the call is [`CirrusError::ResponseTooLarge`].
+    ///
+    /// `body` is sent with its own `Content-Type`, which replaces any
+    /// in `headers`. `query`, `headers` and path resolution are as on
+    /// [`Self::send_with_headers`]; `replay` is as on
+    /// [`Self::send_with_replay`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, Replay, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // A Connect REST file download, which has no typed handler and
+    /// // answers with the file's bytes.
+    /// let response = sf
+    ///     .send_raw(
+    ///         cirrus::reqwest::Method::GET,
+    ///         "connect/files/069xx000000Abcd/content",
+    ///         None,
+    ///         &[],
+    ///         None,
+    ///         Replay::ByMethod,
+    ///     )
+    ///     .await?;
+    /// if response.is_success() {
+    ///     let file: &[u8] = &response.body;
+    ///     # let _ = file;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: Option<RawBody>,
+        replay: Replay,
+    ) -> CirrusResult<RawResponse> {
+        let url = self.resolve_url(path);
+        let url = match query {
+            Some(query) => url_with_query(&url, query)?,
+            None => url,
+        };
+        // The body's content type is part of the body; a Content-Type
+        // among the caller's headers would otherwise go out twice.
+        let mut headers: Vec<(&str, &str)> = headers
+            .iter()
+            .copied()
+            .filter(|(name, _)| body.is_none() || !name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()))
+            .collect();
+        if let Some(body) = &body {
+            headers.push((CONTENT_TYPE.as_str(), body.content_type()));
+        }
+        self.dispatch(
+            &method,
+            &url,
+            replay,
+            &headers,
+            |token: &str| {
+                let mut request = self
+                    .client
+                    .request(method.clone(), url.as_str())
+                    .bearer_auth(token);
+                if let Some(body) = &body {
+                    // bytes::Bytes is Arc-backed — clone is cheap.
+                    request = request.body(body.bytes().clone());
+                }
+                Ok(request)
+            },
+            |status, headers, bytes, token| {
+                // Only Salesforce's own expired-session answer is an
+                // error here: the loop needs it as one to refresh.
+                // Every other status is the endpoint's answer.
+                if status == 401 {
+                    let err = response::parse_error_response(status, &bytes);
+                    if err.is_invalid_session() {
+                        return Err(err);
+                    }
+                }
+                // A non-2xx body is an intermediary's page as often as
+                // the endpoint's, and those echo the request; the error
+                // path scrubs the token from such a body, so this does.
+                let body = if (200..300).contains(&status) {
+                    bytes
+                } else {
+                    crate::error::redact_raw_body(bytes, token)
+                };
+                Ok(RawResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            },
+        )
+        .await
     }
 
     /// GET with query parameters for a resource whose GET has side
@@ -679,8 +916,8 @@ impl Cirrus {
     /// POST a JSON body.
     ///
     /// Never replayed once the request has reached the server: only 429
-    /// and connect-phase failures retry. [`Self::send_with_replay`] with
-    /// [`Replay::Always`] opts a documented read-only POST back in.
+    /// and connect-phase failures retry. [`Self::send_json_with_replay`]
+    /// with [`Replay::Always`] opts a documented read-only POST back in.
     pub async fn post<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -696,7 +933,8 @@ impl Cirrus {
     /// Salesforce REST proper rarely uses PUT; provided for surfaces that
     /// do (Tooling API, Apex REST, etc.). Replayed after a 5xx or a lost
     /// response like GET; when the endpoint behind the PUT is not
-    /// idempotent, use [`Self::send_with_replay`] with [`Replay::Never`].
+    /// idempotent, use [`Self::send_json_with_replay`] with
+    /// [`Replay::Never`].
     pub async fn put<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -816,8 +1054,10 @@ impl Cirrus {
     ///   stops advancing.
     ///
     /// To add Salesforce request headers and keep all of that, use
-    /// [`Self::send_with_headers`]; for a plain typed call, one of
-    /// the verb methods ([`Self::get`], [`Self::post`], …).
+    /// [`Self::send_with_headers`] or [`Self::send_json_with_headers`];
+    /// for a body or a response that is not JSON, [`Self::send_raw`];
+    /// for a plain typed call, one of the verb methods ([`Self::get`],
+    /// [`Self::post`], …).
     pub async fn request_builder(
         &self,
         method: reqwest::Method,
@@ -855,10 +1095,16 @@ impl Cirrus {
     /// On a 401 carrying `INVALID_SESSION_ID` that hasn't already been
     /// retried this call, invalidate the cached token (compare-and-swap
     /// against `token`) and fetch a fresh one. Returns
-    /// [`AuthRetry::Retry`] when a genuinely different token was obtained
-    /// — the caller should set its own `auth_retried` latch and loop — or
-    /// [`AuthRetry::Done`] otherwise. `auth_retried` short-circuits the
-    /// whole check so the refresh happens at most once.
+    /// [`AuthRetry::Retry`] carrying that token when it is genuinely
+    /// different — the caller should set its own `auth_retried` latch and
+    /// loop, sending the carried token rather than asking the session
+    /// again — or [`AuthRetry::Done`] otherwise. `auth_retried`
+    /// short-circuits the whole check so the refresh happens at most once.
+    ///
+    /// Handing the token back matters for a session that mints on every
+    /// call (caching disabled, or a bespoke implementation): a second
+    /// `access_token()` would spend another grant, fire another rotation
+    /// callback, and send a token other than the one that was checked.
     ///
     /// Every send path reaches this through the shared [`Self::dispatch`]
     /// loop, so the refresh behavior lives in one place. This is the place
@@ -873,7 +1119,7 @@ impl Cirrus {
         is_retryable_401: bool,
         token: &str,
         auth_retried: bool,
-    ) -> CirrusResult<AuthRetry> {
+    ) -> CirrusResult<AuthRetry<'_>> {
         if auth_retried || !is_retryable_401 {
             return Ok(AuthRetry::Done);
         }
@@ -890,7 +1136,7 @@ impl Cirrus {
             );
             return Ok(AuthRetry::Done);
         }
-        Ok(AuthRetry::Retry)
+        Ok(AuthRetry::Retry(fresh))
     }
 
     /// Shared request loop behind every send path.
@@ -902,10 +1148,11 @@ impl Cirrus {
     /// - **Outer loop** — the 401 auth-refresh retry, latched to at most
     ///   two passes via [`Self::auth_retry_decision`].
     ///
-    /// `attempt` resets to zero when the outer loop re-enters with a
-    /// fresh token: transient flakiness and credential staleness are
-    /// independent failure classes, so retries burned on throttling
-    /// before a 401 must not starve the post-refresh request. The reset
+    /// `attempt` resets to zero when the outer loop re-enters with the
+    /// token the refresh obtained: transient flakiness and credential
+    /// staleness are independent failure classes, so retries burned on
+    /// throttling before a 401 must not starve the post-refresh request.
+    /// The reset
     /// also restarts the backoff schedule from `base_delay`. Total work
     /// stays bounded at `2 * (max_retries + 1)` requests because the
     /// outer loop is latched.
@@ -913,9 +1160,15 @@ impl Cirrus {
     /// `make_request` builds a fresh request from the current bearer
     /// token, once per attempt ([`reqwest::RequestBuilder`] is consumed
     /// by `send`); an `Err` from it aborts the whole call without
-    /// retrying. `parse` maps the terminal response into the caller's
-    /// result shape. `Sforce-Limit-Info` capture happens here, on every
-    /// response, so no send path can forget it.
+    /// retrying. `headers` are the caller's request headers, checked
+    /// here before any request and attached to every attempt, so a
+    /// malformed pair is [`CirrusError::InvalidHeader`] rather than the
+    /// builder failure reqwest would defer to `send`. `parse` maps the
+    /// terminal response into the caller's result shape, and receives
+    /// the bearer token the attempt carried so a path that keeps body
+    /// text on success can scrub it as the error path does.
+    /// `Sforce-Limit-Info` capture happens here, on every response, so
+    /// no send path can forget it.
     ///
     /// `replay` replaces the method-derived idempotency assumption where
     /// the HTTP method misstates an endpoint's effect: Apex REST,
@@ -926,21 +1179,32 @@ impl Cirrus {
         method: &reqwest::Method,
         url: &str,
         replay: retry::Replay,
+        headers: &[(&str, &str)],
         make_request: MakeReq,
         parse: Parse,
     ) -> CirrusResult<T>
     where
         MakeReq: Fn(&str) -> CirrusResult<reqwest::RequestBuilder>,
-        Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
+        Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes, &str) -> CirrusResult<T>,
     {
         self.check_transport_security(url)?;
+        let headers = validate_headers(headers)?;
         let mut auth_retried = false;
         let mut attempt: u32 = 0;
+        // The token the 401 refresh obtained, carried into the next pass
+        // so the session is not asked a second time.
+        let mut refreshed: Option<Cow<'_, str>> = None;
         loop {
-            let token = self.auth.access_token().await?;
+            let token = match refreshed.take() {
+                Some(token) => token,
+                None => self.auth.access_token().await?,
+            };
 
             let result: CirrusResult<T> = loop {
-                let request = make_request(&token)?;
+                let mut request = make_request(&token)?;
+                for (name, value) in &headers {
+                    request = request.header(name.clone(), value.clone());
+                }
 
                 // Both a request that never got a response and a
                 // response whose body dies mid-stream are transport
@@ -987,7 +1251,7 @@ impl Cirrus {
                         let retry_after = retry::parse_retry_after(&headers);
                         match collect_body(response, cap).await {
                             Ok(bytes) => {
-                                break parse(status, headers, bytes)
+                                break parse(status, headers, bytes, &token)
                                     .map_err(|e| e.with_retry_after(retry_after));
                             }
                             Err(CollectBodyError::TooLarge { limit }) => {
@@ -997,6 +1261,30 @@ impl Cirrus {
                             // `CollectBodyError` is `non_exhaustive`.
                             Err(other) => CirrusError::InvalidResponse(other.to_string()),
                         }
+                    }
+                    // reqwest keeps a request it could not build and
+                    // reports it here, from `send`. Nothing left the
+                    // machine, so it is the caller's input at fault,
+                    // not the transport: `Http` would invite a caller's
+                    // own retry wrapper to re-run a deterministic
+                    // failure. The send paths check their inputs
+                    // before the loop; this catches what they miss.
+                    Err(mut e) if e.is_builder() => {
+                        // The query string is caller data (SOQL, an
+                        // Apex script), dropped as `From<reqwest::Error>`
+                        // drops it. reqwest's own text stops short of the
+                        // cause, which is the part that says what to fix.
+                        if let Some(url) = e.url_mut() {
+                            url.set_query(None);
+                        }
+                        let message = match std::error::Error::source(&e) {
+                            Some(cause) => format!("{e}: {cause}"),
+                            None => e.to_string(),
+                        };
+                        break Err(CirrusError::InvalidInput {
+                            field: "request",
+                            message,
+                        });
                     }
                     Err(e) => e.into(),
                 };
@@ -1035,7 +1323,8 @@ impl Cirrus {
                 .auth_retry_decision(is_retryable_401, &token, auth_retried)
                 .await?
             {
-                AuthRetry::Retry => {
+                AuthRetry::Retry(fresh) => {
+                    refreshed = Some(fresh);
                     auth_retried = true;
                     attempt = 0;
                     continue;
@@ -1105,24 +1394,45 @@ impl Cirrus {
         B: Serialize + ?Sized,
         P: Fn(u16, &[u8]) -> CirrusResult<R> + Send + Sync,
     {
+        // The query and the body are encoded once, before the loop:
+        // a value that cannot be encoded is the caller's mistake and is
+        // reported as such, and the attempts then share one buffer.
+        let url = match parts.query {
+            Some(query) => Cow::Owned(url_with_query(url, query)?),
+            None => Cow::Borrowed(url),
+        };
+        let body = parts
+            .body
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map(bytes::Bytes::from);
+        // A caller-supplied Content-Type wins over the JSON default,
+        // as it does on `reqwest::RequestBuilder::json`.
+        let content_type_set = parts
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()));
         self.dispatch(
             &method,
-            url,
+            &url,
             replay,
+            parts.headers,
             |token: &str| {
-                let mut request = self.client.request(method.clone(), url).bearer_auth(token);
-                for (name, value) in parts.headers {
-                    request = request.header(*name, *value);
-                }
-                if let Some(q) = parts.query {
-                    request = request.query(q);
-                }
-                if let Some(b) = parts.body {
-                    request = request.json(b);
+                let mut request = self
+                    .client
+                    .request(method.clone(), url.as_ref())
+                    .bearer_auth(token);
+                if let Some(body) = &body {
+                    if !content_type_set {
+                        request = request
+                            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    }
+                    // bytes::Bytes is Arc-backed — clone is cheap.
+                    request = request.body(body.clone());
                 }
                 Ok(request)
             },
-            |status, _headers, bytes| parse(status, &bytes),
+            |status, _headers, bytes, _token| parse(status, &bytes),
         )
         .await
     }
@@ -1153,6 +1463,7 @@ impl Cirrus {
             &method,
             &url,
             replay,
+            &[],
             |token: &str| {
                 // bytes::Bytes is Arc-backed — clone is cheap.
                 Ok(self
@@ -1162,7 +1473,7 @@ impl Cirrus {
                     .header(reqwest::header::CONTENT_TYPE, content_type)
                     .body(body.clone()))
             },
-            |status, _headers, bytes| response::parse_response_bytes(status, &bytes),
+            |status, _headers, bytes, _token| response::parse_response_bytes(status, &bytes),
         )
         .await
     }
@@ -1204,6 +1515,7 @@ impl Cirrus {
             &method,
             &url,
             retry::Replay::ByMethod,
+            &[],
             |token: &str| {
                 // Build a fresh Form per attempt — Form isn't Clone.
                 // The Vec<u8> JSON clone is one alloc (typically <1KB
@@ -1233,7 +1545,7 @@ impl Cirrus {
                     .bearer_auth(token)
                     .multipart(form))
             },
-            |status, _headers, bytes| response::parse_response_bytes(status, &bytes),
+            |status, _headers, bytes, _token| response::parse_response_bytes(status, &bytes),
         )
         .await
     }
@@ -1259,6 +1571,7 @@ impl Cirrus {
             &method,
             &url,
             retry::Replay::ByMethod,
+            &[],
             |token: &str| {
                 let mut request = self
                     .client
@@ -1270,7 +1583,7 @@ impl Cirrus {
                 }
                 Ok(request)
             },
-            |status, headers, bytes| {
+            |status, headers, bytes, _token| {
                 if (200..300).contains(&status) {
                     Ok((headers, bytes))
                 } else {
@@ -1300,6 +1613,7 @@ impl Cirrus {
             &method,
             &url,
             retry::Replay::ByMethod,
+            &[],
             |token: &str| {
                 Ok(self
                     .client
@@ -1307,7 +1621,7 @@ impl Cirrus {
                     .bearer_auth(token)
                     .header(reqwest::header::IF_MODIFIED_SINCE, since))
             },
-            |status, _headers, bytes| {
+            |status, _headers, bytes, _token| {
                 // 304 is "your cache is still good", not a failure —
                 // and it carries no body to deserialize.
                 if status == 304 {
@@ -1330,6 +1644,7 @@ pub struct CirrusBuilder {
     api_version: Option<String>,
     user_agent: Option<String>,
     http_client: Option<reqwest::Client>,
+    proxies: Vec<reqwest::Proxy>,
     retry_policy: Option<RetryPolicy>,
     // Outer `Option` is "did the caller set this"; inner `None` is the
     // caller asking for no deadline at all.
@@ -1370,11 +1685,60 @@ impl CirrusBuilder {
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool across multiple SDK clients or for installing custom
     /// middleware. When provided, the builder's `user_agent`,
-    /// `connect_timeout` and `read_timeout` settings are ignored — the
-    /// supplied client owns its own headers, timeouts, redirect policy and
-    /// content-encoding support.
+    /// `connect_timeout`, `read_timeout` and [`proxy`](Self::proxy)
+    /// settings are ignored — the supplied client owns its own headers,
+    /// timeouts, redirect policy, content-encoding support and proxy
+    /// configuration.
+    ///
+    /// The loopback exemption to the https rule stays in force for a
+    /// supplied client, so one that routes through a proxy (reqwest's
+    /// default reads `HTTP_PROXY` and the system proxy) carries the
+    /// session token to that proxy in the clear for a plaintext loopback
+    /// target. Build such a client with `no_proxy()`, or exempt the
+    /// loopback hosts in its proxy's `NoProxy` rules.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
+        self
+    }
+
+    /// Routes every request the client this builder creates through
+    /// `proxy`. May be called more than once; the first proxy that
+    /// matches a request's URL is used, as on `reqwest::ClientBuilder`.
+    ///
+    /// Without this, the client uses no proxy at all: it ignores
+    /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the operating
+    /// system's proxy settings, which a stock `reqwest::Client` obeys.
+    /// A plaintext request to a loopback host is exempt from the https
+    /// rule because the hop never leaves the machine, and an ambient
+    /// proxy would silently break that: the request, session token
+    /// included, would be forwarded to the proxy in the clear.
+    ///
+    /// With a proxy configured here, the exemption is withdrawn: a
+    /// plaintext loopback target is refused like any other `http://`
+    /// target unless [`allow_insecure_transport`](Self::allow_insecure_transport)
+    /// is set, since the proxy may well intercept it. `https` targets
+    /// are tunneled through the proxy with `CONNECT`, so the token
+    /// stays inside TLS.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// let sf = Cirrus::builder()
+    ///     .auth(auth)
+    ///     .proxy(cirrus::reqwest::Proxy::all("http://proxy.corp.example:3128")?)
+    ///     .build()?;
+    /// # let _ = sf;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn proxy(mut self, proxy: reqwest::Proxy) -> Self {
+        self.proxies.push(proxy);
         self
     }
 
@@ -1443,7 +1807,8 @@ impl CirrusBuilder {
     }
 
     /// Allows requests to carry the Salesforce session token over
-    /// plaintext `http://` to a non-loopback host.
+    /// plaintext `http://` to a non-loopback host, or to a loopback
+    /// host through a [`proxy`](Self::proxy).
     ///
     /// Off by default: the token is the org session id, and RFC 6750
     /// §5.3 requires TLS for any request that bears one. Turn this on
@@ -1467,10 +1832,15 @@ impl CirrusBuilder {
             .api_version
             .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
         validate_api_version(&api_version)?;
+        // A supplied client's proxy configuration is its owner's
+        // business; only a proxy this builder installs is known to be
+        // on the path.
+        let proxied = self.http_client.is_none() && !self.proxies.is_empty();
         check_transport_security(
             "instance URL",
             auth.instance_url(),
             self.allow_insecure_transport,
+            proxied,
         )?;
 
         let client = if let Some(c) = self.http_client {
@@ -1491,7 +1861,15 @@ impl CirrusBuilder {
                 // token included — to whatever host the Location header
                 // names, so a redirect is surfaced as an error for the
                 // caller to inspect.
-                .redirect(reqwest::redirect::Policy::none());
+                .redirect(reqwest::redirect::Policy::none())
+                // reqwest obeys HTTP_PROXY and the system proxy by
+                // default, and a proxy on the path is what the loopback
+                // exemption to the https rule assumes there is not. Only
+                // a proxy named on the builder is used.
+                .no_proxy();
+            for proxy in self.proxies {
+                builder = builder.proxy(proxy);
+            }
             if let Some(t) = self
                 .connect_timeout
                 .unwrap_or(Some(DEFAULT_CONNECT_TIMEOUT))
@@ -1510,6 +1888,7 @@ impl CirrusBuilder {
             api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
             allow_insecure_transport: self.allow_insecure_transport,
+            proxied,
             max_response_size: self
                 .max_response_size
                 .unwrap_or(Some(DEFAULT_MAX_RESPONSE_SIZE)),
@@ -1562,28 +1941,84 @@ impl CirrusBuilder {
 /// RFC 6750 §5.3 makes TLS mandatory for requests bearing an OAuth
 /// bearer token, and the value here is the org session id: anything
 /// on the path can replay it for the session's lifetime. Loopback
-/// hosts are exempt (local mock servers and sidecar proxies never
-/// leave the machine), and `allow_insecure` reflects the caller's
-/// deliberate opt-out.
+/// hosts are exempt when the client uses no proxy, because a local
+/// mock server or sidecar is then the only thing on the path; with a
+/// proxy configured (`proxied`), that path runs through the proxy and
+/// the exemption is withdrawn. `allow_insecure` reflects the caller's
+/// deliberate opt-out of both.
 fn check_transport_security(
     field: &'static str,
     url: &str,
     allow_insecure: bool,
+    proxied: bool,
 ) -> CirrusResult<()> {
     if allow_insecure {
         return Ok(());
     }
-    let parsed = url::Url::parse(url)?;
-    if cirrus_auth::transport::is_secure_transport(&parsed) {
+    let mut parsed = url::Url::parse(url)?;
+    if cirrus_auth::transport::is_secure_transport_for(&parsed, proxied) {
         return Ok(());
     }
+    let why = if cirrus_auth::transport::is_loopback_host(&parsed) {
+        "a loopback target is reached through the configured proxy, so the Salesforce session \
+         token would travel to the proxy in the clear"
+    } else {
+        "the Salesforce session token must not travel in the clear"
+    };
+    // The query string is caller data (a SOQL statement, an Apex
+    // script); the message names the target without it, as the
+    // transport errors do.
+    parsed.set_query(None);
     Err(CirrusError::InvalidInput {
         field,
         message: format!(
-            "`{url}` is not an https target, and the Salesforce session token must not travel in the clear; \
+            "`{parsed}` is not an https target, and {why}; \
              opt out with CirrusBuilder::allow_insecure_transport if the plaintext hop is deliberate",
         ),
     })
+}
+
+/// Checks caller-supplied request headers before any request is built.
+///
+/// reqwest accepts an invalid name or value on the builder and fails
+/// the request at `send`, as a builder error; checking here reports the
+/// pair as [`CirrusError::InvalidHeader`] without a request, and lets
+/// every attempt reuse the parsed pairs. The message names the header,
+/// never its value, which can be a credential or record data.
+fn validate_headers(headers: &[(&str, &str)]) -> CirrusResult<Vec<(HeaderName, HeaderValue)>> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let parsed_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| CirrusError::InvalidHeader(format!("header name {name:?}: {e}")))?;
+            let parsed_value = HeaderValue::from_str(value).map_err(|e| {
+                CirrusError::InvalidHeader(format!("value of header {name:?}: {e}"))
+            })?;
+            Ok((parsed_name, parsed_value))
+        })
+        .collect()
+}
+
+/// Appends `query` to `url` as form-encoded pairs, the way
+/// `reqwest::RequestBuilder::query` does, so that a value the encoder
+/// rejects (a nested structure, say) is reported before any request as
+/// [`CirrusError::InvalidInput`] rather than deferred to `send`.
+fn url_with_query<Q: Serialize + ?Sized>(url: &str, query: &Q) -> CirrusResult<String> {
+    let mut url = url::Url::parse(url)?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        let serializer = serde_urlencoded::Serializer::new(&mut pairs);
+        query
+            .serialize(serializer)
+            .map_err(|e| CirrusError::InvalidInput {
+                field: "query",
+                message: format!("cannot be form-encoded: {e}"),
+            })?;
+    }
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
+    Ok(url.into())
 }
 
 /// Accepts the two forms Salesforce documents for the version segment
@@ -1728,6 +2163,179 @@ mod tests {
             sf.resolve_url("limits"),
             "http://my-org.my.salesforce.com/services/data/v66.0/limits"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_plaintext_target_does_not_echo_the_query_string() {
+        // The query carries caller data (a SOQL statement, an Apex
+        // script), which the transport errors strip from the URL they
+        // print; the refusal must not print it either.
+        let sf = fixture("https://my-org.my.salesforce.com");
+        let err = sf
+            .get_with_query::<serde_json::Value, _>(
+                "http://elsewhere.example.com/query",
+                &[("q", "SELECT Secret__c FROM Account")],
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("elsewhere.example.com"), "{text}");
+        assert!(!text.contains("Secret__c"), "{text}");
+
+        let err = sf
+            .send_raw(
+                reqwest::Method::GET,
+                "http://elsewhere.example.com/query",
+                Some(&[("q", "SELECT Secret__c FROM Account")]),
+                &[],
+                None,
+                Replay::ByMethod,
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("Secret__c"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_default_client_ignores_an_ambient_proxy() {
+        // The loopback exemption assumes the hop stays on the machine.
+        // A stock reqwest client obeys HTTP_PROXY and would carry the
+        // request, token included, to the proxy; the client the builder
+        // creates must not.
+        //
+        // The variable is process-wide. nextest gives every test its
+        // own process, which is what makes setting it safe; under a
+        // threaded runner it would leak into every other test in the
+        // binary, so the test is a no-op there.
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // A port nothing listens on.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before the mock server or
+        // any other thread of that process exists, so nothing reads the
+        // environment while it is modified.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/limits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        // The variable is in effect: a stock client goes to the proxy.
+        let stock = reqwest::Client::new();
+        let err = stock
+            .get(format!("{}/services/data/v66.0/limits", server.uri()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect(), "{err:?}");
+
+        let sf = fixture(&server.uri());
+        let limits: serde_json::Value = sf.get("limits").await.unwrap();
+        assert!(limits.is_object());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_configured_proxy_receives_the_request() {
+        // An HTTP proxy receives the request in absolute form; the mock
+        // server plays the proxy. The instance host does not resolve,
+        // which the proxy makes irrelevant.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/limits"))
+            .and(wiremock::matchers::header("host", "sf.invalid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&proxy)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", "http://sf.invalid"));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .proxy(reqwest::Proxy::http(proxy.uri()).unwrap())
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+        let limits: serde_json::Value = sf.get("limits").await.unwrap();
+        assert!(limits.is_object());
+    }
+
+    #[tokio::test]
+    async fn a_configured_proxy_withdraws_the_loopback_exemption() {
+        let proxy = reqwest::Proxy::all("http://proxy.corp.example:3128").unwrap();
+        let loopback = Arc::new(StaticTokenAuth::new("tok", "http://localhost:8080"));
+
+        // The instance URL, at build.
+        let err = Cirrus::builder()
+            .auth(loopback.clone())
+            .proxy(proxy.clone())
+            .build()
+            .unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, message } => {
+                assert_eq!(field, "instance URL");
+                assert!(message.contains("proxy"), "{message}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // A request URL, on a client whose instance is https.
+        let org = Arc::new(StaticTokenAuth::new(
+            "tok",
+            "https://my-org.my.salesforce.com",
+        ));
+        let sf = Cirrus::builder()
+            .auth(org)
+            .proxy(proxy.clone())
+            .build()
+            .unwrap();
+        let err = sf
+            .get::<serde_json::Value>("http://127.0.0.1:8080/collect")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CirrusError::InvalidInput {
+                    field: "request URL",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // The opt-out covers it, as it covers any plaintext hop.
+        Cirrus::builder()
+            .auth(loopback.clone())
+            .proxy(proxy)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+
+        // A supplied client's proxy settings are its owner's business:
+        // the exemption stays.
+        Cirrus::builder()
+            .auth(loopback)
+            .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .build()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1988,12 +2596,12 @@ mod tests {
 
             let sf = server_fixture(server.uri());
             let created: Value = sf
-                .send_with_headers(
+                .send_json_with_headers(
                     reqwest::Method::POST,
                     "sobjects/Lead",
                     None,
                     &[("Sforce-Auto-Assign", "FALSE")],
-                    Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+                    &json!({"LastName": "Chen", "Company": "Initech"}),
                 )
                 .await
                 .unwrap();
@@ -2034,18 +2642,165 @@ mod tests {
                 })
                 .build()
                 .unwrap();
+            // No turbofish: a bodiless call has nothing to infer.
             let result: Value = sf
-                .send_with_headers::<_, ()>(
+                .send_with_headers(
                     reqwest::Method::GET,
                     "query",
                     Some(&[("q", "SELECT Id FROM Account")]),
                     &[("Sforce-Query-Options", "batchSize=200")],
-                    None,
                 )
                 .await
                 .unwrap();
             assert_eq!(result["done"], true);
             assert_eq!(sf.last_limit_info().unwrap().used, 7);
+        }
+
+        #[tokio::test]
+        async fn send_with_headers_refuses_a_malformed_header_without_a_request() {
+            // reqwest defers a header it cannot build until `send`, where
+            // it would surface as a transport failure; the client checks
+            // the pair first so a caller can tell a local mistake from
+            // a network one. The name and the value are each refused.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            for (name, value) in [
+                ("Sforce-Call-Options", "client=a\nb"),
+                ("Sforce Call Options", "client=a"),
+            ] {
+                let err = sf
+                    .send_with_headers::<Value>(
+                        reqwest::Method::GET,
+                        "limits",
+                        None,
+                        &[(name, value)],
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, CirrusError::InvalidHeader(_)),
+                    "{name:?}: {value:?}: {err:?}"
+                );
+            }
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn post_reports_an_unserializable_body_as_serialization() {
+            // serde_json refuses a map whose keys are not strings.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            let body: std::collections::HashMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+            let err = sf
+                .post::<Value, _>("sobjects/Account", &body)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CirrusError::Serialization(_)), "{err:?}");
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn get_with_query_reports_an_unencodable_query_as_invalid_input() {
+            // A nested value has no form encoding.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            let err = sf
+                .get_with_query::<Value, _>("query", &json!({"q": {"nested": 1}}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidInput { field: "query", .. }),
+                "{err:?}"
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn send_raw_carries_the_query_and_replays_by_method() {
+            // The raw send is the same loop as the typed verbs: the
+            // query is encoded, the 503 is retried under Replay::ByMethod,
+            // and the terminal response comes back whole. The path and
+            // the query are arbitrary; the test is about the loop, not
+            // a documented resource.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/EventLogFile/0AT/LogFile",
+                ))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/EventLogFile/0AT/LogFile",
+                ))
+                .and(wiremock::matchers::query_param("x", "1"))
+                .and(header("accept", "text/csv"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Sforce-Limit-Info", "api-usage=9/15000")
+                        .set_body_string("a,b\n"),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy {
+                    base_delay: std::time::Duration::ZERO,
+                    max_delay: std::time::Duration::ZERO,
+                    jitter: false,
+                    ..RetryPolicy::default()
+                })
+                .build()
+                .unwrap();
+            let response = sf
+                .send_raw(
+                    reqwest::Method::GET,
+                    "sobjects/EventLogFile/0AT/LogFile",
+                    Some(&[("x", "1")]),
+                    &[("Accept", "text/csv")],
+                    None,
+                    Replay::ByMethod,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body.as_ref(), b"a,b\n");
+            assert_eq!(sf.last_limit_info().unwrap().used, 9);
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_request_the_client_cannot_build_is_not_a_transport_failure() {
+            // The internal paths set headers of their own inside the
+            // loop; one reqwest refuses must not come back as `Http`,
+            // which a caller's own retry wrapper may treat as transient.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            let err = sf
+                .send_with_body::<Value>(
+                    reqwest::Method::POST,
+                    "jobs/ingest/750R/batches",
+                    Bytes::new(),
+                    "text/csv\r\n",
+                    Replay::Never,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CirrusError::InvalidInput {
+                        field: "request",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
         }
 
         #[tokio::test]
@@ -2709,12 +3464,11 @@ mod tests {
 
             let sf = fixture_with_policy(server.uri(), fast_retry_policy());
             let err = sf
-                .send_with_replay::<serde_json::Value, ()>(
+                .send_with_replay::<serde_json::Value>(
                     reqwest::Method::GET,
                     "limits",
                     None,
                     &[],
-                    None,
                     Replay::Never,
                 )
                 .await
@@ -2745,12 +3499,12 @@ mod tests {
 
             let sf = fixture_with_policy(server.uri(), fast_retry_policy());
             let v: serde_json::Value = sf
-                .send_with_replay(
+                .send_json_with_replay(
                     reqwest::Method::POST,
                     "composite/sobjects/Account",
                     None,
                     &[],
-                    Some(&serde_json::json!({"ids": ["001xx"], "fields": ["Id"]})),
+                    &serde_json::json!({"ids": ["001xx"], "fields": ["Id"]}),
                     Replay::Always,
                 )
                 .await
@@ -3140,6 +3894,44 @@ mod tests {
             }
         }
 
+        /// Test-only AuthSession with no cache: every `access_token()`
+        /// call mints a new token, as a session whose cache is disabled
+        /// or a bespoke implementation does. Counts the mints and records
+        /// every `invalidate()` call.
+        struct MintingAuth {
+            instance_url: String,
+            mints: AtomicUsize,
+            invalidations: Mutex<Vec<String>>,
+        }
+
+        impl MintingAuth {
+            fn new(instance_url: impl Into<String>) -> Self {
+                Self {
+                    instance_url: instance_url.into(),
+                    mints: AtomicUsize::new(0),
+                    invalidations: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl AuthSession for MintingAuth {
+            async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
+                let n = self.mints.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(Cow::Owned(format!("t{n}")))
+            }
+
+            fn instance_url(&self) -> &str {
+                &self.instance_url
+            }
+
+            async fn invalidate(&self, stale_token: &str) {
+                if let Ok(mut g) = self.invalidations.lock() {
+                    g.push(stale_token.to_string());
+                }
+            }
+        }
+
         fn fixture(_uri: String, auth: SharedAuth) -> Cirrus {
             // _uri unused here — the AuthSession's instance_url drives
             // URL resolution. Keep the param for symmetry with other
@@ -3185,6 +3977,45 @@ mod tests {
             let inv = auth.invalidations.lock().unwrap();
             assert_eq!(inv.len(), 1);
             assert_eq!(inv[0], "old");
+        }
+
+        #[tokio::test]
+        async fn retries_with_the_token_the_refresh_obtained() {
+            // The refresh after a 401 fetches a token to compare against
+            // the stale one; that token is the one the retry must carry.
+            // A session that mints on every call makes a second fetch
+            // visible as a request bearing a third token, which no mock
+            // answers, and as a third mint.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .and(header("authorization", "Bearer t1"))
+                .respond_with(ResponseTemplate::new(401).set_body_json(json!([{
+                    "errorCode": "INVALID_SESSION_ID",
+                    "message": "Session expired or invalid"
+                }])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .and(header("authorization", "Bearer t2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(MintingAuth::new(server.uri()));
+            let sf = fixture(server.uri(), auth.clone());
+
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+            assert_eq!(
+                auth.mints.load(Ordering::SeqCst),
+                2,
+                "one mint for the first attempt and one for the refresh"
+            );
+            assert_eq!(*auth.invalidations.lock().unwrap(), vec!["t1".to_string()]);
         }
 
         #[tokio::test]

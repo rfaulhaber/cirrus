@@ -168,7 +168,7 @@ pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A `reqwest::ClientBuilder` carrying the settings the flow builders
 /// apply to the token-endpoint client they create: the two default
-/// timeouts and a redirect policy that follows nothing.
+/// timeouts, a redirect policy that follows nothing, and no proxy.
 ///
 /// Redirects are not followed because every grant in this crate carries
 /// its credential in the form body (`client_secret`, `refresh_token`, the
@@ -177,10 +177,23 @@ pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// redirect from the token endpoint would re-POST live credentials to
 /// whatever host the `Location` header names.
 ///
+/// No proxy is used, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the
+/// operating system's proxy settings are ignored, where a stock
+/// `reqwest::Client` obeys them. The login-URL rule exempts loopback
+/// hosts from https on the grounds that the hop stays on the machine,
+/// and an ambient proxy would carry the form body, credentials included,
+/// off it in the clear. Call `.proxy(..)` on the returned builder for a
+/// deployment that needs one; an `https` login URL is then tunneled
+/// through it, while a plaintext loopback login URL stays accepted and
+/// reaches that proxy in the clear, since the login-URL rule knows
+/// nothing of the client: keep such a proxy's `NoProxy` rules covering
+/// loopback, or use `https`.
+///
 /// Start from this builder when the token client needs a setting the
 /// flow builders do not expose, such as a private root CA, a proxy or a
 /// connection pool shared with other clients, so that adding it does not
-/// silently drop the no-redirect rule or the timeouts:
+/// silently drop the no-redirect rule, the no-proxy default or the
+/// timeouts:
 ///
 /// ```no_run
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -206,13 +219,15 @@ pub fn token_client_builder() -> reqwest::ClientBuilder {
     )
 }
 
-/// The no-redirect policy plus whichever timeouts are given; `None`
-/// leaves that bound off.
+/// The no-redirect policy, no proxy, plus whichever timeouts are given;
+/// `None` leaves that bound off.
 fn hardened_client_builder(
     connect_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
 ) -> reqwest::ClientBuilder {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
     if let Some(timeout) = connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
@@ -275,7 +290,10 @@ pub(super) fn normalize_url(url: &str) -> String {
 /// the credential in the request body, so a plain-HTTP host leaks it to
 /// anyone on-path before any redirect to HTTPS could take effect. Loopback
 /// hosts (`localhost`, `127.0.0.0/8`, `::1`) are exempt so local mock
-/// servers and test harnesses can run without TLS.
+/// servers and test harnesses can run without TLS; the client the flow
+/// builders create uses no proxy, so that hop does stay on the machine.
+/// A caller-supplied client that routes through a proxy carries the form
+/// body to the proxy, and is its owner's responsibility.
 ///
 /// Expects an already-[`normalize_url`]d value.
 pub(super) fn require_secure_login_url(url: &str) -> AuthResult<()> {
@@ -1278,5 +1296,46 @@ mod tests {
             .unwrap();
         assert_eq!(response.status().as_u16(), 307);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_client_builder_ignores_an_ambient_proxy() {
+        // The variable is process-wide; nextest runs each test in its
+        // own process, which is what makes setting it safe. Under a
+        // threaded runner the test is a no-op.
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        // A port nothing listens on.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before the mock server or
+        // any other thread of that process exists, so nothing reads the
+        // environment while it is modified.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let url = format!("{}/services/oauth2/token", server.uri());
+
+        let err = reqwest::Client::new().post(&url).send().await.unwrap_err();
+        assert!(err.is_connect(), "stock client ignored HTTP_PROXY: {err:?}");
+
+        let http = token_client_builder().build().unwrap();
+        let response = http.post(&url).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
     }
 }

@@ -81,7 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Tooling API** — `tooling().{describe_global, sobject(name).*, query, search,
   execute_anonymous}`.
 - **Apex REST** — thin passthrough for custom `/services/apexrest/...`
-  endpoints.
+  endpoints. `send_raw`
+  keeps a non-JSON body or response, and an error body the class wrote, whole.
 - **Event Monitoring** — `event_monitoring().{download, download_url}` for
   binary `EventLogFile` CSV downloads.
 - **Versions, limits, describe** — `sf.versions()`, `sf.limits()`,
@@ -150,7 +151,8 @@ boundary between auth and REST without extra plumbing.
   carries a token or a body.
 - **Transport defaults** — the HTTP client the builder creates advertises
   gzip and decompresses responses, applies a 10 s connect timeout and a 120 s
-  read timeout, and doesn't follow redirects — a 3xx surfaces as
+  read timeout, uses no proxy (`HTTP_PROXY` and the system proxy are ignored;
+  `CirrusBuilder::proxy` names one), and doesn't follow redirects — a 3xx surfaces as
   `CirrusError::Api` (a 300 whose body is a JSON array of records, as an
   upsert by a non-unique external ID answers, is `CirrusError::MultipleMatches`)
   rather than re-sending the token to the `Location` host.
@@ -185,12 +187,15 @@ sf.get::<MyShape>("https://...").await?;                   // fully-qualified
 
 Three-mode path resolution: relative → `/services/data/{version}/...`,
 leading-`/` → instance-rooted, `http(s)://` → passthrough.
-Whichever mode applies, the resolved target must be `https` (loopback hosts
-excepted) because the request carries the org session token — a plaintext
-target is rejected with `CirrusError::InvalidInput` and no request is sent,
-and `Cirrus::builder().build()` fails outright on an `http://` instance URL.
-`CirrusBuilder::allow_insecure_transport(true)` is the opt-out for a
-deliberate plaintext hop, such as a recording proxy on a trusted network.
+Whichever mode applies, the resolved target must be `https` because the
+request carries the org session token — a plaintext target is rejected with
+`CirrusError::InvalidInput` and no request is sent, and
+`Cirrus::builder().build()` fails outright on an `http://` instance URL. A
+loopback host is excepted while the client uses no proxy, since that hop
+stays on the machine; with `CirrusBuilder::proxy` set it is refused like any
+other plaintext target. `CirrusBuilder::allow_insecure_transport(true)` is
+the opt-out for a deliberate plaintext hop, such as a recording proxy on a
+trusted network.
 
 The path is sent as written — nothing is percent-encoded — so a value
 interpolated into it has to be encoded first: a raw `#` starts a fragment
@@ -200,25 +205,35 @@ builds a versioned URL from separate segments, encoding each one and refusing
 an empty segment or a `.`/`..`; `cirrus::encode_path_segment(value)` encodes
 one segment for an instance-rooted or Apex REST path.
 
-Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
-`Sforce-Query-Options`, …) go through `send_with_headers`, which keeps retry,
-the 401 auto-refresh and the `Sforce-Limit-Info` capture:
+The typed paths carry the common Salesforce request headers themselves:
+`QueryOptions::new().batch_size(n)` sends `Sforce-Query-Options` on
+`query_with_options`, `query_all_with_options`, `query_more_with_options` and
+the matching `_stream_with_options` streams (on every page), and
+`sobject(..).create_with_headers` / `update_with_headers` take the Assignment
+Rule, Duplicate Rule, MRU and Call Options headers as `("name", "value")`
+pairs. Any other header goes through `send_with_headers` for a bodiless
+request and `send_json_with_headers` for one with a JSON body; both keep
+retry, the 401 auto-refresh and the `Sforce-Limit-Info` capture, and refuse
+a header that is not valid HTTP with `CirrusError::InvalidHeader` before any
+request:
 
 ```rust,ignore
 let created: Value = sf
-    .send_with_headers(
+    .send_json_with_headers(
         Method::POST,
         "sobjects/Lead",
         None,
         &[("Sforce-Auto-Assign", "FALSE")],
-        Some(&lead),
+        &lead,
     )
     .await?;
 ```
 
 Binary downloads stay inside the request loop: `retrieve_blob` on a
 `sf.sobject(..)` handler fetches a blob field, and `sf.event_monitoring().download`
-an Event Monitoring log file. For the remaining unusual cases (SSE),
+an Event Monitoring log file; `send_raw`, on `Cirrus` and on `sf.apex()`, sends
+an optional raw body and returns the status, headers and bytes of any
+response. For the remaining unusual cases (SSE),
 `request_builder` and `execute` give you a pre-authenticated
 `reqwest::RequestBuilder` and a full bypass respectively. Both step outside the
 request loop, so retry, the 401 auto-refresh and the limit-info capture don't
@@ -246,7 +261,7 @@ cargo run --example simple_query
 ## Testing
 
 ```bash
-cargo nextest run             # default unit + property + wiremock tests (no network)
+cargo nextest run             # default unit + property + wiremock tests (no network; HTTP_PROXY is ignored)
 cargo clippy --all-targets    # strict lints; deny set listed in Cargo.toml
 cargo fmt                     # rustfmt
 ```
