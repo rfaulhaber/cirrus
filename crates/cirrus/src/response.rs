@@ -21,6 +21,7 @@
 //! [Status Codes and Error Responses]: https://developer.salesforce.com/docs/platform/api-rest/guide/errorcodes.html
 
 use crate::error::{CirrusError, CirrusResult, SalesforceError};
+use bytes::Bytes;
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde::Serialize;
@@ -1527,6 +1528,91 @@ fn capped_body(bytes: &[u8], cap: usize) -> String {
         body.push_str("… <truncated>");
     }
     body
+}
+
+/// A request body sent as given: the bytes and their `Content-Type`.
+///
+/// What [`Cirrus::send_raw`](crate::Cirrus::send_raw) and
+/// [`ApexHandler::send_raw`](crate::handlers::apex::ApexHandler::send_raw)
+/// take for a body that is not JSON, or that is already serialized.
+#[derive(Clone)]
+pub struct RawBody {
+    bytes: Bytes,
+    content_type: String,
+}
+
+impl RawBody {
+    /// A body of `bytes` sent with `content_type` as the request's
+    /// `Content-Type`. `bytes` is anything that converts into
+    /// [`Bytes`]: a `Vec<u8>`, a `String`, a `&'static str` or `&'static
+    /// [u8]`, or a [`Bytes`] shared with the caller.
+    pub fn new(bytes: impl Into<Bytes>, content_type: impl Into<String>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            content_type: content_type.into(),
+        }
+    }
+
+    /// The bytes the request sends.
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// The `Content-Type` the request sends.
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+}
+
+impl std::fmt::Debug for RawBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The bytes are the caller's data, and can be large.
+        f.debug_struct("RawBody")
+            .field("content_type", &self.content_type)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// A response as it arrived: the status, the headers and the body
+/// bytes, with nothing parsed.
+///
+/// What [`Cirrus::send_raw`](crate::Cirrus::send_raw) and
+/// [`ApexHandler::send_raw`](crate::handlers::apex::ApexHandler::send_raw)
+/// return, for every status the request loop lets through, so a
+/// non-2xx answer is read from [`status`](Self::status) rather than
+/// matched as an error. The struct is `#[non_exhaustive]`: read its
+/// fields, and destructure it with `..`.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct RawResponse {
+    /// The HTTP status code.
+    pub status: u16,
+    /// The response headers, as received.
+    pub headers: HeaderMap,
+    /// The body, as received: not redacted, not capped below the
+    /// client's response size limits, and decoded only of its transfer
+    /// encoding.
+    pub body: Bytes,
+}
+
+impl RawResponse {
+    /// Whether the status is 2xx.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+impl std::fmt::Debug for RawResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The body is record data, or an error page that may echo the
+        // request; its size is what a log line needs.
+        f.debug_struct("RawResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]

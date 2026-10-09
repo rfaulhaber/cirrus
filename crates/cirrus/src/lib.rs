@@ -96,7 +96,8 @@ pub use response::{
     BulkQueryJob, BulkQueryResults, BulkResultPage, BulkResultPages, CompositeError,
     CompositeResponse, CompositeSubresponse, CompositeTreeResponse, CompositeTreeResult,
     DescribeGlobal, EventLogFileRecord, ExecuteAnonymousResult, Limit, OrgLimits, QueryResult,
-    SObjectCollectionResult, SObjectCreateResult, SObjectMetadata, SearchResult,
+    RawBody, RawResponse, SObjectCollectionResult, SObjectCreateResult, SObjectMetadata,
+    SearchResult,
 };
 pub use retry::{Replay, RetryPolicy};
 
@@ -754,6 +755,113 @@ impl Cirrus {
         let url = self.resolve_url(path);
         self.send_resolved(method, &url, query, headers, Some(body), replay)
             .await
+    }
+
+    /// Sends a request with an optional raw body and returns the
+    /// response as it arrived: status, headers and body bytes.
+    ///
+    /// The same request loop as the typed verbs — the [`RetryPolicy`],
+    /// the 401 auto-refresh and the `Sforce-Limit-Info` capture — for
+    /// a body that is not JSON (a CSV upload, say) or a response that
+    /// is not (a file, text, a body an Apex REST class wrote). Nothing
+    /// is parsed: every status the loop lets through, a 4xx or 5xx
+    /// included, comes back as `Ok` with that status on
+    /// [`RawResponse::status`], and the body is as sent, not redacted
+    /// and not cut to the 2 KiB that [`CirrusError::Api`] keeps. The
+    /// one status the loop keeps for itself is a 401 carrying
+    /// `INVALID_SESSION_ID`, which is refreshed and retried like any
+    /// other call and, when the retry gets the same answer, is
+    /// `Err(CirrusError::Api)`. The response size limits still apply.
+    ///
+    /// `body` is sent with its own `Content-Type`, which replaces any
+    /// in `headers`. `query`, `headers` and path resolution are as on
+    /// [`Self::send_with_headers`]; `replay` is as on
+    /// [`Self::send_with_replay`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, Replay, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // A resource with no typed handler whose body is text.
+    /// let response = sf
+    ///     .send_raw(
+    ///         cirrus::reqwest::Method::GET,
+    ///         "sobjects/ContentVersion/068xx000000Abcd/VersionData",
+    ///         None,
+    ///         &[("Accept", "text/plain")],
+    ///         None,
+    ///         Replay::ByMethod,
+    ///     )
+    ///     .await?;
+    /// if response.is_success() {
+    ///     let text = String::from_utf8_lossy(&response.body);
+    ///     # let _ = text;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: Option<RawBody>,
+        replay: Replay,
+    ) -> CirrusResult<RawResponse> {
+        let url = self.resolve_url(path);
+        let url = match query {
+            Some(query) => url_with_query(&url, query)?,
+            None => url,
+        };
+        // The body's content type is part of the body; a Content-Type
+        // among the caller's headers would otherwise go out twice.
+        let mut headers: Vec<(&str, &str)> = headers
+            .iter()
+            .copied()
+            .filter(|(name, _)| body.is_none() || !name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()))
+            .collect();
+        if let Some(body) = &body {
+            headers.push((CONTENT_TYPE.as_str(), body.content_type()));
+        }
+        self.dispatch(
+            &method,
+            &url,
+            replay,
+            &headers,
+            |token: &str| {
+                let mut request = self
+                    .client
+                    .request(method.clone(), url.as_str())
+                    .bearer_auth(token);
+                if let Some(body) = &body {
+                    // bytes::Bytes is Arc-backed — clone is cheap.
+                    request = request.body(body.bytes().clone());
+                }
+                Ok(request)
+            },
+            |status, headers, bytes| {
+                // Only Salesforce's own expired-session answer is an
+                // error here: the loop needs it as one to refresh.
+                // Every other status is the endpoint's answer.
+                if !(200..300).contains(&status) {
+                    let err = response::parse_error_response(status, &bytes);
+                    if err.is_invalid_session() {
+                        return Err(err);
+                    }
+                }
+                Ok(RawResponse {
+                    status,
+                    headers,
+                    body: bytes,
+                })
+            },
+        )
+        .await
     }
     /// GET with query parameters for a resource whose GET has side
     /// effects, so a lost response must never be replayed. Same wire
@@ -2323,6 +2431,62 @@ mod tests {
                 "{err:?}"
             );
             assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn send_raw_carries_the_query_and_replays_by_method() {
+            // The raw send is the same loop as the typed verbs: the
+            // query is encoded, the 503 is retried under Replay::ByMethod,
+            // and the terminal response comes back whole.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/EventLogFile/0AT/LogFile",
+                ))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/EventLogFile/0AT/LogFile",
+                ))
+                .and(wiremock::matchers::query_param("x", "1"))
+                .and(header("accept", "text/csv"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Sforce-Limit-Info", "api-usage=9/15000")
+                        .set_body_string("a,b\n"),
+                )
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy {
+                    base_delay: std::time::Duration::ZERO,
+                    max_delay: std::time::Duration::ZERO,
+                    jitter: false,
+                    ..RetryPolicy::default()
+                })
+                .build()
+                .unwrap();
+            let response = sf
+                .send_raw(
+                    reqwest::Method::GET,
+                    "sobjects/EventLogFile/0AT/LogFile",
+                    Some(&[("x", "1")]),
+                    &[("Accept", "text/csv")],
+                    None,
+                    Replay::ByMethod,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body.as_ref(), b"a,b\n");
+            assert_eq!(sf.last_limit_info().unwrap().used, 9);
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
         }
 
         #[tokio::test]

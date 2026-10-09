@@ -2,10 +2,39 @@
 //!
 //! Apex REST lets Salesforce admins/developers expose custom Apex classes as
 //! REST endpoints by annotating them with `@RestResource(urlMapping='...')`.
-//! The wire shape (request body, response body) is entirely defined by the
-//! developer who wrote the Apex class — Salesforce only provides the
-//! transport, auth, and (on non-2xx) the standard `[{message, errorCode}]`
-//! error array.
+//! The wire shape is the Apex class's, for failures as much as for
+//! successes: per the [`RestResponse`] class, the method sets the status
+//! code (`statusCode`, with 400, 401, 409, 412 and 500 among the valid
+//! values), the body (`responseBody`, a Blob, or the serialized return
+//! value) and the response headers (`addHeader`). Salesforce itself
+//! answers only when the class does not run or does not finish: an
+//! expired session, or an unhandled exception, which is a 500.
+//!
+//! # Response bodies
+//!
+//! The verbs here parse a 2xx body as JSON into the type you ask for.
+//! A method that returns a value is serialized as JSON, so that is the
+//! common case. A method that returns void and sets `responseBody` to
+//! a CSV, a PDF or plain text is not JSON: send it through
+//! [`ApexHandler::send_raw`], which returns the status, the headers and
+//! the body bytes as they arrived. To discard a JSON body whatever it
+//! holds, deserialize into [`serde::de::IgnoredAny`]; `()` accepts only
+//! an empty body, and fails with [`CirrusError::InvalidResponse`] on a
+//! method that returns something.
+//!
+//! # Errors
+//!
+//! A non-2xx body the class wrote is rarely the standard
+//! `[{message, errorCode}]` array. Through the typed verbs it arrives as
+//! [`CirrusError::Api`] with an empty `errors` list and the body in
+//! `raw`, decoded lossily and cut at 2 KiB, with no headers. When the
+//! body matters — a list of validation failures, say —
+//! [`ApexHandler::send_raw`] returns the whole response for any status,
+//! and the status says whether the call succeeded.
+//!
+//! [`RestResponse`]: https://developer.salesforce.com/docs/atlas.en-us.apexref.meta/apexref/apex_methods_system_restresponse.htm
+//! [`CirrusError::Api`]: crate::CirrusError::Api
+//! [`CirrusError::InvalidResponse`]: crate::CirrusError::InvalidResponse
 //!
 //! The handler prepends `/services/apexrest/` to the path you supply
 //! (stripping a single leading slash if present). Pass just the Apex
@@ -41,6 +70,7 @@
 //! [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
 
 use crate::error::{CirrusError, CirrusResult};
+use crate::response::{RawBody, RawResponse};
 use crate::{Cirrus, Replay};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -78,7 +108,9 @@ impl Cirrus {
 /// Each method takes the Apex `urlMapping` (with or without a leading
 /// slash) and forwards through the corresponding [`Cirrus`] verb.
 /// Body and response types are caller-defined since Apex REST endpoints
-/// have no platform-defined wire shape.
+/// have no platform-defined wire shape; the [module docs](self#response-bodies)
+/// say which type to ask for, and when to use [`send_raw`](Self::send_raw)
+/// instead.
 ///
 /// Every method sends `path` as written, and returns
 /// [`CirrusError::InvalidInput`] without issuing a request when it
@@ -212,6 +244,72 @@ impl ApexHandler<'_> {
                 &apex_path(path)?,
                 None,
                 &[],
+                Replay::Never,
+            )
+            .await
+    }
+
+    /// Sends a request with an optional raw body and returns the
+    /// response as it arrived — status, headers and body bytes — for a
+    /// method whose request or response is not JSON, or whose error
+    /// body has to be read whole.
+    ///
+    /// [`Cirrus::send_raw`] with [`Replay::Never`], so the request is
+    /// never re-sent once it has reached the org, like every other
+    /// method here. Every status the loop lets through comes back as
+    /// `Ok`: a 400 the class set is `Ok` with
+    /// [`RawResponse::status`] of 400 and the body the class wrote,
+    /// uncut. The exception is Salesforce's own `INVALID_SESSION_ID`
+    /// 401, which is refreshed and retried, and surfaces as
+    /// [`CirrusError::Api`] only when the retry gets the same answer.
+    ///
+    /// `path` is sent as written; the [module docs](self#path-encoding)
+    /// say what to pre-encode. `body` is sent with its own
+    /// `Content-Type`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, RawBody, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // An @HttpPost method that takes a CSV and answers with one.
+    /// let response = sf
+    ///     .apex()
+    ///     .send_raw(
+    ///         cirrus::reqwest::Method::POST,
+    ///         "Import",
+    ///         None,
+    ///         &[("Accept", "text/csv")],
+    ///         Some(RawBody::new("Id,Name\n001xx,Acme\n", "text/csv")),
+    ///     )
+    ///     .await?;
+    /// if !response.is_success() {
+    ///     // The class's own error body, whole.
+    ///     eprintln!("{}: {}", response.status, String::from_utf8_lossy(&response.body));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`CirrusError::Api`]: crate::CirrusError::Api
+    pub async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: Option<RawBody>,
+    ) -> CirrusResult<RawResponse> {
+        self.client
+            .send_raw(
+                method,
+                &apex_path(path)?,
+                query,
+                headers,
+                body,
                 Replay::Never,
             )
             .await
@@ -550,6 +648,204 @@ mod tests {
             );
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_raw_returns_a_non_json_body_with_its_status_and_headers() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.apexref.meta/apexref/apex_methods_system_restresponse.htm
+        // "If the method returns void, then Apex REST returns the
+        // response in the responseBody property" (a Blob), and
+        // "headers: Returns the headers to be sent to the response."
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Export"))
+            .and(header("authorization", "Bearer tok"))
+            .and(query_param("since", "2026-01-01"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-export-count", "1")
+                    .set_body_raw("Id,Name\n001xx,Acme\n", "text/csv"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let response = sf
+            .apex()
+            .send_raw(
+                reqwest::Method::GET,
+                "Export",
+                Some(&[("since", "2026-01-01")]),
+                &[("Accept", "text/csv")],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.is_success());
+        assert_eq!(response.body.as_ref(), b"Id,Name\n001xx,Acme\n");
+        assert_eq!(response.headers["x-export-count"], "1");
+        assert_eq!(response.headers["content-type"], "text/csv");
+    }
+
+    #[tokio::test]
+    async fn send_raw_sends_a_body_with_its_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/apexrest/Import"))
+            .and(header("content-type", "text/csv"))
+            .and(wiremock::matchers::body_string("Id,Name\n001xx,Acme\n"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let response = sf
+            .apex()
+            .send_raw(
+                reqwest::Method::POST,
+                "Import",
+                None,
+                &[],
+                Some(crate::RawBody::new("Id,Name\n001xx,Acme\n", "text/csv")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 202);
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_raw_keeps_the_whole_error_body_the_apex_class_set() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.apexref.meta/apexref/apex_methods_system_restresponse.htm
+        // "statusCode: Returns or sets the response status code" (400
+        // BAD_REQUEST among the valid codes) and "responseBody: Returns
+        // or sets the body of the response". A body the class wrote is
+        // not the standard error array, and it can be larger than the
+        // 2 KiB that CirrusError::Api::raw keeps.
+        let server = MockServer::start().await;
+        let failures: Vec<serde_json::Value> = (0..200)
+            .map(|i| json!({"field": format!("Custom_Field_{i}__c"), "problem": "required"}))
+            .collect();
+        let body = serde_json::to_vec(&json!({"failures": failures})).unwrap();
+        assert!(body.len() > 4096);
+        Mock::given(method("POST"))
+            .and(path("/services/apexrest/Validate"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(body.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let response = sf
+            .apex()
+            .send_raw(
+                reqwest::Method::POST,
+                "Validate",
+                None,
+                &[],
+                Some(crate::RawBody::new(
+                    br#"{"records": []}"#.as_slice(),
+                    "application/json",
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 400);
+        assert!(!response.is_success());
+        assert_eq!(response.body.as_ref(), body.as_slice());
+        let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(parsed["failures"].as_array().unwrap().len(), 200);
+    }
+
+    #[tokio::test]
+    async fn send_raw_is_not_replayed_after_a_5xx() {
+        // A 500 is the Apex class's unhandled exception, not a transient
+        // failure, so the one request is the whole call and its answer
+        // is returned as it came.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Flaky"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let response = sf
+            .apex()
+            .send_raw(reqwest::Method::GET, "Flaky", None, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(response.body.as_ref(), b"down");
+    }
+
+    #[tokio::test]
+    async fn send_raw_surfaces_an_expired_session_as_an_error_but_returns_a_401_the_class_set() {
+        // The one status the loop keeps for itself: Salesforce's own
+        // INVALID_SESSION_ID 401 goes through the refresh and, when the
+        // session cannot produce a different token, surfaces as the Api
+        // error every other path raises. A 401 the Apex class set is the
+        // endpoint's answer and comes back as such.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Expired"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!([{
+                "errorCode": "INVALID_SESSION_ID",
+                "message": "Session expired or invalid"
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Gate"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("who are you?"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .apex()
+            .send_raw(reqwest::Method::GET, "Expired", None, &[], None)
+            .await
+            .unwrap_err();
+        assert!(err.is_invalid_session(), "{err:?}");
+
+        let response = sf
+            .apex()
+            .send_raw(reqwest::Method::GET, "Gate", None, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 401);
+        assert_eq!(response.body.as_ref(), b"who are you?");
+    }
+
+    #[tokio::test]
+    async fn a_response_body_is_discarded_with_ignored_any_not_unit() {
+        // `()` deserializes from JSON null, which is what an empty body
+        // is read as; a method that returns a value needs IgnoredAny.
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/services/apexrest/Cases/500xx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deleted": true})))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.apex()
+            .delete::<serde::de::IgnoredAny>("Cases/500xx")
+            .await
+            .unwrap();
+        let err = sf.apex().delete::<()>("Cases/500xx").await.unwrap_err();
+        assert!(matches!(err, CirrusError::InvalidResponse(_)), "{err:?}");
     }
 
     #[tokio::test]
