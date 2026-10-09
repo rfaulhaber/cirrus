@@ -60,7 +60,7 @@ where
 /// Most fields beyond `id` are deprecated as of API v31; we keep them
 /// optional for future-proofing but in practice only `id` is reliably
 /// populated.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsyncResult {
     /// ID of the deployment or retrieval job. Pass this to
@@ -84,7 +84,7 @@ pub struct AsyncResult {
 /// Lifecycle state of an async metadata call.
 ///
 /// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AsyncRequestState {
     Queued,
@@ -247,7 +247,7 @@ impl std::str::FromStr for TestLevel {
 /// A finished deployment is returned as a value whatever its outcome;
 /// [`Self::into_result`] converts one that did not succeed into
 /// [`MetadataError::DeployFailed`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployResult {
     pub id: String,
@@ -536,7 +536,7 @@ fn retrieve_message_line(message: &RetrieveMessage) -> String {
 ///     }
 /// }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DeployStatus {
     Pending,
@@ -579,7 +579,7 @@ impl DeployStatus {
 }
 
 /// Per-component results bundled into a [`DeployResult`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployDetails {
     #[serde(default, rename = "componentFailures")]
@@ -597,7 +597,7 @@ pub struct DeployDetails {
 }
 
 /// Per-component status entry inside [`DeployDetails`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployMessage {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -640,7 +640,7 @@ pub struct DeployMessage {
 /// Whether a [`DeployMessage`] reports an error or a warning.
 ///
 /// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DeployProblemType {
     Warning,
@@ -655,7 +655,7 @@ pub enum DeployProblemType {
 }
 
 /// Apex test results inside [`DeployDetails`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestsResult {
     #[serde(default)]
@@ -686,7 +686,7 @@ pub struct RunTestsResult {
     pub flow_coverage_warnings: Vec<FlowCoverageWarning>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestSuccess {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -703,7 +703,7 @@ pub struct RunTestSuccess {
     pub see_all_data: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestFailure {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -730,7 +730,7 @@ pub struct RunTestFailure {
 /// The counts say how much was covered; the `CodeLocation` arrays say
 /// where. `locations_not_covered` is what a CI job needs to annotate
 /// the lines a failed 75% check left uncovered.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeCoverageResult {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -775,7 +775,7 @@ pub struct CodeCoverageResult {
 // and RunTestFailure is left out. `time` is typed like
 // `RunTestSuccess::time`; whether Salesforce ever sends it blank is not
 // documented.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeLocation {
     #[serde(default)]
@@ -800,7 +800,7 @@ pub struct CodeLocation {
 // element. `processType` is a "FlowProcessType (enumeration of type
 // string)" whose set grows with the platform; the literal is kept
 // rather than mapped onto a closed enum.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowCoverageResult {
     /// API names of the flow elements the test run did not execute.
@@ -830,7 +830,7 @@ pub struct FlowCoverageResult {
 /// A warning about flow coverage, inside
 /// [`RunTestsResult::flow_coverage_warnings`]. Available in API
 /// version 44.0 and later.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowCoverageWarning {
     /// ID of the flow version that generated the warning. `None` for a
@@ -848,7 +848,7 @@ pub struct FlowCoverageWarning {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeCoverageWarning {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -866,7 +866,7 @@ pub struct CodeCoverageWarning {
 /// Returned by `cancel_deploy()`. `done == false` means the cancellation
 /// is in progress; `done == true` means it landed (the deployment was
 /// either still queued or cancelled successfully).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelDeployResult {
     pub id: String,
@@ -922,7 +922,11 @@ pub struct RetrieveRequest {
 /// A finished retrieve is returned as a value whatever its outcome;
 /// [`Self::into_result`] converts one that did not succeed into
 /// [`MetadataError::RetrieveFailed`].
-#[derive(Clone, Deserialize)]
+///
+/// Serializing writes `zip_file` in full, where the `Debug` output
+/// prints only its length, so a persisted result still decodes with
+/// [`Self::zip_bytes`].
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveResult {
     /// ID of the retrieve request. `done` is the only field Salesforce
@@ -1038,7 +1042,7 @@ impl RetrieveResult {
 /// State of a retrieve job. See [`RetrieveResult::status`].
 ///
 /// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum RetrieveStatus {
     Pending,
@@ -1066,7 +1070,7 @@ impl RetrieveStatus {
 }
 
 /// Properties of one file inside a retrieve result.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileProperties {
     pub file_name: String,
@@ -1097,7 +1101,7 @@ pub struct FileProperties {
 /// Distribution / lifecycle state of a packaged component.
 ///
 /// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ManageableState {
@@ -1118,7 +1122,7 @@ pub enum ManageableState {
 }
 
 /// Error / warning surfaced in a [`RetrieveResult`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveMessage {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
@@ -1146,7 +1150,7 @@ pub struct ListMetadataQuery {
 /// Returned by `describe_metadata`. Catalogs the metadata types
 /// available in the target org plus a few org-wide flags useful for
 /// deciding deploy behavior.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DescribeMetadataResult {
     /// Per-type descriptors — directory name, file suffix, child types,
@@ -1177,7 +1181,7 @@ pub struct DescribeMetadataResult {
 /// This is the source of truth for `package.xml` `<types><name>` values
 /// and for zip directory layout — `xml_name` is what goes in the
 /// manifest, `directory_name` is what the zip folder is called.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DescribeMetadataObject {
     /// Component name as it appears in `package.xml` (and in
@@ -1210,7 +1214,7 @@ pub struct DescribeMetadataObject {
 /// Returned by `describe_value_type`. Schema-level information about
 /// one specific metadata type — what fields it has, whether it supports
 /// CRUD operations, etc.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DescribeValueTypeResult {
     /// `true` if components of this type can be created via
@@ -1256,7 +1260,7 @@ pub struct DescribeValueTypeResult {
 //   (`ApexPage`, `Scontrol`) for the one `customHelp` field. The
 //   repeating form is modelled here because binding a repeated
 //   element to a scalar fails the whole response, not just the field.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueTypeField {
     /// Field name. `None` for the placeholder root in `parent_field`.
@@ -1299,7 +1303,7 @@ pub struct ValueTypeField {
 }
 
 /// One picklist option inside a [`ValueTypeField`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PicklistEntry {
     /// Wire value of the option.
@@ -1329,7 +1333,7 @@ pub struct PicklistEntry {
 /// failure detail otherwise. A single call can have a mix of
 /// per-component successes and failures — Salesforce's default in
 /// API v34+ allows partial success.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveResult {
     /// `fullName` of the component that was processed.
@@ -1345,7 +1349,7 @@ pub struct SaveResult {
 /// Per-component result for `upsertMetadata`. Same shape as
 /// [`SaveResult`] plus a `created` flag that distinguishes
 /// newly-inserted components from those that were updated.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpsertResult {
     #[serde(default)]
@@ -1363,7 +1367,7 @@ pub struct UpsertResult {
 
 /// Per-component result for `deleteMetadata`. Same shape as
 /// [`SaveResult`] in API v30+.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteResult {
     #[serde(default)]
@@ -1384,7 +1388,7 @@ pub struct DeleteResult {
 /// `status_code` is left as a `String` rather than an enum because
 /// Salesforce ships hundreds of status codes across the platform and
 /// adds new ones each release.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataApiError {
     /// Salesforce status code identifier (e.g. `"DUPLICATE_VALUE"`,
@@ -1988,5 +1992,207 @@ mod tests {
         assert!(coverage.dml_info.is_empty());
         assert!(coverage.method_info.is_empty());
         assert!(coverage.soql_info.is_empty());
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    /// Elements are the "API version 29.0 and later" DeployResult table
+    /// plus the DeployDetails, DeployMessage and RunTestsResult tables
+    /// on the same page, with one failed component carrying a problem
+    /// and its location.
+    const DEPLOY_RESULT_XML: &str = "<result>\
+        <id>0Af00000abcDEF</id>\
+        <done>true</done>\
+        <success>false</success>\
+        <status>Failed</status>\
+        <checkOnly>false</checkOnly>\
+        <ignoreWarnings>false</ignoreWarnings>\
+        <rollbackOnError>true</rollbackOnError>\
+        <runTestsEnabled>true</runTestsEnabled>\
+        <numberComponentsDeployed>9</numberComponentsDeployed>\
+        <numberComponentsTotal>10</numberComponentsTotal>\
+        <numberComponentErrors>1</numberComponentErrors>\
+        <numberTestsCompleted>5</numberTestsCompleted>\
+        <numberTestsTotal>5</numberTestsTotal>\
+        <numberTestErrors>0</numberTestErrors>\
+        <numFiles>12</numFiles>\
+        <zipSize>18342211</zipSize>\
+        <createdBy>005xx00000abcde</createdBy>\
+        <createdByName>Stephanie</createdByName>\
+        <createdDate>2026-05-28T10:00:00.000Z</createdDate>\
+        <completedDate>2026-05-28T10:01:00.000Z</completedDate>\
+        <details>\
+          <componentFailures>\
+            <componentType>ApexClass</componentType>\
+            <fullName>Bar</fullName>\
+            <fileName>classes/Bar.cls</fileName>\
+            <success>false</success>\
+            <changed>false</changed>\
+            <created>false</created>\
+            <deleted>false</deleted>\
+            <problem>Unexpected token</problem>\
+            <problemType>Error</problemType>\
+            <lineNumber>4</lineNumber>\
+            <columnNumber>9</columnNumber>\
+          </componentFailures>\
+          <componentSuccesses>\
+            <componentType>ApexClass</componentType>\
+            <fullName>Foo</fullName>\
+            <fileName>classes/Foo.cls</fileName>\
+            <success>true</success>\
+            <changed>false</changed>\
+            <created>true</created>\
+            <deleted>false</deleted>\
+          </componentSuccesses>\
+          <runTestResult>\
+            <numTestsRun>5</numTestsRun>\
+            <numFailures>0</numFailures>\
+            <totalTime>1234.5</totalTime>\
+            <codeCoverage>\
+              <name>Foo</name>\
+              <numLocations>10</numLocations>\
+              <numLocationsNotCovered>1</numLocationsNotCovered>\
+              <locationsNotCovered><column>5</column><line>12</line>\
+                <numExecutions>0</numExecutions><time>0.0</time></locationsNotCovered>\
+            </codeCoverage>\
+          </runTestResult>\
+        </details>\
+      </result>";
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+    /// RetrieveResult: `fileProperties` ("information about the
+    /// properties of each component in the .zip file"), `messages`, and
+    /// `zipFile` ("base64Binary ... client applications must decode the
+    /// base64 data to binary"). The base64 text is "PKfakezipbytes".
+    const RETRIEVE_RESULT_XML: &str = "<result>\
+        <id>09S00000retrId</id>\
+        <done>true</done>\
+        <success>true</success>\
+        <status>Succeeded</status>\
+        <fileProperties>\
+          <createdById>005xx0000</createdById>\
+          <createdByName>Stephanie</createdByName>\
+          <createdDate>2026-05-28T10:00:00.000Z</createdDate>\
+          <fileName>unpackaged/classes/MyClass.cls</fileName>\
+          <fullName>MyClass</fullName>\
+          <id>01p00000abc</id>\
+          <lastModifiedById>005xx0000</lastModifiedById>\
+          <lastModifiedByName>Stephanie</lastModifiedByName>\
+          <lastModifiedDate>2026-05-28T10:00:00.000Z</lastModifiedDate>\
+          <manageableState>unmanaged</manageableState>\
+          <type>ApexClass</type>\
+        </fileProperties>\
+        <messages>\
+          <fileName>unpackaged/package.xml</fileName>\
+          <problem>Entity of type 'ApexClass' named 'Gone' cannot be found</problem>\
+        </messages>\
+        <zipFile>UEtmYWtlemlwYnl0ZXM=</zipFile>\
+      </result>";
+
+    fn assert_serialize<T: Serialize>() {}
+
+    #[test]
+    fn every_result_struct_is_serialize() {
+        assert_serialize::<AsyncResult>();
+        assert_serialize::<AsyncRequestState>();
+        assert_serialize::<DeployResult>();
+        assert_serialize::<DeployStatus>();
+        assert_serialize::<DeployDetails>();
+        assert_serialize::<DeployMessage>();
+        assert_serialize::<DeployProblemType>();
+        assert_serialize::<RunTestsResult>();
+        assert_serialize::<RunTestSuccess>();
+        assert_serialize::<RunTestFailure>();
+        assert_serialize::<CodeCoverageResult>();
+        assert_serialize::<CodeLocation>();
+        assert_serialize::<FlowCoverageResult>();
+        assert_serialize::<FlowCoverageWarning>();
+        assert_serialize::<CodeCoverageWarning>();
+        assert_serialize::<CancelDeployResult>();
+        assert_serialize::<RetrieveResult>();
+        assert_serialize::<RetrieveStatus>();
+        assert_serialize::<FileProperties>();
+        assert_serialize::<ManageableState>();
+        assert_serialize::<RetrieveMessage>();
+        assert_serialize::<DescribeMetadataResult>();
+        assert_serialize::<DescribeMetadataObject>();
+        assert_serialize::<DescribeValueTypeResult>();
+        assert_serialize::<ValueTypeField>();
+        assert_serialize::<PicklistEntry>();
+        assert_serialize::<SaveResult>();
+        assert_serialize::<UpsertResult>();
+        assert_serialize::<DeleteResult>();
+        assert_serialize::<MetadataApiError>();
+    }
+
+    #[test]
+    fn deploy_result_serializes_its_wire_names_and_reads_back() {
+        let parsed = deploy_result(DEPLOY_RESULT_XML);
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["id"], "0Af00000abcDEF");
+        assert_eq!(written["status"], "Failed");
+        assert_eq!(written["numberComponentsDeployed"], 9);
+        assert_eq!(written["rollbackOnError"], true);
+        assert_eq!(written["zipSize"], 18_342_211);
+        assert_eq!(written["createdByName"], "Stephanie");
+        assert!(written.get("number_components_deployed").is_none());
+        // A member the response left out is written as null, which
+        // reads back as absent.
+        assert!(written["stateDetail"].is_null());
+        let details = &written["details"];
+        assert_eq!(details["componentFailures"][0]["problemType"], "Error");
+        assert_eq!(details["componentFailures"][0]["lineNumber"], 4);
+        assert_eq!(details["runTestResult"]["numTestsRun"], 5);
+        assert_eq!(
+            details["runTestResult"]["codeCoverage"][0]["locationsNotCovered"][0]["line"],
+            12
+        );
+
+        let back: DeployResult = serde_json::from_value(written).unwrap();
+        assert_eq!(back.id, parsed.id);
+        assert!(back.done);
+        assert!(!back.success);
+        assert_eq!(back.status, Some(DeployStatus::Failed));
+        assert_eq!(back.num_files, 12);
+        assert_eq!(back.zip_size, 18_342_211);
+        assert_eq!(back.state_detail, None);
+        assert_eq!(back.created_by_name.as_deref(), Some("Stephanie"));
+        let back_details = back.details.unwrap();
+        assert_eq!(back_details.component_successes.len(), 1);
+        let failure = &back_details.component_failures[0];
+        assert_eq!(failure.problem_type, Some(DeployProblemType::Error));
+        assert_eq!(failure.line_number, Some(4));
+        let tests = back_details.run_test_result.unwrap();
+        assert_eq!(tests.num_tests_run, 5);
+        assert_eq!(tests.code_coverage[0].locations_not_covered[0].column, 5);
+    }
+
+    #[test]
+    fn retrieve_result_serializes_the_zip_with_its_wire_names_and_reads_back() {
+        let parsed = retrieve_result(RETRIEVE_RESULT_XML);
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["zipFile"], "UEtmYWtlemlwYnl0ZXM=");
+        assert_eq!(written["status"], "Succeeded");
+        let file = &written["fileProperties"][0];
+        assert_eq!(file["type"], "ApexClass");
+        assert_eq!(file["fullName"], "MyClass");
+        assert_eq!(file["manageableState"], "unmanaged");
+        assert!(file.get("type_name").is_none());
+        assert_eq!(written["messages"][0]["fileName"], "unpackaged/package.xml");
+
+        let back: RetrieveResult = serde_json::from_value(written).unwrap();
+        assert_eq!(back.id, "09S00000retrId");
+        assert_eq!(back.status, Some(RetrieveStatus::Succeeded));
+        assert_eq!(
+            back.file_properties[0].type_name.as_deref(),
+            Some("ApexClass")
+        );
+        assert_eq!(
+            back.file_properties[0].manageable_state,
+            Some(ManageableState::Unmanaged)
+        );
+        assert_eq!(back.messages.len(), 1);
+        assert_eq!(&back.zip_bytes().unwrap().unwrap()[..], b"PKfakezipbytes");
     }
 }
