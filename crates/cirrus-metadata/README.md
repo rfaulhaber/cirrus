@@ -74,12 +74,15 @@ you need anything beyond `deployRequest`.
   `INVALID_SESSION_ID` refresh against the configured `AuthSession`, SOAP
   fault parsing into a typed `MetadataError::Soap`.
 - **Transport defaults** — the instance URL must be `https` (exact
-  `localhost` and the loopback literals excepted) because the session id
-  rides in every envelope; `MetadataClientBuilder::allow_insecure_transport`
-  is the opt-out, and the same rule governs `cirrus`. The HTTP client the
-  builder creates applies a 30 s connect timeout and a 120 s read timeout
+  `localhost` and the loopback literals excepted while no proxy is
+  configured) because the session id rides in every envelope;
+  `MetadataClientBuilder::allow_insecure_transport` is the opt-out, and the
+  same rule governs `cirrus`. The HTTP client the builder creates applies a
+  30 s connect timeout and a 120 s read timeout
   (`MetadataClientBuilder::connect_timeout` / `read_timeout` override either),
-  and doesn't follow redirects — a 3xx surfaces as an error rather than
+  uses no proxy unless `MetadataClientBuilder::proxy` names one (`HTTP_PROXY`
+  and the system proxy are ignored, and a named proxy withdraws the loopback
+  exemption), and doesn't follow redirects — a 3xx surfaces as an error rather than
   re-POSTing the envelope, session token included, to the `Location` host.
   A read timeout is surfaced, not replayed, unless
   `RetryPolicy::retry_read_timeouts` is set, and a `Retry-After` longer than

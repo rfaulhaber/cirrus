@@ -313,7 +313,11 @@ async fn send_with_retries(
     envelope_bytes: Bytes,
     response_local: &str,
 ) -> MetadataResult<SoapResponse> {
-    crate::check_transport_security(client.auth.instance_url(), client.allow_insecure_transport)?;
+    crate::check_transport_security(
+        client.auth.instance_url(),
+        client.allow_insecure_transport,
+        client.proxied,
+    )?;
     let url = client.endpoint_url();
     let mut attempt: u32 = 0;
     loop {

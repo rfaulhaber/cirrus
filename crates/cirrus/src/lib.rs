@@ -263,8 +263,9 @@ pub fn encode_path_segment(segment: &str) -> Cow<'_, str> {
 /// modes.
 ///
 /// Whichever mode applies, the resolved target has to be `https` (or a
-/// loopback host) before the session token is attached — see
-/// [`CirrusBuilder::allow_insecure_transport`] for the opt-out.
+/// loopback host, when no proxy is configured) before the session token
+/// is attached — see [`CirrusBuilder::allow_insecure_transport`] for the
+/// opt-out and [`CirrusBuilder::proxy`] for the proxy rule.
 #[derive(Clone)]
 pub struct Cirrus {
     client: reqwest::Client,
@@ -272,6 +273,10 @@ pub struct Cirrus {
     api_version: String,
     retry_policy: RetryPolicy,
     allow_insecure_transport: bool,
+    /// Whether the client this crate built routes through a configured
+    /// proxy, which withdraws the loopback exemption from the transport
+    /// rule: the hop then does leave the machine.
+    proxied: bool,
     max_response_size: Option<usize>,
     /// Most recent `Sforce-Limit-Info` header value, parsed. Wrapped
     /// in `Arc<RwLock<...>>` so updates are visible across cloned
@@ -288,6 +293,7 @@ impl std::fmt::Debug for Cirrus {
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("proxied", &self.proxied)
             .field("max_response_size", &self.max_response_size)
             .finish_non_exhaustive()
     }
@@ -431,7 +437,12 @@ impl Cirrus {
     /// Refuses to put the session token on a target that isn't
     /// TLS-protected. See [`check_transport_security`].
     fn check_transport_security(&self, url: &str) -> CirrusResult<()> {
-        check_transport_security("request URL", url, self.allow_insecure_transport)
+        check_transport_security(
+            "request URL",
+            url,
+            self.allow_insecure_transport,
+            self.proxied,
+        )
     }
 
     /// Builds the fully-qualified URL of a versioned resource from its path
@@ -1613,6 +1624,7 @@ pub struct CirrusBuilder {
     api_version: Option<String>,
     user_agent: Option<String>,
     http_client: Option<reqwest::Client>,
+    proxies: Vec<reqwest::Proxy>,
     retry_policy: Option<RetryPolicy>,
     // Outer `Option` is "did the caller set this"; inner `None` is the
     // caller asking for no deadline at all.
@@ -1653,11 +1665,60 @@ impl CirrusBuilder {
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool across multiple SDK clients or for installing custom
     /// middleware. When provided, the builder's `user_agent`,
-    /// `connect_timeout` and `read_timeout` settings are ignored — the
-    /// supplied client owns its own headers, timeouts, redirect policy and
-    /// content-encoding support.
+    /// `connect_timeout`, `read_timeout` and [`proxy`](Self::proxy)
+    /// settings are ignored — the supplied client owns its own headers,
+    /// timeouts, redirect policy, content-encoding support and proxy
+    /// configuration.
+    ///
+    /// The loopback exemption to the https rule stays in force for a
+    /// supplied client, so one that routes through a proxy (reqwest's
+    /// default reads `HTTP_PROXY` and the system proxy) carries the
+    /// session token to that proxy in the clear for a plaintext loopback
+    /// target. Build such a client with `no_proxy()`, or exempt the
+    /// loopback hosts in its proxy's `NoProxy` rules.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
+        self
+    }
+
+    /// Routes every request the client this builder creates through
+    /// `proxy`. May be called more than once; the first proxy that
+    /// matches a request's URL is used, as on `reqwest::ClientBuilder`.
+    ///
+    /// Without this, the client uses no proxy at all: it ignores
+    /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the operating
+    /// system's proxy settings, which a stock `reqwest::Client` obeys.
+    /// A plaintext request to a loopback host is exempt from the https
+    /// rule because the hop never leaves the machine, and an ambient
+    /// proxy would silently break that: the request, session token
+    /// included, would be forwarded to the proxy in the clear.
+    ///
+    /// With a proxy configured here, the exemption is withdrawn: a
+    /// plaintext loopback target is refused like any other `http://`
+    /// target unless [`allow_insecure_transport`](Self::allow_insecure_transport)
+    /// is set, since the proxy may well intercept it. `https` targets
+    /// are tunneled through the proxy with `CONNECT`, so the token
+    /// stays inside TLS.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// let sf = Cirrus::builder()
+    ///     .auth(auth)
+    ///     .proxy(cirrus::reqwest::Proxy::all("http://proxy.corp.example:3128")?)
+    ///     .build()?;
+    /// # let _ = sf;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn proxy(mut self, proxy: reqwest::Proxy) -> Self {
+        self.proxies.push(proxy);
         self
     }
 
@@ -1726,7 +1787,8 @@ impl CirrusBuilder {
     }
 
     /// Allows requests to carry the Salesforce session token over
-    /// plaintext `http://` to a non-loopback host.
+    /// plaintext `http://` to a non-loopback host, or to a loopback
+    /// host through a [`proxy`](Self::proxy).
     ///
     /// Off by default: the token is the org session id, and RFC 6750
     /// §5.3 requires TLS for any request that bears one. Turn this on
@@ -1750,10 +1812,15 @@ impl CirrusBuilder {
             .api_version
             .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
         validate_api_version(&api_version)?;
+        // A supplied client's proxy configuration is its owner's
+        // business; only a proxy this builder installs is known to be
+        // on the path.
+        let proxied = self.http_client.is_none() && !self.proxies.is_empty();
         check_transport_security(
             "instance URL",
             auth.instance_url(),
             self.allow_insecure_transport,
+            proxied,
         )?;
 
         let client = if let Some(c) = self.http_client {
@@ -1774,7 +1841,15 @@ impl CirrusBuilder {
                 // token included — to whatever host the Location header
                 // names, so a redirect is surfaced as an error for the
                 // caller to inspect.
-                .redirect(reqwest::redirect::Policy::none());
+                .redirect(reqwest::redirect::Policy::none())
+                // reqwest obeys HTTP_PROXY and the system proxy by
+                // default, and a proxy on the path is what the loopback
+                // exemption to the https rule assumes there is not. Only
+                // a proxy named on the builder is used.
+                .no_proxy();
+            for proxy in self.proxies {
+                builder = builder.proxy(proxy);
+            }
             if let Some(t) = self
                 .connect_timeout
                 .unwrap_or(Some(DEFAULT_CONNECT_TIMEOUT))
@@ -1793,6 +1868,7 @@ impl CirrusBuilder {
             api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
             allow_insecure_transport: self.allow_insecure_transport,
+            proxied,
             max_response_size: self
                 .max_response_size
                 .unwrap_or(Some(DEFAULT_MAX_RESPONSE_SIZE)),
@@ -1845,25 +1921,38 @@ impl CirrusBuilder {
 /// RFC 6750 §5.3 makes TLS mandatory for requests bearing an OAuth
 /// bearer token, and the value here is the org session id: anything
 /// on the path can replay it for the session's lifetime. Loopback
-/// hosts are exempt (local mock servers and sidecar proxies never
-/// leave the machine), and `allow_insecure` reflects the caller's
-/// deliberate opt-out.
+/// hosts are exempt when the client uses no proxy, because a local
+/// mock server or sidecar is then the only thing on the path; with a
+/// proxy configured (`proxied`), that path runs through the proxy and
+/// the exemption is withdrawn. `allow_insecure` reflects the caller's
+/// deliberate opt-out of both.
 fn check_transport_security(
     field: &'static str,
     url: &str,
     allow_insecure: bool,
+    proxied: bool,
 ) -> CirrusResult<()> {
     if allow_insecure {
         return Ok(());
     }
     let parsed = url::Url::parse(url)?;
-    if cirrus_auth::transport::is_secure_transport(&parsed) {
+    if parsed.scheme() == "https" {
         return Ok(());
     }
+    let loopback = cirrus_auth::transport::is_loopback_host(&parsed);
+    if loopback && !proxied {
+        return Ok(());
+    }
+    let why = if loopback {
+        "a loopback target is reached through the configured proxy, so the Salesforce session \
+         token would travel to the proxy in the clear"
+    } else {
+        "the Salesforce session token must not travel in the clear"
+    };
     Err(CirrusError::InvalidInput {
         field,
         message: format!(
-            "`{url}` is not an https target, and the Salesforce session token must not travel in the clear; \
+            "`{url}` is not an https target, and {why}; \
              opt out with CirrusBuilder::allow_insecure_transport if the plaintext hop is deliberate",
         ),
     })
@@ -2054,6 +2143,145 @@ mod tests {
             sf.resolve_url("limits"),
             "http://my-org.my.salesforce.com/services/data/v66.0/limits"
         );
+    }
+
+    #[tokio::test]
+    async fn the_default_client_ignores_an_ambient_proxy() {
+        // The loopback exemption assumes the hop stays on the machine.
+        // A stock reqwest client obeys HTTP_PROXY and would carry the
+        // request, token included, to the proxy; the client the builder
+        // creates must not.
+        //
+        // The variable is process-wide. nextest gives every test its
+        // own process, which is what makes setting it safe; under a
+        // threaded runner it would leak into every other test in the
+        // binary, so the test is a no-op there.
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/limits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        // A port nothing listens on.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: this test runs in its own process (checked above), so
+        // no other thread reads the environment while it is modified.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
+
+        // The variable is in effect: a stock client goes to the proxy.
+        let stock = reqwest::Client::new();
+        let err = stock
+            .get(format!("{}/services/data/v66.0/limits", server.uri()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect(), "{err:?}");
+
+        let sf = fixture(&server.uri());
+        let limits: serde_json::Value = sf.get("limits").await.unwrap();
+        assert!(limits.is_object());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_configured_proxy_receives_the_request() {
+        // An HTTP proxy receives the request in absolute form; the mock
+        // server plays the proxy. The instance host does not resolve,
+        // which the proxy makes irrelevant.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/limits"))
+            .and(wiremock::matchers::header("host", "sf.invalid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&proxy)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", "http://sf.invalid"));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .proxy(reqwest::Proxy::http(proxy.uri()).unwrap())
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+        let limits: serde_json::Value = sf.get("limits").await.unwrap();
+        assert!(limits.is_object());
+    }
+
+    #[tokio::test]
+    async fn a_configured_proxy_withdraws_the_loopback_exemption() {
+        let proxy = reqwest::Proxy::all("http://proxy.corp.example:3128").unwrap();
+        let loopback = Arc::new(StaticTokenAuth::new("tok", "http://localhost:8080"));
+
+        // The instance URL, at build.
+        let err = Cirrus::builder()
+            .auth(loopback.clone())
+            .proxy(proxy.clone())
+            .build()
+            .unwrap_err();
+        match err {
+            CirrusError::InvalidInput { field, message } => {
+                assert_eq!(field, "instance URL");
+                assert!(message.contains("proxy"), "{message}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // A request URL, on a client whose instance is https.
+        let org = Arc::new(StaticTokenAuth::new(
+            "tok",
+            "https://my-org.my.salesforce.com",
+        ));
+        let sf = Cirrus::builder()
+            .auth(org)
+            .proxy(proxy.clone())
+            .build()
+            .unwrap();
+        let err = sf
+            .get::<serde_json::Value>("http://127.0.0.1:8080/collect")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CirrusError::InvalidInput {
+                    field: "request URL",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // The opt-out covers it, as it covers any plaintext hop.
+        Cirrus::builder()
+            .auth(loopback.clone())
+            .proxy(proxy)
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+
+        // A supplied client's proxy settings are its owner's business:
+        // the exemption stays.
+        Cirrus::builder()
+            .auth(loopback)
+            .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .build()
+            .unwrap();
     }
 
     #[tokio::test]

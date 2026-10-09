@@ -6,8 +6,12 @@
 //! RFC 6750 §5.3 requires TLS for every request that carries a bearer
 //! token. The one exemption is a loopback host, where the hop never
 //! leaves the machine, so local mock servers work without certificates.
-//! Defining the rule once keeps the clients from disagreeing about which
-//! URLs qualify.
+//! That holds only for a client that uses no proxy, which is why every
+//! client the crates build is created with `no_proxy()` rather than
+//! reqwest's default of obeying `HTTP_PROXY` and the system proxy; the
+//! REST and Metadata clients withdraw the exemption again when a proxy
+//! is configured on their builders. Defining the rule once keeps the
+//! clients from disagreeing about which URLs qualify.
 //!
 //! Every client the workspace builds decodes gzip responses, so a body's
 //! size on the wire says nothing about the memory it needs: a few
@@ -165,9 +169,12 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            // The default client decodes gzip, like every client the SDK
+            // Decodes gzip and uses no proxy, like every client the SDK
             // builds.
-            let response = reqwest::Client::new()
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
                 .get(server.uri())
                 .send()
                 .await

@@ -34,12 +34,14 @@
 //!
 //! The session id travels inside every SOAP envelope, so the instance
 //! URL must be `https`; exact `localhost` and the loopback literals are
-//! the only exemption, for local mock servers. The rule is the one
+//! the only exemption, for local mock servers, and it holds only while
+//! no [`MetadataClientBuilder::proxy`] is configured. The rule is the one
 //! `cirrus` applies, from [`cirrus_auth::transport`], checked when the
 //! client is built and again on every call because an [`AuthSession`]
 //! may change its instance URL. [`MetadataClientBuilder::allow_insecure_transport`]
 //! is the opt-out for a deliberate plaintext hop. The HTTP client the
-//! builder creates follows no redirects, and a `Retry-After` hint longer
+//! builder creates follows no redirects and uses no proxy unless one is
+//! configured, and a `Retry-After` hint longer
 //! than the policy's `max_delay` ends the retry loop instead of being
 //! shortened. Response bodies are read through
 //! [`cirrus_auth::transport::collect_body`] and buffered only up to a
@@ -214,6 +216,10 @@ pub struct MetadataClient {
     pub(crate) api_version: String,
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) allow_insecure_transport: bool,
+    /// Whether the client this crate built routes through a configured
+    /// proxy, which withdraws the loopback exemption from the transport
+    /// rule: the hop then does leave the machine.
+    pub(crate) proxied: bool,
     pub(crate) call_options_client: Option<String>,
     pub(crate) max_response_size: Option<usize>,
 }
@@ -227,6 +233,7 @@ impl std::fmt::Debug for MetadataClient {
             .field("instance_url", &self.auth.instance_url())
             .field("retry_policy", &self.retry_policy)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("proxied", &self.proxied)
             .field("call_options_client", &self.call_options_client)
             .field("max_response_size", &self.max_response_size)
             .finish_non_exhaustive()
@@ -350,6 +357,7 @@ pub struct MetadataClientBuilder {
     api_version: Option<String>,
     user_agent: Option<String>,
     http_client: Option<reqwest::Client>,
+    proxies: Vec<reqwest::Proxy>,
     retry_policy: Option<RetryPolicy>,
     // Outer `Option` is "did the caller set this"; inner `None` is the
     // caller asking for no deadline at all.
@@ -392,11 +400,16 @@ impl MetadataClientBuilder {
     ///
     /// The supplied client also brings its own timeouts and redirect
     /// policy, so the builder's `connect_timeout` and `read_timeout`
-    /// are ignored. The client this builder constructs otherwise
-    /// applies [`DEFAULT_CONNECT_TIMEOUT`] and [`DEFAULT_READ_TIMEOUT`]
-    /// and disables redirects so the session token in the SOAP envelope
-    /// is never re-POSTed to a redirect target; a client configured here
-    /// should do the same unless you have a reason not to.
+    /// and [`proxy`](Self::proxy) settings are ignored. The client this
+    /// builder constructs otherwise applies [`DEFAULT_CONNECT_TIMEOUT`]
+    /// and [`DEFAULT_READ_TIMEOUT`], disables redirects so the session
+    /// token in the SOAP envelope is never re-POSTed to a redirect
+    /// target, and uses no proxy; a client configured here should do
+    /// the same unless you have a reason not to. The loopback exemption
+    /// to the https rule stays in force for a supplied client, so one
+    /// that routes through a proxy (reqwest's default obeys
+    /// `HTTP_PROXY` and the system proxy) carries the envelope to that
+    /// proxy in the clear for a plaintext loopback instance.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -454,7 +467,8 @@ impl MetadataClientBuilder {
         self
     }
 
-    /// Allows an instance URL that is neither `https` nor loopback.
+    /// Allows an instance URL that is neither `https` nor loopback, or
+    /// that is loopback reached through a [`proxy`](Self::proxy).
     ///
     /// Every SOAP envelope carries the session id in its body, so by
     /// default [`build`](Self::build) and every call refuse to send one
@@ -463,6 +477,31 @@ impl MetadataClientBuilder {
     /// network, and never for an org.
     pub fn allow_insecure_transport(mut self, allow: bool) -> Self {
         self.allow_insecure_transport = allow;
+        self
+    }
+
+    /// Routes every call the client this builder creates through
+    /// `proxy`. May be called more than once; the first proxy that
+    /// matches the endpoint URL is used, as on `reqwest::ClientBuilder`.
+    ///
+    /// Without this, the client uses no proxy at all: it ignores
+    /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the operating
+    /// system's proxy settings, which a stock `reqwest::Client` obeys.
+    /// A plaintext loopback instance URL is exempt from the https rule
+    /// because the hop never leaves the machine, and an ambient proxy
+    /// would silently break that: the envelope, session id included,
+    /// would be forwarded to the proxy in the clear.
+    ///
+    /// With a proxy configured here, the exemption is withdrawn: a
+    /// plaintext loopback instance URL is refused like any other
+    /// `http://` one unless
+    /// [`allow_insecure_transport`](Self::allow_insecure_transport) is
+    /// set. An `https` instance is tunneled through the proxy with
+    /// `CONNECT`, so the session id stays inside TLS.
+    ///
+    /// Ignored when [`http_client`](Self::http_client) supplies a client.
+    pub fn proxy(mut self, proxy: reqwest::Proxy) -> Self {
+        self.proxies.push(proxy);
         self
     }
 
@@ -491,7 +530,11 @@ impl MetadataClientBuilder {
             .api_version
             .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
         validate_api_version(&api_version)?;
-        check_transport_security(auth.instance_url(), self.allow_insecure_transport)?;
+        // A supplied client's proxy configuration is its owner's
+        // business; only a proxy this builder installs is known to be
+        // on the path.
+        let proxied = self.http_client.is_none() && !self.proxies.is_empty();
+        check_transport_security(auth.instance_url(), self.allow_insecure_transport, proxied)?;
 
         let http = if let Some(c) = self.http_client {
             c
@@ -510,7 +553,15 @@ impl MetadataClientBuilder {
                 // stripping can't reach it. Surfacing a 3xx as an error
                 // beats re-POSTing the envelope — token included — to
                 // whatever host the Location named.
-                .redirect(reqwest::redirect::Policy::none());
+                .redirect(reqwest::redirect::Policy::none())
+                // reqwest obeys HTTP_PROXY and the system proxy by
+                // default, and a proxy on the path is what the loopback
+                // exemption to the https rule assumes there is not. Only
+                // a proxy named on the builder is used.
+                .no_proxy();
+            for proxy in self.proxies {
+                builder = builder.proxy(proxy);
+            }
             if let Some(t) = self
                 .connect_timeout
                 .unwrap_or(Some(DEFAULT_CONNECT_TIMEOUT))
@@ -529,6 +580,7 @@ impl MetadataClientBuilder {
             api_version,
             retry_policy: self.retry_policy.unwrap_or_default(),
             allow_insecure_transport: self.allow_insecure_transport,
+            proxied,
             call_options_client: self.call_options_client,
             max_response_size: self
                 .max_response_size
@@ -539,21 +591,35 @@ impl MetadataClientBuilder {
 
 /// Refuses an instance URL that would carry the session id in the clear:
 /// anything that is not `https` or loopback, under the rule shared with
-/// `cirrus` in [`cirrus_auth::transport`]. `allow_insecure` is the
-/// caller's deliberate opt-out.
-pub(crate) fn check_transport_security(url: &str, allow_insecure: bool) -> MetadataResult<()> {
+/// `cirrus` in [`cirrus_auth::transport`]. The loopback exemption holds
+/// only while no proxy is on the path (`proxied`), and `allow_insecure`
+/// is the caller's deliberate opt-out of both.
+pub(crate) fn check_transport_security(
+    url: &str,
+    allow_insecure: bool,
+    proxied: bool,
+) -> MetadataResult<()> {
     if allow_insecure {
         return Ok(());
     }
     let parsed = url::Url::parse(url).map_err(|e| {
         MetadataError::InvalidArgument(format!("instance URL `{url}` is not a valid URL: {e}"))
     })?;
-    if cirrus_auth::transport::is_secure_transport(&parsed) {
+    if parsed.scheme() == "https" {
         return Ok(());
     }
+    let loopback = cirrus_auth::transport::is_loopback_host(&parsed);
+    if loopback && !proxied {
+        return Ok(());
+    }
+    let why = if loopback {
+        "a loopback instance is reached through the configured proxy, so the Salesforce session \
+         id inside every SOAP envelope would travel to the proxy in the clear"
+    } else {
+        "the Salesforce session id inside every SOAP envelope must not travel in the clear"
+    };
     Err(MetadataError::InvalidArgument(format!(
-        "instance URL `{url}` is not an https target, and the Salesforce session id inside every \
-         SOAP envelope must not travel in the clear; opt out with \
+        "instance URL `{url}` is not an https target, and {why}; opt out with \
          MetadataClientBuilder::allow_insecure_transport if the plaintext hop is deliberate",
     )))
 }
@@ -629,6 +695,93 @@ mod tests {
         let xml_err: MetadataError =
             <crate::quick_xml::DeError as serde::de::Error>::custom("bad").into();
         assert!(matches!(xml_err, MetadataError::Xml(_)));
+    }
+
+    #[test]
+    fn a_configured_proxy_withdraws_the_loopback_exemption() {
+        let proxy = reqwest::Proxy::all("http://proxy.corp.example:3128").unwrap();
+        let loopback = Arc::new(auth::StaticTokenAuth::new("tok", "http://localhost:8080"));
+
+        let err = MetadataClient::builder()
+            .auth(loopback.clone())
+            .proxy(proxy.clone())
+            .build()
+            .unwrap_err();
+        match err {
+            MetadataError::InvalidArgument(message) => {
+                assert!(message.contains("proxy"), "{message}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        // The opt-out covers it, as it covers any plaintext hop.
+        MetadataClient::builder()
+            .auth(loopback.clone())
+            .proxy(proxy.clone())
+            .allow_insecure_transport(true)
+            .build()
+            .unwrap();
+
+        // An https instance is tunneled, so nothing changes for it.
+        let org = Arc::new(auth::StaticTokenAuth::new(
+            "tok",
+            "https://my-org.my.salesforce.com",
+        ));
+        MetadataClient::builder()
+            .auth(org)
+            .proxy(proxy)
+            .build()
+            .unwrap();
+
+        // A supplied client's proxy settings are its owner's business:
+        // the exemption stays.
+        MetadataClient::builder()
+            .auth(loopback)
+            .http_client(reqwest::Client::builder().no_proxy().build().unwrap())
+            .build()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_default_client_ignores_an_ambient_proxy() {
+        // The variable is process-wide; nextest runs each test in its
+        // own process, which is what makes setting it safe. Under a
+        // threaded runner the test is a no-op.
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/Soap/m/66.0"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: this test runs in its own process (checked above), so
+        // no other thread reads the environment while it is modified.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
+
+        let err = reqwest::Client::new()
+            .post(format!("{}/services/Soap/m/66.0", server.uri()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect(), "stock client ignored HTTP_PROXY: {err:?}");
+
+        let auth = Arc::new(auth::StaticTokenAuth::new("tok", server.uri()));
+        let md = MetadataClient::builder().auth(auth).build().unwrap();
+        let response = md.request_builder().send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
     }
 
     #[test]

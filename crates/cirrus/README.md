@@ -150,7 +150,8 @@ boundary between auth and REST without extra plumbing.
   carries a token or a body.
 - **Transport defaults** — the HTTP client the builder creates advertises
   gzip and decompresses responses, applies a 10 s connect timeout and a 120 s
-  read timeout, and doesn't follow redirects — a 3xx surfaces as
+  read timeout, uses no proxy (`HTTP_PROXY` and the system proxy are ignored;
+  `CirrusBuilder::proxy` names one), and doesn't follow redirects — a 3xx surfaces as
   `CirrusError::Api` (a 300 whose body is a JSON array of records, as an
   upsert by a non-unique external ID answers, is `CirrusError::MultipleMatches`)
   rather than re-sending the token to the `Location` host.
@@ -185,12 +186,15 @@ sf.get::<MyShape>("https://...").await?;                   // fully-qualified
 
 Three-mode path resolution: relative → `/services/data/{version}/...`,
 leading-`/` → instance-rooted, `http(s)://` → passthrough.
-Whichever mode applies, the resolved target must be `https` (loopback hosts
-excepted) because the request carries the org session token — a plaintext
-target is rejected with `CirrusError::InvalidInput` and no request is sent,
-and `Cirrus::builder().build()` fails outright on an `http://` instance URL.
-`CirrusBuilder::allow_insecure_transport(true)` is the opt-out for a
-deliberate plaintext hop, such as a recording proxy on a trusted network.
+Whichever mode applies, the resolved target must be `https` because the
+request carries the org session token — a plaintext target is rejected with
+`CirrusError::InvalidInput` and no request is sent, and
+`Cirrus::builder().build()` fails outright on an `http://` instance URL. A
+loopback host is excepted while the client uses no proxy, since that hop
+stays on the machine; with `CirrusBuilder::proxy` set it is refused like any
+other plaintext target. `CirrusBuilder::allow_insecure_transport(true)` is
+the opt-out for a deliberate plaintext hop, such as a recording proxy on a
+trusted network.
 
 The path is sent as written — nothing is percent-encoded — so a value
 interpolated into it has to be encoded first: a raw `#` starts a fragment
@@ -254,7 +258,7 @@ cargo run --example simple_query
 ## Testing
 
 ```bash
-cargo nextest run             # default unit + property + wiremock tests (no network)
+cargo nextest run             # default unit + property + wiremock tests (no network; HTTP_PROXY is ignored)
 cargo clippy --all-targets    # strict lints; deny set listed in Cargo.toml
 cargo fmt                     # rustfmt
 ```
