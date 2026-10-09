@@ -41,7 +41,8 @@
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
 use crate::response::{
-    BulkIngestJob, BulkJobStateChange, BulkOperation, BulkQueryJob, BulkQueryResults,
+    BulkIngestJob, BulkJobList, BulkJobStateChange, BulkJobType, BulkOperation, BulkQueryJob,
+    BulkQueryResults, BulkResultPages,
 };
 use serde::Serialize;
 
@@ -178,8 +179,9 @@ impl BulkIngestHandler<'_> {
     ///
     /// A lost response or a 5xx is never replayed: a second attempt
     /// would create a second job holding the same rows. After an
-    /// ambiguous failure, look the job up before resubmitting the data;
-    /// a job this request did create is already processing.
+    /// ambiguous failure, [`list`](Self::list) the org's jobs before
+    /// resubmitting the data; a job this request did create is already
+    /// processing.
     ///
     /// Calls `POST /services/data/{api_version}/jobs/ingest` with
     /// `Content-Type: multipart/form-data`.
@@ -311,6 +313,26 @@ impl BulkIngestHandler<'_> {
             .await
     }
 
+    /// Lists the org's ingest jobs, one page of up to 1,000 at a time.
+    ///
+    /// The listing covers every Bulk API ingest job, not only this
+    /// client's: a loader that crashed between [`create`](Self::create)
+    /// and [`close`](Self::close) can find its `Open` jobs here and
+    /// [`abort`](Self::abort) or [`delete`](Self::delete) them instead
+    /// of leaving them to Salesforce's seven-day cleanup. Narrow it with
+    /// [`BulkJobListOptions::job_type`], and page with
+    /// [`BulkJobList::next_locator`] until
+    /// [`BulkJobList::done`].
+    ///
+    /// Calls `GET /services/data/{api_version}/jobs/ingest` with the
+    /// optional `jobType`, `isPkChunkingEnabled` and `queryLocator`
+    /// parameters.
+    ///
+    /// [Get Information About All Ingest Jobs](https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html)
+    pub async fn list(&self, options: &BulkJobListOptions) -> CirrusResult<BulkJobList> {
+        list_jobs(self.client, "jobs/ingest", options).await
+    }
+
     /// Returns CSV bytes for records that succeeded. Each row carries
     /// the original input fields plus `sf__Id` (Salesforce ID of the
     /// affected record) and `sf__Created` (`true` if the record was
@@ -372,10 +394,14 @@ impl BulkIngestHandler<'_> {
 ///    `Failed`, or `Aborted`.
 /// 3. Drain results via [`results`](Self::results), passing
 ///    [`BulkQueryResults::locator`] back as the cursor on subsequent
-///    calls until it returns `None`. Fetch them through a client on
-///    the same API version that created the job; Salesforce answers
-///    409 otherwise.
+///    calls until it returns `None`; or, on API 58.0 and later, take
+///    the cursors from [`result_pages`](Self::result_pages) and fetch
+///    several pages at once. Fetch them through a client on the same
+///    API version that created the job; Salesforce answers 409
+///    otherwise.
 /// 4. [`delete`](Self::delete) when done.
+///
+/// [`list`](Self::list) finds the org's existing query jobs.
 #[derive(Debug)]
 pub struct BulkQueryHandler<'a> {
     client: &'a Cirrus,
@@ -497,6 +523,69 @@ impl BulkQueryHandler<'_> {
         self.client
             .send_at::<(), (), ()>(reqwest::Method::DELETE, &path, None, None)
             .await
+    }
+
+    /// Lists the org's query jobs, one page of up to 1,000 at a time.
+    ///
+    /// The listing covers every Bulk API job, Bulk API 1.0 included, so
+    /// narrow it with [`BulkJobListOptions::job_type`] when only 2.0
+    /// query jobs matter. Page with [`BulkJobList::next_locator`] until
+    /// [`BulkJobList::done`].
+    ///
+    /// Calls `GET /services/data/{api_version}/jobs/query` with the
+    /// optional `jobType`, `isPkChunkingEnabled` and `queryLocator`
+    /// parameters. Available in API version 47.0 and later.
+    ///
+    /// [Get Information About All Query Jobs](https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-all-jobs.html)
+    pub async fn list(&self, options: &BulkJobListOptions) -> CirrusResult<BulkJobList> {
+        list_jobs(self.client, "jobs/query", options).await
+    }
+
+    /// Returns up to five result links for a `JobComplete` query job,
+    /// each a cursor that [`results`](Self::results) can fetch, so the
+    /// pages can be downloaded concurrently instead of one locator at a
+    /// time.
+    ///
+    /// `locator` is the cursor from a previous
+    /// [`BulkResultPages::next_locator`]; pass `None` for the first set
+    /// and keep going until [`BulkResultPages::done`]. Like
+    /// [`results`](Self::results), the request has to go out at the API
+    /// version the job was created with, or Salesforce answers 409.
+    ///
+    /// Calls `GET /services/data/{api_version}/jobs/query/{job_id}/resultPages`
+    /// with an optional `locator` parameter. Available in API version
+    /// 58.0 and later.
+    ///
+    /// [Get Parallel Results for a Query Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-parallel-job-results.html)
+    pub async fn result_pages(
+        &self,
+        job_id: &str,
+        locator: Option<&str>,
+    ) -> CirrusResult<BulkResultPages> {
+        let path = self
+            .client
+            .versioned_url(&["jobs", "query", job_id, "resultPages"])?;
+        let query: Vec<(&str, &str)> = locator.map(|l| vec![("locator", l)]).unwrap_or_default();
+        let pages: BulkResultPages = self.client.get_with_query(&path, &query).await?;
+        if pages
+            .result_pages
+            .iter()
+            .any(|page| page.locator().is_none())
+        {
+            return Err(CirrusError::InvalidResponse(
+                "a resultPages entry carries no `locator` in its resultUrl, so its page \
+                 cannot be fetched"
+                    .into(),
+            ));
+        }
+        if !pages.done && pages.next_locator().is_none() {
+            return Err(CirrusError::InvalidResponse(
+                "resultPages reports more sets of links (done is false) but carries no \
+                 nextRecordsUrl with a `locator` to fetch them"
+                    .into(),
+            ));
+        }
+        Ok(pages)
     }
 }
 
@@ -721,6 +810,101 @@ fn check_ingest_spec(spec: &BulkIngestSpec) -> CirrusResult<()> {
     }
 }
 
+/// Filters for [`BulkIngestHandler::list`] and [`BulkQueryHandler::list`].
+///
+/// The struct is `#[non_exhaustive]` so a filter Salesforce adds later
+/// stays an additive change; build it with [`new`](Self::new) and the
+/// setters. An empty set of options lists every job.
+///
+/// ```
+/// use cirrus::{BulkJobListOptions, BulkJobType};
+///
+/// let only_v2_ingest = BulkJobListOptions::new().job_type(BulkJobType::V2Ingest);
+/// assert_eq!(only_v2_ingest.job_type, Some(BulkJobType::V2Ingest));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BulkJobListOptions {
+    /// Only jobs of this kind (`jobType`). The ingest listing documents
+    /// `BigObjectIngest`, `Classic` and `V2Ingest`; the query listing
+    /// `Classic`, `V2Query` and `V2Ingest`.
+    /// [`Unknown`](BulkJobType::Unknown) is refused before any request.
+    pub job_type: Option<BulkJobType>,
+    /// Only jobs with PK chunking enabled (`isPkChunkingEnabled`), which
+    /// applies to Bulk API 1.0 jobs.
+    pub pk_chunking_enabled: Option<bool>,
+    /// Continue a listing from this page (`queryLocator`). Use the value
+    /// of [`BulkJobList::next_locator`] from the previous page; Salesforce
+    /// documents it as opaque.
+    pub query_locator: Option<String>,
+}
+
+impl BulkJobListOptions {
+    /// No filters: every job, from the first page.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the job kind filter — see [`job_type`](Self::job_type).
+    pub fn job_type(mut self, job_type: BulkJobType) -> Self {
+        self.job_type = Some(job_type);
+        self
+    }
+
+    /// Sets the PK chunking filter — see
+    /// [`pk_chunking_enabled`](Self::pk_chunking_enabled).
+    pub fn pk_chunking_enabled(mut self, enabled: bool) -> Self {
+        self.pk_chunking_enabled = Some(enabled);
+        self
+    }
+
+    /// Continues the listing from a page — see
+    /// [`query_locator`](Self::query_locator).
+    pub fn query_locator(mut self, locator: impl Into<String>) -> Self {
+        self.query_locator = Some(locator.into());
+        self
+    }
+}
+
+/// The two job listings share one request shape and one envelope; only
+/// the path differs. A page that says more follow but offers no locator
+/// to fetch them is an error rather than a quiet end, since the caller's
+/// loop would otherwise finish believing it saw every job.
+async fn list_jobs(
+    client: &Cirrus,
+    path: &str,
+    options: &BulkJobListOptions,
+) -> CirrusResult<BulkJobList> {
+    if options.job_type == Some(BulkJobType::Unknown) {
+        return Err(CirrusError::InvalidInput {
+            field: "job_type",
+            message: "`Unknown` stands for a job type this SDK doesn't name and is not a \
+                      filter value; the documented filters are BigObjectIngest, Classic, \
+                      V2Ingest and V2Query"
+                .into(),
+        });
+    }
+    let mut query: Vec<(&str, String)> = Vec::with_capacity(3);
+    if let Some(job_type) = options.job_type {
+        query.push(("jobType", job_type.as_str().to_owned()));
+    }
+    if let Some(enabled) = options.pk_chunking_enabled {
+        query.push(("isPkChunkingEnabled", enabled.to_string()));
+    }
+    if let Some(locator) = &options.query_locator {
+        query.push(("queryLocator", locator.clone()));
+    }
+    let page: BulkJobList = client.get_with_query(path, &query).await?;
+    if !page.done && page.next_locator().is_none() {
+        return Err(CirrusError::InvalidResponse(
+            "the job listing reports more pages (done is false) but carries no \
+             nextRecordsUrl with a `queryLocator` to fetch them"
+                .into(),
+        ));
+    }
+    Ok(page)
+}
+
 #[derive(Serialize)]
 struct StatePatch<'a> {
     state: &'a str,
@@ -738,10 +922,12 @@ fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Str
 mod tests {
     use super::*;
     use crate::auth::StaticTokenAuth;
-    use crate::response::{BulkColumnDelimiter, BulkJobState, BulkLineEnding};
+    use crate::response::{BulkColumnDelimiter, BulkJobState, BulkJobType, BulkLineEnding};
     use serde_json::json;
     use std::sync::Arc;
-    use wiremock::matchers::{body_bytes, body_json, header, method, path, query_param};
+    use wiremock::matchers::{
+        body_bytes, body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fixture(uri: String) -> Cirrus {
@@ -1804,5 +1990,444 @@ mod tests {
             other => panic!("expected Api 502, got {other:?}"),
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    fn query_job_listing_page() -> serde_json::Value {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-all-jobs.html
+        // "Response Body" example, verbatim apart from the elided third
+        // record. Note the `nextRecordsUrl` names `/jobs/ingest` even on
+        // the query listing; only its `queryLocator` is trusted.
+        json!({
+            "done": false,
+            "records": [
+                {
+                    "id": "750R0000000zhfdIAA",
+                    "operation": "query",
+                    "object": "Account",
+                    "createdById": "005R0000000GiwjIAC",
+                    "createdDate": "2018-12-07T19:58:09.000+0000",
+                    "systemModstamp": "2018-12-07T19:59:14.000+0000",
+                    "state": "JobComplete",
+                    "concurrencyMode": "Parallel",
+                    "contentType": "CSV",
+                    "apiVersion": 68.0,
+                    "jobType": "V2Query",
+                    "lineEnding": "LF",
+                    "columnDelimiter": "COMMA"
+                },
+                {
+                    "id": "750R0000000zhjzIAA",
+                    "operation": "query",
+                    "object": "Account",
+                    "createdById": "005R0000000GiwjIAC",
+                    "createdDate": "2018-12-07T20:52:28.000+0000",
+                    "systemModstamp": "2018-12-07T20:53:15.000+0000",
+                    "state": "JobComplete",
+                    "concurrencyMode": "Parallel",
+                    "contentType": "CSV",
+                    "apiVersion": 68.0,
+                    "jobType": "V2Query",
+                    "lineEnding": "LF",
+                    "columnDelimiter": "COMMA"
+                }
+            ],
+            "nextRecordsUrl": "/services/data/v68.0/jobs/ingest?queryLocator=01gR0000000opRTIAY-2000"
+        })
+    }
+
+    #[tokio::test]
+    async fn ingest_list_sends_no_filters_by_default_and_parses_the_documented_envelope() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html
+        // `GET /jobs/ingest` answers `{done, records: JobInfo[], nextRecordsUrl}`;
+        // a JobInfo in `Open` state carries `contentUrl`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .and(query_param_is_missing("jobType"))
+            .and(query_param_is_missing("isPkChunkingEnabled"))
+            .and(query_param_is_missing("queryLocator"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true,
+                "records": [{
+                    "id": "750xx",
+                    "operation": "insert",
+                    "object": "Account",
+                    "createdById": "005xx",
+                    "createdDate": "2024-01-01T00:00:00.000+0000",
+                    "systemModstamp": "2024-01-01T00:00:00.000+0000",
+                    "state": "Open",
+                    "concurrencyMode": "Parallel",
+                    "contentType": "CSV",
+                    "apiVersion": 66.0,
+                    "jobType": "V2Ingest",
+                    "contentUrl": "services/data/v66.0/jobs/ingest/750xx/batches",
+                    "lineEnding": "LF",
+                    "columnDelimiter": "COMMA"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let page = sf
+            .bulk()
+            .ingest()
+            .list(&BulkJobListOptions::new())
+            .await
+            .unwrap();
+        assert!(page.done);
+        assert_eq!(page.next_records_url, None);
+        assert_eq!(page.next_locator(), None);
+        assert_eq!(page.records.len(), 1);
+        let job = &page.records[0];
+        assert_eq!(job.id, "750xx");
+        assert_eq!(job.operation, BulkOperation::Insert);
+        assert_eq!(job.object, "Account");
+        assert_eq!(job.state, BulkJobState::Open);
+        assert_eq!(job.job_type, Some(BulkJobType::V2Ingest));
+        assert_eq!(job.api_version, 66.0);
+        assert_eq!(
+            job.content_url.as_deref(),
+            Some("services/data/v66.0/jobs/ingest/750xx/batches")
+        );
+        assert_eq!(job.line_ending, Some(BulkLineEnding::LF));
+        assert_eq!(job.column_delimiter, Some(BulkColumnDelimiter::Comma));
+    }
+
+    #[tokio::test]
+    async fn ingest_list_sends_the_documented_filters() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html
+        // Parameters `isPkChunkingEnabled`, `jobType` and `queryLocator`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .and(query_param("jobType", "V2Ingest"))
+            .and(query_param("isPkChunkingEnabled", "true"))
+            .and(query_param("queryLocator", "01gR0000000opRTIAY-2000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"done": true, "records": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let options = BulkJobListOptions::new()
+            .job_type(BulkJobType::V2Ingest)
+            .pk_chunking_enabled(true)
+            .query_locator("01gR0000000opRTIAY-2000");
+        let page = sf.bulk().ingest().list(&options).await.unwrap();
+        assert!(page.done);
+        assert!(page.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_list_parses_the_documented_page_and_exposes_the_next_locator() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-all-jobs.html
+        // The example's `nextRecordsUrl` points at `/jobs/ingest`, while
+        // the page's own follow-up request goes to
+        // `/jobs/query?queryLocator=...`: the locator is what carries
+        // over, never the path.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query"))
+            .and(query_param_is_missing("queryLocator"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(query_job_listing_page()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query"))
+            .and(query_param("queryLocator", "01gR0000000opRTIAY-2000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"done": true, "records": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let first = sf
+            .bulk()
+            .query()
+            .list(&BulkJobListOptions::new())
+            .await
+            .unwrap();
+        assert!(!first.done);
+        assert_eq!(first.records.len(), 2);
+        assert_eq!(first.records[0].id, "750R0000000zhfdIAA");
+        assert_eq!(first.records[0].operation, BulkOperation::Query);
+        assert_eq!(first.records[0].job_type, Some(BulkJobType::V2Query));
+        assert_eq!(first.records[0].state, BulkJobState::JobComplete);
+        assert_eq!(
+            first.next_records_url.as_deref(),
+            Some("/services/data/v68.0/jobs/ingest?queryLocator=01gR0000000opRTIAY-2000")
+        );
+        let locator = first.next_locator().unwrap();
+        assert_eq!(locator, "01gR0000000opRTIAY-2000");
+
+        let last = sf
+            .bulk()
+            .query()
+            .list(&BulkJobListOptions::new().query_locator(locator))
+            .await
+            .unwrap();
+        assert!(last.done);
+    }
+
+    #[tokio::test]
+    async fn list_keeps_classic_jobs_readable() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-all-jobs.html
+        // "The information includes Bulk API 2.0 query jobs and all Bulk
+        // API jobs." A Bulk API 1.0 job carries values outside the 2.0
+        // enums: state `Closed` and content type `ZIP_CSV` per
+        // https://developer.salesforce.com/docs/platform/api-asynch/guide/asynch-api-reference-jobinfo.html,
+        // where `apiVersion` is typed as a string, and no CSV formatting
+        // fields. One such job must not fail the whole listing.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": true,
+                "records": [{
+                    "id": "750xx",
+                    "operation": "query",
+                    "object": "Account",
+                    "createdById": "005xx",
+                    "createdDate": "2024-01-01T00:00:00.000+0000",
+                    "systemModstamp": "2024-01-01T00:00:00.000+0000",
+                    "state": "Closed",
+                    "concurrencyMode": "Parallel",
+                    "contentType": "ZIP_CSV",
+                    "apiVersion": "66.0",
+                    "jobType": "Classic"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let page = sf
+            .bulk()
+            .query()
+            .list(&BulkJobListOptions::new())
+            .await
+            .unwrap();
+        let job = &page.records[0];
+        assert_eq!(job.state, BulkJobState::Unknown);
+        assert!(!job.state.is_terminal());
+        assert_eq!(job.job_type, Some(BulkJobType::Classic));
+        assert_eq!(job.content_type, "ZIP_CSV");
+        assert_eq!(job.api_version, 66.0);
+        assert_eq!(job.line_ending, None);
+        assert_eq!(job.column_delimiter, None);
+    }
+
+    #[tokio::test]
+    async fn list_with_more_pages_but_no_usable_locator_is_an_invalid_response() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html
+        // `done` false means "use the nextRecordsUrl value to retrieve
+        // the next group of jobs". Without a locator to do that, the
+        // listing would end silently short, so it is an error instead.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .and(query_param("jobType", "V2Ingest"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"done": false, "records": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .and(query_param("jobType", "Classic"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "done": false,
+                "records": [],
+                "nextRecordsUrl": "/services/data/v66.0/jobs/ingest?page=2"
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        for job_type in [BulkJobType::V2Ingest, BulkJobType::Classic] {
+            let err = sf
+                .bulk()
+                .ingest()
+                .list(&BulkJobListOptions::new().job_type(job_type))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::InvalidResponse(_)),
+                "{job_type:?}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_rejects_the_unknown_job_type_filter_without_a_request() {
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+        let options = BulkJobListOptions::new().job_type(BulkJobType::Unknown);
+        for result in [
+            sf.bulk().ingest().list(&options).await,
+            sf.bulk().query().list(&options).await,
+        ] {
+            match result.unwrap_err() {
+                crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "job_type"),
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_result_pages_parses_the_documented_response_and_follows_its_locator() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-parallel-job-results.html
+        // "Example Response Body", verbatim. The follow-up goes to the
+        // same resource with the `locator` the response's
+        // `nextRecordsUrl` carries.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/jobs/query/750R0000000zxr8IAA/resultPages",
+            ))
+            .and(query_param_is_missing("locator"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultPages": [
+                    {"resultUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=aBcDeFg4N"},
+                    {"resultUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=HiJkLmN4N"},
+                    {"resultUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=oPQrStU4N"},
+                    {"resultUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=vWxYzz4N"},
+                    {"resultUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=NiKmABC4N"}
+                ],
+                "nextRecordsUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/resultpages?locator=YcApWm4N",
+                "done": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/jobs/query/750R0000000zxr8IAA/resultPages",
+            ))
+            .and(query_param("locator", "YcApWm4N"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultPages": [
+                    {"resultUrl": "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=LaStPaGe"}
+                ],
+                "done": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let first = sf
+            .bulk()
+            .query()
+            .result_pages("750R0000000zxr8IAA", None)
+            .await
+            .unwrap();
+        assert!(!first.done);
+        assert_eq!(first.result_pages.len(), 5);
+        assert_eq!(
+            first.result_pages[0].result_url,
+            "/services/data/vXX.X/jobs/query/750R0000000zxr8IAA/results?locator=aBcDeFg4N"
+        );
+        let locators: Vec<String> = first
+            .result_pages
+            .iter()
+            .map(|page| page.locator().unwrap())
+            .collect();
+        assert_eq!(
+            locators,
+            [
+                "aBcDeFg4N",
+                "HiJkLmN4N",
+                "oPQrStU4N",
+                "vWxYzz4N",
+                "NiKmABC4N"
+            ]
+        );
+        let next = first.next_locator().unwrap();
+        assert_eq!(next, "YcApWm4N");
+
+        let last = sf
+            .bulk()
+            .query()
+            .result_pages("750R0000000zxr8IAA", Some(&next))
+            .await
+            .unwrap();
+        assert!(last.done);
+        assert_eq!(last.next_records_url, None);
+        assert_eq!(last.next_locator(), None);
+        assert_eq!(last.result_pages[0].locator().unwrap(), "LaStPaGe");
+    }
+
+    #[tokio::test]
+    async fn query_result_pages_accepts_the_table_spelling_of_the_next_url() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-parallel-job-results.html
+        // The element table spells it `nextRecordUrl`; the example
+        // response spells it `nextRecordsUrl`. Both are read.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/750xx/resultPages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultPages": [
+                    {"resultUrl": "/services/data/v66.0/jobs/query/750xx/results?locator=aBcDeFg4N"}
+                ],
+                "nextRecordUrl": "/services/data/v66.0/jobs/query/750xx/resultpages?locator=YcApWm4N",
+                "done": false
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let pages = sf.bulk().query().result_pages("750xx", None).await.unwrap();
+        assert_eq!(pages.next_locator().as_deref(), Some("YcApWm4N"));
+    }
+
+    #[tokio::test]
+    async fn query_result_pages_without_usable_locators_is_an_invalid_response() {
+        // A page URL without a `locator` cannot be fetched, and a
+        // `done: false` response without a next locator would end the
+        // listing short, so both are errors rather than silent gaps.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/no-next/resultPages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultPages": [
+                    {"resultUrl": "/services/data/v66.0/jobs/query/no-next/results?locator=aBcDeFg4N"}
+                ],
+                "done": false
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/no-page/resultPages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resultPages": [
+                    {"resultUrl": "/services/data/v66.0/jobs/query/no-page/results"}
+                ],
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        for job_id in ["no-next", "no-page"] {
+            let err = sf
+                .bulk()
+                .query()
+                .result_pages(job_id, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::InvalidResponse(_)),
+                "{job_id}: {err:?}"
+            );
+        }
     }
 }
