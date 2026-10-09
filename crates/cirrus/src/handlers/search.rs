@@ -334,4 +334,37 @@ mod tests {
             other => panic!("expected Api error, got {other:?}"),
         }
     }
+
+    /// A `+`, `&`, `%` or `#` inside the SOSL has to be percent-encoded
+    /// in `q` or it is read as query-string syntax. wiremock form-decodes
+    /// the value it matches, so an unencoded one fails the match; the raw
+    /// query string pins the encoding itself.
+    #[tokio::test]
+    async fn search_percent_encodes_reserved_characters_in_q() {
+        const SOSL: &str = r"FIND {\+1 555 \& 100\%#} RETURNING Contact(Id)";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/search"))
+            .and(query_param("q", SOSL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "searchRecords": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.search(SOSL).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let raw = requests[0].url.query().unwrap();
+        assert!(
+            raw.contains("%5C%2B1"),
+            "`\\` and `+` must be encoded: {raw}"
+        );
+        assert!(
+            raw.contains("%5C%26+100%5C%25%23"),
+            "`&`, `%` and `#` must be encoded: {raw}"
+        );
+    }
 }

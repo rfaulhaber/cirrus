@@ -930,4 +930,35 @@ mod tests {
             other => panic!("expected Api error, got {other:?}"),
         }
     }
+
+    /// The Tooling query sends `q` through the same encoder as the data
+    /// query: a `+`, `&`, `%` or `#` in the statement is percent-encoded
+    /// rather than read as query-string syntax.
+    #[tokio::test]
+    async fn tooling_query_percent_encodes_reserved_characters_in_q() {
+        const SOQL: &str = "SELECT Id FROM ApexClass WHERE Name = 'A&B' AND Body LIKE '%+1#%'";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/tooling/query"))
+            .and(query_param("q", SOQL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 0,
+                "done": true,
+                "records": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.tooling().query(SOQL).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let raw = requests[0].url.query().unwrap();
+        assert!(raw.contains("A%26B"), "`&` must be encoded: {raw}");
+        assert!(
+            raw.contains("%25%2B1%23%25"),
+            "`%`, `+` and `#` must be encoded: {raw}"
+        );
+    }
 }

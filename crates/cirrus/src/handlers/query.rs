@@ -359,7 +359,10 @@ mod tests {
         let server = MockServer::start().await;
 
         // Locator carries v66.0 — this is what `nextRecordsUrl` returns
-        // after a v66.0 query, regardless of the client's configured version.
+        // after a v66.0 query. The client is built for v61.0 to pin that
+        // the locator is followed as issued rather than rebuilt from the
+        // client's version: the cursor belongs to the query that opened
+        // it.
         Mock::given(method("GET"))
             .and(path("/services/data/v66.0/query/01gD0000002HU6KIAW-2000"))
             .and(header("authorization", "Bearer tok"))
@@ -370,10 +373,22 @@ mod tests {
                     {"attributes": {"type": "Account"}, "Id": "001yy"}
                 ]
             })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v61.0/query/01gD0000002HU6KIAW-2000"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
             .mount(&server)
             .await;
 
-        let sf = fixture(server.uri());
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v61.0")
+            .build()
+            .unwrap();
         let qr = sf
             .query_more("/services/data/v66.0/query/01gD0000002HU6KIAW-2000")
             .await
@@ -576,6 +591,51 @@ mod tests {
                 assert_eq!(errors[0].error_code, "MALFORMED_QUERY");
             }
             other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    /// Characters that mean something in a query string have to be
+    /// percent-encoded inside `q`: a literal `+` arrives as a space, a
+    /// literal `&` splits the parameter, a literal `#` ends the URI.
+    /// wiremock form-decodes the value it matches, so a statement sent
+    /// with any of them unencoded fails the match; the raw query string
+    /// pins the encoding itself.
+    #[tokio::test]
+    async fn query_and_query_all_percent_encode_reserved_characters_in_q() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-query.html
+        // "To create a valid URI, replace spaces in the query string with
+        // a plus sign + or with %20" — so a `+` in the statement itself
+        // cannot travel as a `+`.
+        const SOQL: &str = "SELECT Id FROM Contact WHERE Phone = '+1 555' AND Name LIKE 'A&B%#'";
+        let server = MockServer::start().await;
+        for resource in ["query", "queryAll"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/services/data/v66.0/{resource}")))
+                .and(query_param("q", SOQL))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "totalSize": 0,
+                    "done": true,
+                    "records": []
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let sf = fixture(server.uri());
+        sf.query(SOQL).await.unwrap();
+        sf.query_all(SOQL).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let raw = request.url.query().unwrap();
+            assert!(raw.contains("%2B1"), "`+` must be encoded: {raw}");
+            assert!(
+                raw.contains("A%26B%25%23"),
+                "`&`, `%` and `#` must be encoded: {raw}"
+            );
+            assert!(!raw.contains("&B"), "{raw}");
         }
     }
 }
