@@ -122,7 +122,7 @@ impl SObjectsHandler<'_> {
         &self,
         since: SystemTime,
     ) -> CirrusResult<Option<DescribeGlobal>> {
-        let date = http_date(since)?;
+        let date = http_date("If-Modified-Since", since)?;
         self.client.get_if_modified_since("sobjects", &date).await
     }
 }
@@ -209,7 +209,7 @@ impl<'a> SObjectHandler<'a> {
         let url = self
             .client
             .versioned_url(&["sobjects", self.name, "describe"])?;
-        let date = http_date(since)?;
+        let date = http_date("If-Modified-Since", since)?;
         self.client.get_if_modified_since(&url, &date).await
     }
 
@@ -227,6 +227,48 @@ impl<'a> SObjectHandler<'a> {
         self.client
             .send_at(reqwest::Method::GET, &url, None::<&()>, None::<&()>)
             .await
+    }
+
+    /// Conditional record retrieve — returns `Some(record)` if the record
+    /// changed since `since`, or `None` on `304 Not Modified`.
+    ///
+    /// Calls `GET /services/data/{api_version}/sobjects/{name}/{id}` with an
+    /// `If-Modified-Since` header. The [Conditional Request Headers] page
+    /// lists sObject Rows among the resources that support both
+    /// `If-Modified-Since` and `If-Unmodified-Since`. Same caching
+    /// workflow as [`describe_if_modified_since`](Self::describe_if_modified_since):
+    /// pass the timestamp of your last fetch; Salesforce returns 304 (and
+    /// you can keep your cached record) when nothing has changed since.
+    ///
+    /// `since` is sent as an RFC 7231 IMF-fixdate in GMT, a form of the
+    /// `EEE, dd MMM yyyy HH:mm:ss z` pattern the resource pages give. A
+    /// time that format can't express — before the Unix epoch, or in year
+    /// 9999 or later — returns [`CirrusError::InvalidHeader`] without a
+    /// request.
+    ///
+    /// The `If-Match` and `If-None-Match` ETag headers are documented for
+    /// Account records only and are not wrapped; send them with
+    /// [`Cirrus::send_with_headers`].
+    ///
+    /// [Conditional Request Headers]: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
+    pub async fn retrieve_if_modified_since(
+        &self,
+        id: &str,
+        since: SystemTime,
+    ) -> CirrusResult<Option<Value>> {
+        self.retrieve_if_modified_since_as(id, since).await
+    }
+
+    /// Typed variant of
+    /// [`retrieve_if_modified_since`](Self::retrieve_if_modified_since).
+    pub async fn retrieve_if_modified_since_as<R: DeserializeOwned>(
+        &self,
+        id: &str,
+        since: SystemTime,
+    ) -> CirrusResult<Option<R>> {
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
+        let date = http_date("If-Modified-Since", since)?;
+        self.client.get_if_modified_since(&url, &date).await
     }
 
     /// Retrieves selected fields of a record by ID.
@@ -288,6 +330,78 @@ impl<'a> SObjectHandler<'a> {
         let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         self.client
             .send_at::<(), (), B>(reqwest::Method::PATCH, &url, None, Some(body))
+            .await
+    }
+
+    /// Updates a record by ID only if it hasn't changed since `since`.
+    ///
+    /// The same request as [`update`](Self::update) with an
+    /// `If-Unmodified-Since` header. Per the [Conditional Request
+    /// Headers] page, "REST API processes the request only if the data
+    /// hasn't changed since the specified date. Otherwise, a 412
+    /// Precondition Failed status code is returned, and the request isn't
+    /// processed." That 412 is the signal that the write did not happen,
+    /// and it surfaces as [`CirrusError::Api`] with `status: 412`; re-read
+    /// the record and decide whether to apply the change again.
+    ///
+    /// `since` is sent as in
+    /// [`retrieve_if_modified_since`](Self::retrieve_if_modified_since),
+    /// including the [`CirrusError::InvalidHeader`] for a time the format
+    /// can't express.
+    ///
+    /// The `If-Match` and `If-None-Match` ETag headers are documented for
+    /// Account records only and are not wrapped; send them with
+    /// [`Cirrus::send_with_headers`].
+    ///
+    /// [Conditional Request Headers]: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, CirrusError, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::json;
+    /// use std::time::SystemTime;
+    ///
+    /// # async fn example() -> Result<(), CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// # let last_read = SystemTime::now();
+    /// let outcome = sf
+    ///     .sobject("Account")
+    ///     .update_if_unmodified_since(
+    ///         "001D000000INjVe",
+    ///         &json!({"Industry": "Biotech"}),
+    ///         last_read,
+    ///     )
+    ///     .await;
+    /// match outcome {
+    ///     Ok(()) => println!("updated"),
+    ///     Err(CirrusError::Api { status: 412, .. }) => println!("changed since last read"),
+    ///     Err(other) => return Err(other),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update_if_unmodified_since<B>(
+        &self,
+        id: &str,
+        body: &B,
+        since: SystemTime,
+    ) -> CirrusResult<()>
+    where
+        B: Serialize + ?Sized,
+    {
+        let url = self.client.versioned_url(&["sobjects", self.name, id])?;
+        let date = http_date("If-Unmodified-Since", since)?;
+        self.client
+            .send_with_headers::<(), B>(
+                reqwest::Method::PATCH,
+                &url,
+                None,
+                &[("If-Unmodified-Since", date.as_str())],
+                Some(body),
+            )
             .await
     }
 
@@ -641,30 +755,30 @@ impl<'a> SObjectHandler<'a> {
     }
 }
 
-/// Formats a [`SystemTime`] as an RFC 7231 IMF-fixdate for
-/// `If-Modified-Since`.
+/// Formats a [`SystemTime`] as an RFC 7231 IMF-fixdate for the named
+/// conditional-request header.
 ///
 /// `httpdate::fmt_http_date` is partial: it panics for times before the
 /// Unix epoch and for year 9999 onwards. Both bounds are checked here so
 /// a caller-supplied watermark — a stored sentinel, a clock skewed
 /// backwards — surfaces as an error instead of unwinding the calling
 /// task.
-fn http_date(since: SystemTime) -> CirrusResult<String> {
+fn http_date(header: &str, since: SystemTime) -> CirrusResult<String> {
     // httpdate's own ceiling, in seconds since the epoch: 9999-01-01.
     const YEAR_9999: u64 = 253_402_300_800;
 
     let secs = since
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| {
-            CirrusError::InvalidHeader(
-                "If-Modified-Since requires a time at or after the Unix epoch".into(),
-            )
+            CirrusError::InvalidHeader(format!(
+                "{header} requires a time at or after the Unix epoch"
+            ))
         })?
         .as_secs();
     if secs >= YEAR_9999 {
-        return Err(CirrusError::InvalidHeader(
-            "If-Modified-Since requires a time before year 9999".into(),
-        ));
+        return Err(CirrusError::InvalidHeader(format!(
+            "{header} requires a time before year 9999"
+        )));
     }
     Ok(httpdate::fmt_http_date(since))
 }
@@ -1594,14 +1708,17 @@ mod tests {
         fn http_date_formats_a_representable_time() {
             // RFC 7231 IMF-fixdate example: 1994-11-06T08:49:37Z.
             let t = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777);
-            assert_eq!(http_date(t).unwrap(), "Sun, 06 Nov 1994 08:49:37 GMT");
+            assert_eq!(
+                http_date("If-Modified-Since", t).unwrap(),
+                "Sun, 06 Nov 1994 08:49:37 GMT"
+            );
         }
 
         #[test]
         fn http_date_rejects_times_before_the_epoch() {
             let t = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
             assert!(matches!(
-                http_date(t),
+                http_date("If-Modified-Since", t),
                 Err(crate::CirrusError::InvalidHeader(_))
             ));
         }
@@ -1610,7 +1727,7 @@ mod tests {
         fn http_date_rejects_year_9999_and_later() {
             let t = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800);
             assert!(matches!(
-                http_date(t),
+                http_date("If-Modified-Since", t),
                 Err(crate::CirrusError::InvalidHeader(_))
             ));
         }
@@ -1643,6 +1760,181 @@ mod tests {
                 matches!(err, crate::CirrusError::InvalidHeader(_)),
                 "{err:?}"
             );
+
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        /// 1994-11-06T08:49:37Z, the RFC 7231 IMF-fixdate example.
+        fn fixed_time() -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777)
+        }
+
+        // wiremock's `header` matcher splits a value on commas, which an
+        // IMF-fixdate contains, so the exact value is pinned with an
+        // anchored regex instead.
+        const FIXED_HTTP_DATE: &str = r"^Sun, 06 Nov 1994 08:49:37 GMT$";
+
+        #[tokio::test]
+        async fn retrieve_if_modified_since_returns_the_record_on_200() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-get-field-values.html
+            // The sObject Rows response body from the page's example,
+            // without the trailing comma its listing prints.
+            //
+            // Wire-shape provenance: no page prints a conditional GET of a
+            // record. The header contract is the parameter table on
+            // https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-retrieve-get.html
+            // ("The request returns records that have been modified after
+            // that date and time"), and the body is the unconditional one.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/Account/001D000000INjVe",
+                ))
+                .and(header_regex("if-modified-since", FIXED_HTTP_DATE))
+                .and(header("authorization", "Bearer tok"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "AccountNumber": "CD656092",
+                    "BillingPostalCode": "27215"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let record = sf
+                .sobject("Account")
+                .retrieve_if_modified_since("001D000000INjVe", fixed_time())
+                .await
+                .unwrap()
+                .expect("expected Some(record) on 200");
+            assert_eq!(record["AccountNumber"], "CD656092");
+            assert_eq!(record["BillingPostalCode"], "27215");
+        }
+
+        #[tokio::test]
+        async fn retrieve_if_modified_since_returns_none_on_304() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
+            // "The request is processed only if the data has changed since
+            // the date and time specified in the header. Otherwise, a 304
+            // Not Modified status code is returned, and the request isn't
+            // processed." The only printed 304 example, on
+            // https://developer.salesforce.com/docs/platform/api-rest/guide/sobject-describe-with-ifmodified-header.html,
+            // has no response body.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/Account/001D000000INjVe",
+                ))
+                .and(header_regex("if-modified-since", FIXED_HTTP_DATE))
+                .respond_with(ResponseTemplate::new(304))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let record = sf
+                .sobject("Account")
+                .retrieve_if_modified_since_as::<serde_json::Value>("001D000000INjVe", fixed_time())
+                .await
+                .unwrap();
+            assert!(record.is_none(), "expected None on 304");
+        }
+
+        #[tokio::test]
+        async fn update_if_unmodified_since_sends_the_header_and_body() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-retrieve-patch.html
+            // The sObject Rows PATCH resource lists `If-Unmodified-Since`
+            // as an optional header, and the update itself answers 204
+            // with no body.
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/Account/001D000000INjVe",
+                ))
+                .and(header_regex("if-unmodified-since", FIXED_HTTP_DATE))
+                .and(body_json(json!({"Industry": "Biotech"})))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            sf.sobject("Account")
+                .update_if_unmodified_since(
+                    "001D000000INjVe",
+                    &json!({"Industry": "Biotech"}),
+                    fixed_time(),
+                )
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn update_if_unmodified_since_surfaces_412_when_the_record_changed() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
+            // "If you make a request and include the If-Unmodified-Since
+            // header, REST API processes the request only if the data
+            // hasn't changed since the specified date. Otherwise, a 412
+            // Precondition Failed status code is returned, and the
+            // request isn't processed."
+            //
+            // Wire-shape provenance: the page documents the status but
+            // prints no 412 body, so the mock answers with an empty one.
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/Account/001D000000INjVe",
+                ))
+                .respond_with(ResponseTemplate::new(412))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let err = sf
+                .sobject("Account")
+                .update_if_unmodified_since(
+                    "001D000000INjVe",
+                    &json!({"Industry": "Biotech"}),
+                    fixed_time(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::CirrusError::Api { status: 412, .. }),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conditional_record_requests_error_on_unrepresentable_time() {
+            let server = MockServer::start().await;
+            let sf = fixture(server.uri());
+            let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+
+            let err = sf
+                .sobject("Account")
+                .retrieve_if_modified_since("001D000000INjVe", before_epoch)
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::InvalidHeader(message) => {
+                    assert!(message.contains("If-Modified-Since"), "{message}");
+                }
+                other => panic!("expected InvalidHeader, got {other:?}"),
+            }
+
+            let err = sf
+                .sobject("Account")
+                .update_if_unmodified_since("001D000000INjVe", &json!({}), before_epoch)
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::InvalidHeader(message) => {
+                    assert!(message.contains("If-Unmodified-Since"), "{message}");
+                }
+                other => panic!("expected InvalidHeader, got {other:?}"),
+            }
 
             assert!(server.received_requests().await.unwrap().is_empty());
         }
