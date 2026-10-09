@@ -8,7 +8,9 @@
 //!   that ceiling is per job rather than per upload: larger data sets
 //!   need additional jobs. The caller drives the job through `Open` →
 //!   `UploadComplete` → `InProgress` → `JobComplete` / `Failed` /
-//!   `Aborted`. Reach via [`BulkHandler::ingest`].
+//!   `Aborted`, or collapses create, upload and close into one
+//!   multipart request for a small data set. Reach via
+//!   [`BulkHandler::ingest`].
 //! - **Query** (`/jobs/query`) — async SOQL execution that streams
 //!   results as CSV with cursor-based pagination. Reach via
 //!   [`BulkHandler::query`].
@@ -45,6 +47,15 @@ use serde::Serialize;
 
 const CSV_CONTENT_TYPE: &str = "text/csv";
 const CSV_ACCEPT: &str = "text/csv";
+
+/// The most job data a single multipart create-job request may carry,
+/// in characters. Salesforce documents the one-request path of
+/// [`BulkIngestHandler::create_with_data`] for "small amounts of job
+/// data (100,000 characters or less)"; larger data goes through
+/// [`BulkIngestHandler::create`] and [`BulkIngestHandler::upload`].
+///
+/// [Create a Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html)
+pub const MAX_MULTIPART_JOB_DATA_CHARS: usize = 100_000;
 const SFORCE_LOCATOR: &str = "Sforce-Locator";
 const SFORCE_NUM_RECORDS: &str = "Sforce-NumberOfRecords";
 
@@ -117,6 +128,11 @@ impl BulkHandler<'_> {
 /// 6. [`delete`](Self::delete) — `DELETE /jobs/ingest/{id}` once
 ///    you've consumed the results.
 ///
+/// For job data of at most [`MAX_MULTIPART_JOB_DATA_CHARS`] characters,
+/// [`create_with_data`](Self::create_with_data) does steps 1 to 3 in
+/// one multipart request and returns the job already in
+/// `UploadComplete`.
+///
 /// [`abort`](Self::abort) cancels a job mid-flight if needed.
 #[derive(Debug)]
 pub struct BulkIngestHandler<'a> {
@@ -139,6 +155,70 @@ impl BulkIngestHandler<'_> {
     pub async fn create(&self, spec: &BulkIngestSpec) -> CirrusResult<BulkIngestJob> {
         check_ingest_spec(spec)?;
         self.client.post("jobs/ingest", spec).await
+    }
+
+    /// Creates an ingest job and uploads its CSV in the same request.
+    ///
+    /// Sends the multipart form the [Create a Job] page documents: a
+    /// `job` part carrying `spec` as JSON and a `content` part carrying
+    /// `csv` as `text/csv`. Salesforce completes the upload itself, so
+    /// the job comes back in `UploadComplete`: do not pass it to
+    /// [`close`](Self::close), poll [`get`](Self::get) until
+    /// [`BulkJobState::is_terminal`](crate::BulkJobState::is_terminal)
+    /// instead. The [multipart walkthrough] puts it as "You don't need
+    /// to manually set the job state to UploadComplete for a multipart
+    /// job".
+    ///
+    /// The single-request path is documented for job data of
+    /// [`MAX_MULTIPART_JOB_DATA_CHARS`] characters or less. A larger
+    /// `csv` is refused with [`CirrusError::InvalidInput`] before any
+    /// request and belongs in [`create`](Self::create) plus
+    /// [`upload`](Self::upload). `spec` passes the same checks as
+    /// `create`.
+    ///
+    /// A lost response or a 5xx is never replayed: a second attempt
+    /// would create a second job holding the same rows. After an
+    /// ambiguous failure, look the job up before resubmitting the data;
+    /// a job this request did create is already processing.
+    ///
+    /// Calls `POST /services/data/{api_version}/jobs/ingest` with
+    /// `Content-Type: multipart/form-data`.
+    ///
+    /// [Create a Job]: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+    /// [multipart walkthrough]: https://developer.salesforce.com/docs/platform/api-asynch/guide/walkthrough-upload-multipart-data.html
+    pub async fn create_with_data(
+        &self,
+        spec: &BulkIngestSpec,
+        csv: bytes::Bytes,
+    ) -> CirrusResult<BulkIngestJob> {
+        check_ingest_spec(spec)?;
+        // The documented cap is in characters. Job data is UTF-8 text;
+        // bytes stand in only for data that isn't, where the byte count
+        // bounds the character count from above.
+        let chars = std::str::from_utf8(&csv).map_or(csv.len(), |text| text.chars().count());
+        if chars > MAX_MULTIPART_JOB_DATA_CHARS {
+            return Err(CirrusError::InvalidInput {
+                field: "csv",
+                message: format!(
+                    "{chars} characters of job data; a multipart create-job request carries \
+                     at most {MAX_MULTIPART_JOB_DATA_CHARS}, so larger data goes through \
+                     create and upload"
+                ),
+            });
+        }
+        let job = serde_json::to_vec(spec).map_err(CirrusError::Serialization)?;
+        self.client
+            .send_multipart(
+                reqwest::Method::POST,
+                "jobs/ingest",
+                "job",
+                job,
+                "content",
+                "content",
+                CSV_CONTENT_TYPE,
+                csv,
+            )
+            .await
     }
 
     /// Uploads CSV record data for a job. The job must be in `Open` state.
@@ -1518,5 +1598,211 @@ mod tests {
                 "columnDelimiter": "PIPE"
             })
         );
+    }
+
+    /// Splits a `multipart/form-data` request into `(part headers, part
+    /// body)` pairs using the boundary its `Content-Type` declares.
+    fn multipart_parts(request: &wiremock::Request) -> Vec<(String, Vec<u8>)> {
+        let content_type = request.headers["content-type"].to_str().unwrap().to_owned();
+        let boundary = content_type
+            .split_once("boundary=")
+            .map(|(_, b)| b.trim_matches('"').to_owned())
+            .expect("multipart content type with a boundary");
+        let delimiter = format!("--{boundary}");
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        body.split(&delimiter)
+            .filter(|chunk| !chunk.trim().is_empty() && !chunk.starts_with("--"))
+            .map(|chunk| {
+                let chunk = chunk.strip_prefix("\r\n").unwrap_or(chunk);
+                let (headers, body) = chunk.split_once("\r\n\r\n").expect("part header block");
+                let body = body.strip_suffix("\r\n").unwrap_or(body);
+                (headers.to_owned(), body.as_bytes().to_vec())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ingest_create_with_data_sends_the_documented_job_and_content_parts() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // "Usage Notes": a `job` part typed application/json and a
+        // `content` part typed text/csv with filename "content". The
+        // response is the multipart walkthrough's: the job is already
+        // `UploadComplete`, with no `contentUrl` and no `jobType`.
+        // https://developer.salesforce.com/docs/platform/api-asynch/guide/walkthrough-upload-multipart-data.html
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "7303gEXAMPLE4X2QAN",
+                "operation": "insert",
+                "object": "Contact",
+                "createdById": "0055fEXAMPLEtG4AAM",
+                "createdDate": "2022-01-02T19:26:52.000+0000",
+                "systemModstamp": "2022-01-02T19:26:52.000+0000",
+                "state": "UploadComplete",
+                "concurrencyMode": "Parallel",
+                "contentType": "CSV",
+                "apiVersion": 68.0,
+                "lineEnding": "LF",
+                "columnDelimiter": "COMMA"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let csv = "FirstName,LastName\nAstro,Nomical\n";
+        let job = sf
+            .bulk()
+            .ingest()
+            .create_with_data(
+                &BulkIngestSpec::new("Contact", BulkOperation::Insert)
+                    .line_ending(BulkLineEnding::LF),
+                bytes::Bytes::from(csv),
+            )
+            .await
+            .unwrap();
+        assert_eq!(job.id, "7303gEXAMPLE4X2QAN");
+        assert_eq!(job.state, BulkJobState::UploadComplete);
+        assert_eq!(job.content_url, None);
+        assert_eq!(job.job_type, None);
+
+        let requests = server.received_requests().await.unwrap();
+        let request = &requests[0];
+        assert!(
+            request.headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("multipart/form-data; boundary="),
+            "{:?}",
+            request.headers["content-type"]
+        );
+        let parts = multipart_parts(request);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+
+        let (job_headers, job_body) = &parts[0];
+        assert!(
+            job_headers.contains("Content-Disposition: form-data; name=\"job\""),
+            "{job_headers}"
+        );
+        assert!(
+            job_headers.contains("Content-Type: application/json"),
+            "{job_headers}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(job_body).unwrap(),
+            json!({"object": "Contact", "operation": "insert", "lineEnding": "LF"})
+        );
+
+        let (content_headers, content_body) = &parts[1];
+        assert!(
+            content_headers
+                .contains("Content-Disposition: form-data; name=\"content\"; filename=\"content\""),
+            "{content_headers}"
+        );
+        assert!(
+            content_headers.contains("Content-Type: text/csv"),
+            "{content_headers}"
+        );
+        assert_eq!(content_body, csv.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn ingest_create_with_data_refuses_more_than_the_documented_character_cap() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // "For small amounts of job data (100,000 characters or less), you
+        // can create a job and upload all the data for a job using a
+        // multipart request." The cap counts characters, not bytes.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ingest_job_response("750xx", "UploadComplete")),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let bulk = sf.bulk();
+        let ingest = bulk.ingest();
+        let spec = BulkIngestSpec::new("Account", BulkOperation::Insert);
+
+        let over = bytes::Bytes::from("a".repeat(MAX_MULTIPART_JOB_DATA_CHARS + 1));
+        match ingest.create_with_data(&spec, over).await.unwrap_err() {
+            crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "csv"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let at_cap = bytes::Bytes::from("a".repeat(MAX_MULTIPART_JOB_DATA_CHARS));
+        ingest.create_with_data(&spec, at_cap).await.unwrap();
+        // Two-byte characters: at the cap by character count, twice it
+        // by byte count.
+        let multibyte = bytes::Bytes::from("é".repeat(MAX_MULTIPART_JOB_DATA_CHARS));
+        assert_eq!(multibyte.len(), 2 * MAX_MULTIPART_JOB_DATA_CHARS);
+        ingest.create_with_data(&spec, multibyte).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingest_create_with_data_runs_the_create_job_checks_first() {
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+        let csv = bytes::Bytes::from("Name\nAcme\n");
+
+        let mut consent = BulkIngestSpec::consent_import();
+        consent.object = Some("Account".into());
+        match sf
+            .bulk()
+            .ingest()
+            .create_with_data(&consent, csv.clone())
+            .await
+            .unwrap_err()
+        {
+            crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "object"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        match sf
+            .bulk()
+            .ingest()
+            .create_with_data(&BulkIngestSpec::new("Account", BulkOperation::Query), csv)
+            .await
+            .unwrap_err()
+        {
+            crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "operation"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_create_with_data_is_not_replayed_after_a_transient_5xx() {
+        // A replayed multipart create would make a second job holding
+        // the same rows, so a 502 surfaces as the error it is after one
+        // attempt.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/jobs/ingest"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .bulk()
+            .ingest()
+            .create_with_data(
+                &BulkIngestSpec::new("Account", BulkOperation::Insert),
+                bytes::Bytes::from("Name\nAcme\n"),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::Api { status, .. } => assert_eq!(status, 502),
+            other => panic!("expected Api 502, got {other:?}"),
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
