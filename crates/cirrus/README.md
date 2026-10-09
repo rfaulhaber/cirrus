@@ -212,10 +212,13 @@ let created: Value = sf
     .await?;
 ```
 
-For the remaining unusual cases (binary download, SSE), `request_builder` and
-`execute` give you a pre-authenticated `reqwest::RequestBuilder` and a full
-bypass respectively. Both step outside the request loop, so retry, the 401
-auto-refresh and the limit-info capture don't apply to them.
+Binary downloads stay inside the request loop: `retrieve_blob` on a
+`sf.sobject(..)` handler fetches a blob field, and `sf.event_monitoring().download`
+an Event Monitoring log file. For the remaining unusual cases (SSE),
+`request_builder` and `execute` give you a pre-authenticated
+`reqwest::RequestBuilder` and a full bypass respectively. Both step outside the
+request loop, so retry, the 401 auto-refresh and the limit-info capture don't
+apply to them.
 
 ## Examples
 

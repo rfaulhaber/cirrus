@@ -582,6 +582,63 @@ impl<'a> SObjectHandler<'a> {
             )
             .await
     }
+
+    /// Downloads a record's blob field as raw bytes.
+    ///
+    /// Calls
+    /// `GET /services/data/{api_version}/sobjects/{name}/{id}/{blob_field}`
+    /// with `Accept: */*`. The [sObject Blob Get] resource "gets the
+    /// specified blob field from an individual record and returns it as
+    /// binary data", so the response is neither JSON nor XML and the bytes
+    /// come back exactly as received.
+    ///
+    /// The usual pairs are `ContentVersion` / `VersionData`, `Document` /
+    /// `Body` and `Attachment` / `Body`; the page lists `Attachment`,
+    /// `ContentNote`, `ContentVersion`, `Document`, `Folder` and `Note` as
+    /// the standard objects with blob fields. The resource can't be used
+    /// as a subrequest of a Composite request, so each blob is its own
+    /// call.
+    ///
+    /// The request runs inside the same loop as
+    /// [`create_with_blob`](Self::create_with_blob) and
+    /// [`update_with_blob`](Self::update_with_blob): the retry policy, the
+    /// 401 session refresh and `Sforce-Limit-Info` capture all apply. The
+    /// whole body is buffered in memory and bounded by
+    /// [`CirrusBuilder::max_response_size`](crate::CirrusBuilder::max_response_size)
+    /// (1 GiB by default); a larger blob fails with
+    /// [`CirrusError::ResponseTooLarge`] unless the limit is raised or
+    /// lifted.
+    ///
+    /// A missing record or blob field is a 404 [`CirrusError::Api`].
+    ///
+    /// [sObject Blob Get]: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-blob-retrieve.html
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// let pdf = sf
+    ///     .sobject("ContentVersion")
+    ///     .retrieve_blob("068D00000000pgOIAQ", "VersionData")
+    ///     .await?;
+    /// println!("downloaded {} bytes", pdf.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn retrieve_blob(&self, id: &str, blob_field: &str) -> CirrusResult<bytes::Bytes> {
+        let url = self
+            .client
+            .versioned_url(&["sobjects", self.name, id, blob_field])?;
+        let (_headers, bytes) = self
+            .client
+            .fetch_raw(reqwest::Method::GET, &url, "*/*", None)
+            .await?;
+        Ok(bytes)
+    }
 }
 
 /// Formats a [`SystemTime`] as an RFC 7231 IMF-fixdate for
@@ -1816,6 +1873,112 @@ mod tests {
                 )
                 .await
                 .unwrap();
+        }
+    }
+
+    mod blob_download {
+        use super::*;
+
+        #[tokio::test]
+        async fn retrieve_blob_returns_the_binary_body_unchanged() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-sobject-blob-retrieve.html
+            // "Document body content is returned in binary form. The
+            // response content type isn't JSON or XML since the returned
+            // data is binary."
+            //
+            // Wire-shape provenance: the page prints no response headers,
+            // so the `application/octet-stream` content type is
+            // illustrative. The bytes are not valid UTF-8, which a JSON or
+            // text decode of the body would reject or alter.
+            const BODY: &[u8] = b"%PDF-1.4\n\x00\x01\xff\xfe";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/ContentVersion/068D00000000pgOIAQ/VersionData",
+                ))
+                .and(header("accept", "*/*"))
+                .and(header("authorization", "Bearer tok"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/octet-stream")
+                        .set_body_bytes(BODY),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let blob = sf
+                .sobject("ContentVersion")
+                .retrieve_blob("068D00000000pgOIAQ", "VersionData")
+                .await
+                .unwrap();
+            assert_eq!(blob.as_ref(), BODY);
+        }
+
+        #[tokio::test]
+        async fn retrieve_blob_surfaces_the_error_array_on_404() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+            // The page's 404 body for an unknown resource, wrapped in the
+            // error array the REST API returns for a non-2xx response; the
+            // blob page prints no error body of its own.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/ContentVersion/068D00000000pgOIAQ/VersionData",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(json!([{
+                    "message": "The requested resource does not exist",
+                    "errorCode": "NOT_FOUND"
+                }])))
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let err = sf
+                .sobject("ContentVersion")
+                .retrieve_blob("068D00000000pgOIAQ", "VersionData")
+                .await
+                .unwrap_err();
+            match err {
+                CirrusError::Api { status, errors, .. } => {
+                    assert_eq!(status, 404);
+                    assert_eq!(errors[0].error_code, "NOT_FOUND");
+                }
+                other => panic!("expected Api error, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn retrieve_blob_percent_encodes_the_blob_field() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-blob-retrieve.html
+            // "URI: /services/data/vXX.X/sobjects/sObject/id/blobField" —
+            // the blob field occupies exactly one path segment, so a '/'
+            // inside it has to arrive encoded or the request targets a
+            // different resource.
+            let server = MockServer::start().await;
+            // wiremock matches on `Url::path()`, which is percent-encoded,
+            // so the `[^/]+` anchor fails if the field is ever split into
+            // two segments.
+            Mock::given(method("GET"))
+                .and(path(
+                    "/services/data/v66.0/sobjects/ContentVersion/068D00000000pgOIAQ/Version%2FData",
+                ))
+                .and(path_regex(
+                    r"^/services/data/v66\.0/sobjects/ContentVersion/068D00000000pgOIAQ/[^/]+$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"ok"[..]))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture(server.uri());
+            let blob = sf
+                .sobject("ContentVersion")
+                .retrieve_blob("068D00000000pgOIAQ", "Version/Data")
+                .await
+                .unwrap();
+            assert_eq!(blob.as_ref(), b"ok");
         }
     }
 }
