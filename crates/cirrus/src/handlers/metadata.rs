@@ -59,7 +59,7 @@ impl Cirrus {
 }
 
 /// Handler for the Metadata REST API. Returned by [`Cirrus::metadata`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct MetadataHandler<'a> {
     client: &'a Cirrus,
 }

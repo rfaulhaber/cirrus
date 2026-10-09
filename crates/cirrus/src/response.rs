@@ -359,6 +359,35 @@ pub enum BulkOperation {
     Unknown,
 }
 
+impl BulkOperation {
+    /// `true` for an operation the ingest endpoint (`/jobs/ingest`)
+    /// accepts: `insert`, `update`, `upsert`, `delete`, `hardDelete`,
+    /// `refresh` and `consentImport`. [`Unknown`](Self::Unknown) is
+    /// neither an ingest nor a query operation.
+    ///
+    /// [Create a Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html)
+    pub fn is_ingest(self) -> bool {
+        matches!(
+            self,
+            Self::Insert
+                | Self::Update
+                | Self::Upsert
+                | Self::Delete
+                | Self::HardDelete
+                | Self::Refresh
+                | Self::ConsentImport
+        )
+    }
+
+    /// `true` for an operation the query endpoint (`/jobs/query`)
+    /// accepts: `query` and `queryAll`.
+    ///
+    /// [Create a Query Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/query-create-job.html)
+    pub fn is_query(self) -> bool {
+        matches!(self, Self::Query | Self::QueryAll)
+    }
+}
+
 /// State of a Bulk API 2.0 job.
 ///
 /// Ingest job lifecycle: `Open` → `UploadComplete` → `InProgress` →
@@ -367,7 +396,44 @@ pub enum BulkOperation {
 /// Query job lifecycle: `UploadComplete` → `InProgress` → `JobComplete` /
 /// `Failed` / `Aborted` (query jobs skip `Open` since the SOQL is
 /// supplied at create time — there's no separate upload step).
+///
+/// The enum is `#[non_exhaustive]` with an [`Unknown`](Self::Unknown)
+/// fallback: a job listing covers every Bulk API job in the org,
+/// including Bulk API 1.0 jobs whose states (`Closed`) are not 2.0
+/// literals, and a literal promoted from `Unknown` to a named variant
+/// has to stay an additive change. Match with a `_` arm, or use
+/// [`is_terminal`](Self::is_terminal):
+///
+/// ```
+/// use cirrus::BulkJobState;
+///
+/// fn still_running(state: BulkJobState) -> bool {
+///     match state {
+///         BulkJobState::Open | BulkJobState::UploadComplete | BulkJobState::InProgress => true,
+///         _ => false,
+///     }
+/// }
+/// assert!(still_running(BulkJobState::InProgress));
+/// ```
+///
+/// Naming every variant, `Unknown` included, does not compile outside
+/// this crate:
+///
+/// ```compile_fail
+/// use cirrus::BulkJobState;
+///
+/// fn still_running(state: BulkJobState) -> bool {
+///     match state {
+///         BulkJobState::Open | BulkJobState::UploadComplete | BulkJobState::InProgress => true,
+///         BulkJobState::JobComplete
+///         | BulkJobState::Aborted
+///         | BulkJobState::Failed
+///         | BulkJobState::Unknown => false,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BulkJobState {
     /// Ingest job: created, accepting CSV uploads. Not used by query jobs.
     Open,
@@ -394,6 +460,29 @@ pub enum BulkJobState {
     /// [`unprocessed_records`]: crate::handlers::bulk::BulkIngestHandler::unprocessed_records
     /// [Get Job Info]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
     Failed,
+    /// A state literal this SDK doesn't name: a Bulk API 1.0 job's
+    /// `Closed` in a listing, or a state Salesforce adds later. Reading
+    /// it as a value keeps the rest of the job, and the rest of a
+    /// listing, usable.
+    #[serde(other)]
+    Unknown,
+}
+
+impl BulkJobState {
+    /// `true` once Salesforce has stopped processing the job, for any
+    /// reason: `JobComplete`, `Failed` or `Aborted`. A poll loop over
+    /// [`BulkIngestHandler::get`] or [`BulkQueryHandler::get`] can stop
+    /// once this returns `true`.
+    ///
+    /// [`Unknown`](Self::Unknown) reports `false`: an unrecognized state
+    /// can't be assumed finished, so a poller should keep going, bounded
+    /// by its own timeout, rather than stop early.
+    ///
+    /// [`BulkIngestHandler::get`]: crate::handlers::bulk::BulkIngestHandler::get
+    /// [`BulkQueryHandler::get`]: crate::handlers::bulk::BulkQueryHandler::get
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::JobComplete | Self::Failed | Self::Aborted)
+    }
 }
 
 /// CSV line ending used in Bulk 2.0 job payloads and result downloads.
@@ -654,6 +743,218 @@ impl std::fmt::Debug for BulkQueryResults {
             .field("number_of_records", &self.number_of_records)
             .finish()
     }
+}
+
+/// Kind of a Bulk job, as a job listing reports it and as the
+/// `jobType` filter of [`BulkJobListOptions`] names it.
+///
+/// The enum is `#[non_exhaustive]` with an [`Unknown`](Self::Unknown)
+/// fallback so a kind Salesforce adds later still deserializes; match
+/// with a `_` arm.
+///
+/// [`BulkJobListOptions`]: crate::handlers::bulk::BulkJobListOptions
+//
+// Wire-shape provenance: get-all-jobs.html lists `BigObjectIngest`,
+// `Classic` and `V2Ingest` for the ingest listing; query-get-all-jobs.html
+// lists `Classic`, `V2Query` and `V2Ingest` for the query listing. The
+// serialized form is the variant name as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum BulkJobType {
+    /// A BigObjects ingest job.
+    BigObjectIngest,
+    /// A Bulk API 1.0 job, query or ingest.
+    Classic,
+    /// A Bulk API 2.0 ingest job.
+    V2Ingest,
+    /// A Bulk API 2.0 query job.
+    V2Query,
+    /// A job type this SDK doesn't name. Not a filter value: the
+    /// listing methods refuse it before any request.
+    #[serde(other)]
+    Unknown,
+}
+
+impl BulkJobType {
+    /// The wire literal, as the listing filter sends it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BigObjectIngest => "BigObjectIngest",
+            Self::Classic => "Classic",
+            Self::V2Ingest => "V2Ingest",
+            Self::V2Query => "V2Query",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// One page of a Bulk job listing, from `GET /jobs/ingest` or
+/// `GET /jobs/query`.
+///
+/// A page holds up to 1,000 jobs. When `done` is `false`, pass
+/// [`next_locator`](Self::next_locator) to the next
+/// [`list`](crate::handlers::bulk::BulkIngestHandler::list) call; the
+/// listing methods guarantee it is present in that case.
+///
+/// [Get Information About All Ingest Jobs](https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html)
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkJobList {
+    /// `false` while more pages remain.
+    pub done: bool,
+    /// The jobs on this page, in no particular order.
+    pub records: Vec<BulkJobSummary>,
+    /// The URL Salesforce suggests for the next page, carrying its
+    /// `queryLocator`. Only the locator is reused: the documented query
+    /// listing example names `/jobs/ingest` here, so the path is not
+    /// trusted to say which listing it continues.
+    #[serde(rename = "nextRecordsUrl", default)]
+    pub next_records_url: Option<String>,
+}
+
+impl BulkJobList {
+    /// The `queryLocator` carried by [`next_records_url`](Self::next_records_url),
+    /// for [`BulkJobListOptions::query_locator`]; `None` on the last
+    /// page.
+    ///
+    /// [`BulkJobListOptions::query_locator`]: crate::handlers::bulk::BulkJobListOptions::query_locator
+    pub fn next_locator(&self) -> Option<String> {
+        self.next_records_url
+            .as_deref()
+            .and_then(|url| query_value(url, "queryLocator"))
+    }
+}
+
+/// One job as a listing reports it.
+///
+/// A listing covers every Bulk API job in the org, so the record is
+/// looser than [`BulkIngestJob`] / [`BulkQueryJob`]: a Bulk API 1.0 job
+/// has no CSV formatting fields, a content type outside `CSV`, and a
+/// [`state`](Self::state) the 2.0 enum reads as
+/// [`Unknown`](BulkJobState::Unknown). Fetch a 2.0 job's full record
+/// through the handler's `get`.
+//
+// Wire-shape provenance: the JobInfo table on get-all-jobs.html, and the
+// query-get-all-jobs.html example. Both type `apiVersion` as a string
+// while the example prints `68.0`, and asynch-api-reference-jobinfo.html
+// (the Bulk API 1.0 JobInfo a listing can include) types it as a string
+// too, so either form is read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkJobSummary {
+    pub id: String,
+    pub operation: BulkOperation,
+    /// Object type of the job's data. Empty for a `consentImport` job.
+    #[serde(default)]
+    pub object: String,
+    pub state: BulkJobState,
+    #[serde(rename = "jobType", default)]
+    pub job_type: Option<BulkJobType>,
+    #[serde(rename = "apiVersion", deserialize_with = "api_version_number")]
+    pub api_version: f64,
+    #[serde(rename = "concurrencyMode")]
+    pub concurrency_mode: String,
+    /// `CSV` for a Bulk API 2.0 job; a Bulk API 1.0 job can report
+    /// another format.
+    #[serde(rename = "contentType")]
+    pub content_type: String,
+    /// Where an `Open` ingest job's CSV is uploaded; see
+    /// [`BulkIngestJob::content_url`] for its unusual form.
+    #[serde(rename = "contentUrl", default)]
+    pub content_url: Option<String>,
+    #[serde(rename = "createdById")]
+    pub created_by_id: String,
+    #[serde(rename = "createdDate")]
+    pub created_date: String,
+    #[serde(rename = "systemModstamp")]
+    pub system_modstamp: String,
+    #[serde(rename = "lineEnding", default)]
+    pub line_ending: Option<BulkLineEnding>,
+    #[serde(rename = "columnDelimiter", default)]
+    pub column_delimiter: Option<BulkColumnDelimiter>,
+}
+
+/// Reads `apiVersion` as the JSON number the examples print or the
+/// string the field tables declare.
+fn api_version_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(f64),
+        Text(String),
+    }
+    match Raw::deserialize(deserializer)? {
+        Raw::Number(version) => Ok(version),
+        Raw::Text(text) => text.trim().parse().map_err(serde::de::Error::custom),
+    }
+}
+
+/// One set of parallel result links for a query job, from
+/// `GET /jobs/query/{jobId}/resultPages` (API 58.0 and later).
+///
+/// Each [`BulkResultPage::locator`] is a cursor for
+/// [`BulkQueryHandler::results`], and the pages can be fetched
+/// concurrently. When `done` is `false`, pass
+/// [`next_locator`](Self::next_locator) to the next
+/// [`BulkQueryHandler::result_pages`] call; the handler guarantees it is
+/// present in that case.
+///
+/// [`BulkQueryHandler::results`]: crate::handlers::bulk::BulkQueryHandler::results
+/// [`BulkQueryHandler::result_pages`]: crate::handlers::bulk::BulkQueryHandler::result_pages
+/// [Get Parallel Results for a Query Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-parallel-job-results.html)
+//
+// Wire-shape provenance: query-get-parallel-job-results.html. Its
+// element table spells the continuation `nextRecordUrl` while its example
+// response spells it `nextRecordsUrl`, so both are read.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkResultPages {
+    /// Up to five result links.
+    #[serde(rename = "resultPages", default)]
+    pub result_pages: Vec<BulkResultPage>,
+    /// The URL Salesforce suggests for the next set of links, carrying
+    /// its `locator`.
+    #[serde(rename = "nextRecordsUrl", alias = "nextRecordUrl", default)]
+    pub next_records_url: Option<String>,
+    /// `false` while more sets of links remain.
+    pub done: bool,
+}
+
+impl BulkResultPages {
+    /// The `locator` carried by [`next_records_url`](Self::next_records_url);
+    /// `None` on the last set.
+    pub fn next_locator(&self) -> Option<String> {
+        self.next_records_url
+            .as_deref()
+            .and_then(|url| query_value(url, "locator"))
+    }
+}
+
+/// One result link from [`BulkResultPages`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkResultPage {
+    /// The results URL as Salesforce wrote it, with its `locator`.
+    #[serde(rename = "resultUrl")]
+    pub result_url: String,
+}
+
+impl BulkResultPage {
+    /// The `locator` carried by [`result_url`](Self::result_url), to pass
+    /// to [`BulkQueryHandler::results`].
+    ///
+    /// [`BulkQueryHandler::results`]: crate::handlers::bulk::BulkQueryHandler::results
+    pub fn locator(&self) -> Option<String> {
+        query_value(&self.result_url, "locator")
+    }
+}
+
+/// The decoded, non-empty value of `name` in `url`'s query string.
+fn query_value(url: &str, name: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    let query = query.split_once('#').map_or(query, |(query, _)| query);
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, value)| key == name && !value.is_empty())
+        .map(|(_, value)| value.into_owned())
 }
 
 /// One `EventLogFile` sObject record returned by querying
@@ -1921,6 +2222,86 @@ mod tests {
             (BulkOperation::ConsentImport, "consentImport"),
         ] {
             assert_eq!(serde_json::to_value(op).unwrap(), json!(wire));
+        }
+    }
+
+    #[test]
+    fn bulk_operation_knows_which_endpoint_takes_it() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // and query-create-job.html: the ingest endpoint lists insert,
+        // delete, hardDelete, update, upsert, refresh and consentImport;
+        // the query endpoint lists query and queryAll.
+        for op in [
+            BulkOperation::Insert,
+            BulkOperation::Update,
+            BulkOperation::Upsert,
+            BulkOperation::Delete,
+            BulkOperation::HardDelete,
+            BulkOperation::Refresh,
+            BulkOperation::ConsentImport,
+        ] {
+            assert!(op.is_ingest(), "{op:?}");
+            assert!(!op.is_query(), "{op:?}");
+        }
+        for op in [BulkOperation::Query, BulkOperation::QueryAll] {
+            assert!(op.is_query(), "{op:?}");
+            assert!(!op.is_ingest(), "{op:?}");
+        }
+        assert!(!BulkOperation::Unknown.is_ingest());
+        assert!(!BulkOperation::Unknown.is_query());
+    }
+
+    #[test]
+    fn bulk_job_type_round_trips_the_documented_wire_names() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html
+        // (`BigObjectIngest`, `Classic`, `V2Ingest`) and
+        // query-get-all-jobs.html (`Classic`, `V2Query`, `V2Ingest`).
+        for (job_type, wire) in [
+            (BulkJobType::BigObjectIngest, "BigObjectIngest"),
+            (BulkJobType::Classic, "Classic"),
+            (BulkJobType::V2Ingest, "V2Ingest"),
+            (BulkJobType::V2Query, "V2Query"),
+        ] {
+            assert_eq!(serde_json::to_value(job_type).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<BulkJobType>(json!(wire)).unwrap(),
+                job_type
+            );
+            assert_eq!(job_type.as_str(), wire);
+        }
+        assert_eq!(
+            serde_json::from_value::<BulkJobType>(json!("V3Ingest")).unwrap(),
+            BulkJobType::Unknown
+        );
+    }
+
+    #[test]
+    fn bulk_job_state_reads_an_unnamed_literal_as_unknown_and_never_terminal() {
+        // A job listing can carry Bulk API 1.0 jobs, whose `Closed`
+        // state is not a 2.0 literal.
+        let state: BulkJobState = serde_json::from_value(json!("Closed")).unwrap();
+        assert_eq!(state, BulkJobState::Unknown);
+        assert!(!state.is_terminal());
+    }
+
+    #[test]
+    fn bulk_job_state_is_terminal_once_processing_has_ended() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/get-job-info.html
+        // `state`: JobComplete, Failed and Aborted end a job; Open,
+        // UploadComplete and InProgress precede processing or are it.
+        for state in [
+            BulkJobState::JobComplete,
+            BulkJobState::Failed,
+            BulkJobState::Aborted,
+        ] {
+            assert!(state.is_terminal(), "{state:?}");
+        }
+        for state in [
+            BulkJobState::Open,
+            BulkJobState::UploadComplete,
+            BulkJobState::InProgress,
+        ] {
+            assert!(!state.is_terminal(), "{state:?}");
         }
     }
 

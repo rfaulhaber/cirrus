@@ -73,7 +73,9 @@ pub use reqwest;
 pub use auth::{AuthError, AuthSession, SharedAuth};
 pub use bytes::Bytes;
 pub use error::{CirrusError, CirrusResult, SalesforceError};
-pub use handlers::bulk::{BulkIngestSpec, BulkQuerySpec};
+pub use handlers::bulk::{
+    BulkIngestSpec, BulkJobListOptions, BulkQuerySpec, MAX_MULTIPART_JOB_DATA_CHARS,
+};
 pub use handlers::composite::{
     BatchRequest, BatchSubrequest, CompositeRequest, CompositeSubrequest,
 };
@@ -85,12 +87,12 @@ pub use handlers::sobjects::{BlobUploadSpec, UpsertOptions};
 pub use pagination::Records;
 pub use response::LimitInfo;
 pub use response::{
-    ApiVersion, BatchResponse, BatchSubresult, BulkColumnDelimiter, BulkIngestJob, BulkJobState,
-    BulkJobStateChange, BulkLineEnding, BulkOperation, BulkQueryJob, BulkQueryResults,
-    CompositeError, CompositeResponse, CompositeSubresponse, CompositeTreeResponse,
-    CompositeTreeResult, DescribeGlobal, EventLogFileRecord, ExecuteAnonymousResult, Limit,
-    OrgLimits, QueryResult, SObjectCollectionResult, SObjectCreateResult, SObjectMetadata,
-    SearchResult,
+    ApiVersion, BatchResponse, BatchSubresult, BulkColumnDelimiter, BulkIngestJob, BulkJobList,
+    BulkJobState, BulkJobStateChange, BulkJobSummary, BulkJobType, BulkLineEnding, BulkOperation,
+    BulkQueryJob, BulkQueryResults, BulkResultPage, BulkResultPages, CompositeError,
+    CompositeResponse, CompositeSubresponse, CompositeTreeResponse, CompositeTreeResult,
+    DescribeGlobal, EventLogFileRecord, ExecuteAnonymousResult, Limit, OrgLimits, QueryResult,
+    SObjectCollectionResult, SObjectCreateResult, SObjectMetadata, SearchResult,
 };
 pub use retry::{Replay, RetryPolicy};
 

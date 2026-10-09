@@ -74,8 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `composite/sobjects` (collections), and the generic chained-reference
   `/composite` endpoint.
 - **Bulk API 2.0** — ingest (`bulk().ingest()`) and query (`bulk().query()`)
-  with the full lifecycle: `create`, `upload`, `close`, `abort`, `get`,
-  `results` (with `Sforce-Locator` cursor pagination), raw CSV downloads.
+  with the full lifecycle: `create` (or the one-request multipart
+  `create_with_data`), `upload`, `close`, `abort`, `get`, `results` (with
+  `Sforce-Locator` cursor pagination, or `result_pages` for parallel
+  downloads), raw CSV downloads, and `list` for the org's existing jobs.
 - **Tooling API** — `tooling().{describe_global, sobject(name).*, query, search,
   execute_anonymous}`.
 - **Apex REST** — thin passthrough for custom `/services/apexrest/...`

@@ -98,7 +98,7 @@ impl Cirrus {
 }
 
 /// Handler for Tooling API resources. Returned by [`Cirrus::tooling`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ToolingHandler<'a> {
     client: &'a Cirrus,
 }
@@ -253,7 +253,7 @@ impl<'a> ToolingHandler<'a> {
 ///
 /// Mirrors the per-object methods of [`crate::handlers::sobjects::SObjectHandler`]
 /// but rooted under `tooling/sobjects/` instead of `sobjects/`.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ToolingSObjectHandler<'a> {
     client: &'a Cirrus,
     name: &'a str,
