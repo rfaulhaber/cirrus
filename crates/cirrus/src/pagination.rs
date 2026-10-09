@@ -1,4 +1,4 @@
-//! Lazy, runtime-agnostic pagination over Salesforce query results.
+//! Lazy pagination over Salesforce query results.
 //!
 //! Salesforce paginates SOQL queries (and several adjacent endpoints)
 //! via the `nextRecordsUrl` cursor pattern: a [`QueryResult<R>`] carries
@@ -36,14 +36,16 @@
 //! All of the standard `Stream` / `TryStreamExt` combinators apply —
 //! `take`, `try_collect`, `try_filter`, `chunks`, `try_for_each`, etc.
 //!
-//! # Runtime independence
+//! # Runtime
 //!
-//! [`Records<R>`] only implements [`futures::stream::Stream`]; it does
-//! not depend on a specific async runtime. Whatever executor your
-//! application uses to drive the stream is fine, provided
-//! [`reqwest`]'s connection pool can run on it (i.e. a Tokio runtime
-//! is *eventually* required at the transport layer, but consumers
-//! aren't forced to write `#[tokio::main]`).
+//! [`Records<R>`] implements [`futures::stream::Stream`] and nothing
+//! runtime-specific, so any combinator crate drives it. The pages it
+//! fetches go through the client's [`reqwest`] transport, whose read
+//! timeout, like the retry policy's backoff, is a Tokio timer, so the
+//! stream has to be polled from inside a Tokio runtime with its time
+//! driver enabled (`#[tokio::main]` and `#[tokio::test]` both enable
+//! it). Polled from another executor's thread, the first page fetch
+//! panics inside `reqwest` with "there is no reactor running".
 //!
 //! # Cancellation and back-pressure
 //!
@@ -52,6 +54,37 @@
 //! initiated only when the previous page's records are exhausted, so a
 //! consumer that breaks early after the first page issues exactly one
 //! HTTP request total.
+//!
+//! # Resuming
+//!
+//! The first failed page fetch ends the stream once the error has been
+//! yielded, because a query timeout or a malformed locator does not clear
+//! up on its own. The locator of the page that failed stays reachable
+//! through [`Records::pending_locator`], and Salesforce keeps a cursor
+//! and its results for two days, so a consumer that wants to go on from
+//! there — after a transient 503, or after a record it could not
+//! deserialize — hands the locator to [`Records::from_locator`] instead
+//! of re-running the query:
+//!
+//! ```ignore
+//! use futures::StreamExt;
+//!
+//! let mut records = sf.query_stream_as::<Acct>("SELECT Id, Name FROM Account");
+//! while let Some(rec) = records.next().await {
+//!     if let Err(e) = rec {
+//!         if let Some(locator) = records.pending_locator() {
+//!             // The fetch of `locator` failed. Keep it and resume later with
+//!             // `Records::<Acct>::from_locator(sf.clone(), locator)`.
+//!         }
+//!         return Err(e.into());
+//!     }
+//! }
+//! ```
+//!
+//! [`Records::from_page`] starts a stream from a page fetched some other
+//! way — a first page sent with `Sforce-Query-Options` through
+//! [`Cirrus::send_with_headers`], say — and [`Records::total_size`]
+//! reports the query's total once the first page is in.
 //!
 //! # What this *doesn't* cover
 //!
@@ -64,6 +97,7 @@
 //!
 //! [`QueryResult<R>`]: crate::QueryResult
 //! [`reqwest`]: reqwest
+//! [`Cirrus::send_with_headers`]: crate::Cirrus::send_with_headers
 
 use crate::Cirrus;
 use crate::error::CirrusResult;
@@ -82,11 +116,14 @@ type PageFuture<R> = BoxFuture<'static, CirrusResult<QueryResult<R>>>;
 /// transparently.
 ///
 /// Yields [`CirrusResult<R>`] — the first error from any page fetch
-/// terminates the stream after surfacing it once. Construct via
-/// [`Cirrus::query_stream`] / [`Cirrus::query_stream_as`] /
-/// [`Cirrus::query_all_stream`] / [`Cirrus::query_all_stream_as`]
-/// or the equivalent methods on
-/// [`crate::handlers::tooling::ToolingHandler`].
+/// terminates the stream after surfacing it once, with the locator of
+/// the page that failed left on [`pending_locator`](Self::pending_locator)
+/// for [`from_locator`](Self::from_locator) to resume from. Construct
+/// via [`Cirrus::query_stream`] / [`Cirrus::query_stream_as`] /
+/// [`Cirrus::query_all_stream`] / [`Cirrus::query_all_stream_as`], the
+/// equivalent methods on [`crate::handlers::tooling::ToolingHandler`],
+/// or from a saved locator or an already-fetched page with
+/// [`from_locator`](Self::from_locator) and [`from_page`](Self::from_page).
 ///
 /// [`Cirrus::query_stream`]: crate::Cirrus::query_stream
 /// [`Cirrus::query_stream_as`]: crate::Cirrus::query_stream_as
@@ -96,34 +133,36 @@ type PageFuture<R> = BoxFuture<'static, CirrusResult<QueryResult<R>>>;
 pub struct Records<R> {
     client: Cirrus,
     state: State<R>,
+    /// `totalSize` of the first page seen, which Salesforce repeats on
+    /// every page of the same query.
+    total_size: Option<i64>,
 }
 
 impl<R> std::fmt::Debug for Records<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't expose the BoxFuture or buffered records — the former
         // has no useful Debug; the latter is large and may carry PII.
-        let state_label = match &self.state {
-            State::Fetching(_) => "Fetching",
-            State::Buffered { records, next } => {
-                return f
-                    .debug_struct("Records")
-                    .field("state", &"Buffered")
-                    .field("buffered_records", &records.len())
-                    .field("has_next_page", &next.is_some())
-                    .finish_non_exhaustive();
-            }
-            State::Done => "Done",
+        let (state, buffered) = match &self.state {
+            State::Fetching { .. } => ("Fetching", 0),
+            State::Buffered { records, .. } => ("Buffered", records.len()),
+            State::Done { .. } => ("Done", 0),
         };
         f.debug_struct("Records")
-            .field("state", &state_label)
+            .field("state", &state)
+            .field("buffered_records", &buffered)
+            .field("has_pending_locator", &self.pending_locator().is_some())
+            .field("total_size", &self.total_size)
             .finish_non_exhaustive()
     }
 }
 
 enum State<R> {
-    /// A page fetch is in flight (the initial query, or a follow-up
-    /// `query_more` after exhausting the current buffer).
-    Fetching(PageFuture<R>),
+    /// A page fetch is in flight. `locator` is the `nextRecordsUrl` being
+    /// fetched, `None` when the page is the query itself.
+    Fetching {
+        fut: PageFuture<R>,
+        locator: Option<String>,
+    },
     /// We have a page; serve from `records` until empty, then either
     /// fetch the next page (via `next`) or transition to [`State::Done`].
     Buffered {
@@ -131,8 +170,9 @@ enum State<R> {
         next: Option<String>,
     },
     /// Stream is fully drained or surfaced an error. Subsequent polls
-    /// return `None`.
-    Done,
+    /// return `None`. `unfetched` is the locator whose fetch failed, kept
+    /// so the consumer can resume from it.
+    Done { unfetched: Option<String> },
 }
 
 impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
@@ -144,8 +184,91 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
     pub(crate) fn new(client: Cirrus, initial: PageFuture<R>) -> Self {
         Self {
             client,
-            state: State::Fetching(initial),
+            state: State::Fetching {
+                fut: initial,
+                locator: None,
+            },
+            total_size: None,
         }
+    }
+
+    /// Starts a stream at a saved `nextRecordsUrl` locator: one taken
+    /// from [`QueryResult::next_records_url`], or left on
+    /// [`pending_locator`](Self::pending_locator) by a stream that
+    /// failed.
+    ///
+    /// The first poll fetches that page through
+    /// [`Cirrus::query_more_as`](crate::Cirrus::query_more_as), so the
+    /// locator is confined the same way: one naming another host or
+    /// resource is yielded as [`CirrusError::InvalidInput`] without a
+    /// request. Salesforce keeps a cursor and its results for two days.
+    ///
+    /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
+    pub fn from_locator(client: Cirrus, next_records_url: impl Into<String>) -> Self {
+        let state = fetch_more(&client, next_records_url.into());
+        Self {
+            client,
+            state,
+            total_size: None,
+        }
+    }
+
+    /// Starts a stream at a page already fetched, serving its records
+    /// first and then walking its `nextRecordsUrl` like any other page.
+    ///
+    /// This is how a first page sent with request headers (such as
+    /// `Sforce-Query-Options` for the batch size) becomes a stream:
+    /// fetch it with
+    /// [`Cirrus::send_with_headers`](crate::Cirrus::send_with_headers)
+    /// and hand it over here.
+    pub fn from_page(client: Cirrus, page: QueryResult<R>) -> Self {
+        Self {
+            client,
+            state: State::Buffered {
+                records: page.records.into(),
+                next: page.next_records_url,
+            },
+            total_size: Some(page.total_size),
+        }
+    }
+}
+
+impl<R> Records<R> {
+    /// The locator of the next page the stream has not received.
+    ///
+    /// While a page fetch is in flight, this is the locator being
+    /// fetched; after a fetch failed, the locator that failed, which
+    /// [`from_locator`](Self::from_locator) resumes from. While records
+    /// are buffered, it is the locator of the page after them, so a
+    /// consumer that stops early and resumes from it skips the records
+    /// still buffered. `None` before the first page, when the buffered
+    /// page is the last one, and after a clean drain.
+    pub fn pending_locator(&self) -> Option<&str> {
+        match &self.state {
+            State::Fetching { locator, .. } => locator.as_deref(),
+            State::Buffered { next, .. } => next.as_deref(),
+            State::Done { unfetched } => unfetched.as_deref(),
+        }
+    }
+
+    /// The query's `totalSize`, known once the first page has arrived
+    /// (immediately for [`from_page`](Self::from_page)).
+    pub fn total_size(&self) -> Option<i64> {
+        self.total_size
+    }
+}
+
+/// The state for fetching the page `locator` names.
+fn fetch_more<R: DeserializeOwned + Send + Unpin + 'static>(
+    client: &Cirrus,
+    locator: String,
+) -> State<R> {
+    let client = client.clone();
+    let url = locator.clone();
+    let fut: PageFuture<R> = Box::pin(async move { client.query_more_as::<R>(&url).await });
+    State::Fetching {
+        fut,
+        locator: Some(locator),
     }
 }
 
@@ -160,8 +283,9 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Stream for Records<R> {
         let this = self.get_mut();
         loop {
             match &mut this.state {
-                State::Fetching(fut) => match fut.as_mut().poll(cx) {
+                State::Fetching { fut, locator } => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(qr)) => {
+                        this.total_size = Some(qr.total_size);
                         this.state = State::Buffered {
                             records: qr.records.into(),
                             next: qr.next_records_url,
@@ -174,8 +298,10 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Stream for Records<R> {
                         // permanent for the duration of the query
                         // (query timeout, malformed locator), so
                         // continuing past the first error would waste
-                        // requests.
-                        this.state = State::Done;
+                        // requests. The locator stays on the stream for
+                        // a consumer that wants to resume.
+                        let unfetched = locator.take();
+                        this.state = State::Done { unfetched };
                         return Poll::Ready(Some(Err(e)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -187,16 +313,13 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Stream for Records<R> {
                     // Current page drained — start the next one (or
                     // finish, if the locator is None).
                     if let Some(next_url) = next.take() {
-                        let client = this.client.clone();
-                        let fut: PageFuture<R> =
-                            Box::pin(async move { client.query_more_as::<R>(&next_url).await });
-                        this.state = State::Fetching(fut);
+                        this.state = fetch_more(&this.client, next_url);
                     } else {
-                        this.state = State::Done;
+                        this.state = State::Done { unfetched: None };
                         return Poll::Ready(None);
                     }
                 }
-                State::Done => return Poll::Ready(None),
+                State::Done { .. } => return Poll::Ready(None),
             }
         }
     }
@@ -205,13 +328,14 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Stream for Records<R> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::Records;
     use crate::Cirrus;
     use crate::auth::StaticTokenAuth;
     use futures::StreamExt;
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     fn fixture(uri: String) -> Cirrus {
@@ -585,5 +709,281 @@ mod tests {
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
 
         assert!(stream.next().await.is_none());
+    }
+
+    /// A failed page fetch leaves its locator on the stream, and a
+    /// stream started from that locator picks up where the first one
+    /// stopped instead of re-running the query.
+    #[tokio::test]
+    async fn a_failed_page_leaves_its_locator_pending_and_from_locator_resumes_it() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 3,
+                "done": false,
+                "nextRecordsUrl": "/services/data/v66.0/query/01gAA-2",
+                "records": [{"attributes": {"type": "Account"}, "Id": "001a"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The first fetch of page 2 fails; the resumed one succeeds.
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gAA-2"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!([{
+                "errorCode": "SERVER_UNAVAILABLE",
+                "message": "Service Unavailable"
+            }])))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gAA-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 3,
+                "done": true,
+                "records": [
+                    {"attributes": {"type": "Account"}, "Id": "001b"},
+                    {"attributes": {"type": "Account"}, "Id": "001c"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let mut stream = sf.query_stream("SELECT Id FROM Account");
+        assert_eq!(stream.pending_locator(), None, "nothing fetched yet");
+        assert_eq!(stream.total_size(), None);
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first["Id"], "001a");
+        assert_eq!(stream.total_size(), Some(3));
+        assert_eq!(
+            stream.pending_locator(),
+            Some("/services/data/v66.0/query/01gAA-2"),
+            "while a page is buffered, the pending locator names the page after it"
+        );
+
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 503, .. }));
+        assert!(
+            stream.next().await.is_none(),
+            "the stream ends after the error"
+        );
+        let locator = stream
+            .pending_locator()
+            .expect("the failed page's locator survives the error")
+            .to_owned();
+        assert_eq!(locator, "/services/data/v66.0/query/01gAA-2");
+        let debug = format!("{stream:?}");
+        assert!(debug.contains("has_pending_locator: true"), "{debug}");
+        assert!(!debug.contains("01gAA-2"), "{debug}");
+
+        let resumed: Vec<Value> = Records::<Value>::from_locator(sf.clone(), locator)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(resumed.len(), 2);
+        assert_eq!(resumed[0]["Id"], "001b");
+        assert_eq!(resumed[1]["Id"], "001c");
+    }
+
+    #[tokio::test]
+    async fn a_clean_drain_leaves_no_locator_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 1,
+                "done": true,
+                "records": [{"attributes": {"type": "Account"}, "Id": "001a"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let mut stream = sf.query_stream("SELECT Id FROM Account");
+        assert!(stream.next().await.unwrap().is_ok());
+        assert_eq!(
+            stream.pending_locator(),
+            None,
+            "the last page has no locator"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(stream.pending_locator(), None);
+        assert_eq!(stream.total_size(), Some(1));
+    }
+
+    /// The initial query is not a locator, so its failure leaves nothing
+    /// to resume from: the consumer re-runs the query.
+    #[tokio::test]
+    async fn a_failed_initial_query_leaves_nothing_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!([{
+                "message": "unexpected token: SELECTT",
+                "errorCode": "MALFORMED_QUERY"
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let mut stream = sf.query_stream("SELECTT Id FROM Account");
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(err, crate::CirrusError::Api { status: 400, .. }));
+        assert_eq!(stream.pending_locator(), None);
+        assert_eq!(stream.total_size(), None);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A first page fetched by the caller — here with the
+    /// `Sforce-Query-Options` header the stream constructors cannot send
+    /// — becomes a stream that serves it and then walks its locator.
+    #[tokio::test]
+    async fn from_page_serves_the_given_page_then_walks_its_locator() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers_queryoptions.htm
+        // "Sforce-Query-Options: batchSize=1000" bounds the page size of
+        // the request that opens the cursor.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .and(query_param("q", "SELECT Id FROM Account"))
+            .and(header("Sforce-Query-Options", "batchSize=200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 2,
+                "done": false,
+                "nextRecordsUrl": "/services/data/v66.0/query/01gAA-2",
+                "records": [{"attributes": {"type": "Account"}, "Id": "001a"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gAA-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 2,
+                "done": true,
+                "records": [{"attributes": {"type": "Account"}, "Id": "001b"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let page: crate::QueryResult<Value> = sf
+            .send_with_headers::<_, ()>(
+                reqwest::Method::GET,
+                "query",
+                Some(&[("q", "SELECT Id FROM Account")]),
+                &[("Sforce-Query-Options", "batchSize=200")],
+                None,
+            )
+            .await
+            .unwrap();
+        let mut stream = Records::from_page(sf, page);
+        assert_eq!(stream.total_size(), Some(2), "known before the first poll");
+        assert_eq!(
+            stream.pending_locator(),
+            Some("/services/data/v66.0/query/01gAA-2")
+        );
+
+        let ids: Vec<Value> = (&mut stream).map(|r| r.unwrap()).collect().await;
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0]["Id"], "001a");
+        assert_eq!(ids[1]["Id"], "001b");
+        assert_eq!(stream.pending_locator(), None);
+    }
+
+    /// A locator is followed as issued, whatever version the client was
+    /// built for: the cursor belongs to the version of the query that
+    /// opened it, and rebuilding it from the client's version would hit
+    /// a resource that does not exist.
+    #[tokio::test]
+    async fn locators_are_followed_verbatim_across_client_versions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v61.0/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 2,
+                "done": false,
+                "nextRecordsUrl": "/services/data/v66.0/query/01gAA-2",
+                "records": [{"attributes": {"type": "Account"}, "Id": "001a"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gAA-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 2,
+                "done": true,
+                "records": [{"attributes": {"type": "Account"}, "Id": "001b"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v61.0/query/01gAA-2"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v61.0")
+            .retry_policy(crate::RetryPolicy::none())
+            .build()
+            .unwrap();
+
+        let ids: Vec<Value> = sf
+            .query_stream("SELECT Id FROM Account")
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[1]["Id"], "001b");
+
+        let resumed: Vec<Value> =
+            Records::<Value>::from_locator(sf, "/services/data/v66.0/query/01gAA-2")
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+        assert_eq!(resumed.len(), 1);
+    }
+
+    /// `from_locator` confines the locator like `query_more` does: a
+    /// value naming another host is an error on the first poll, with no
+    /// request sent and nothing left to resume.
+    #[tokio::test]
+    async fn from_locator_refuses_a_foreign_locator_on_its_first_poll() {
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        let mut stream = Records::<Value>::from_locator(
+            sf,
+            "https://other.my.salesforce.com/services/data/v66.0/query/01gXXX-2000",
+        );
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::CirrusError::InvalidInput {
+                    field: "next_records_url",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(stream.next().await.is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

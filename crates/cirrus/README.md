@@ -62,7 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `Document` / `Attachment`.
 - **SOQL** — `sf.query(...)`, `sf.query_all(...)`, `sf.query_more(...)`. Typed
   variants (`query_as::<T>(...)`) and a `futures::Stream` pagination iterator
-  (`query_stream(...)`) that walks `nextRecordsUrl` locators transparently.
+  (`query_stream(...)`) that walks `nextRecordsUrl` locators transparently,
+  keeps the locator of a page that failed on `Records::pending_locator`, and
+  resumes from a saved one with `Records::from_locator`.
   The query resource has no bind parameters, so a value interpolated into a
   statement goes through `cirrus::soql::quote` (a string literal) or
   `cirrus::soql::escape_like` (part of a `LIKE` pattern).
