@@ -62,14 +62,7 @@ impl Cirrus {
     /// # let sf = Cirrus::builder().auth(auth).build()?;
     /// let bulk = sf.bulk();
     /// let ingest = bulk.ingest();
-    /// let spec = BulkIngestSpec {
-    ///     object: Some("Account".into()),
-    ///     operation: BulkOperation::Insert,
-    ///     external_id_field_name: None,
-    ///     line_ending: None,
-    ///     column_delimiter: None,
-    ///     assignment_rule_id: None,
-    /// };
+    /// let spec = BulkIngestSpec::new("Account", BulkOperation::Insert);
     /// let job = ingest.create(&spec).await?;
     /// ingest.upload(&job.id, cirrus::Bytes::from("Name\nAcme\n")).await?;
     /// ingest.close(&job.id).await?;
@@ -135,28 +128,17 @@ impl BulkIngestHandler<'_> {
     /// state with a `content_url` indicating where to upload data.
     ///
     /// Rejects `spec` with [`CirrusError::InvalidInput`] before issuing
-    /// a request if `object` is set for a
-    /// [`ConsentImport`](BulkOperation::ConsentImport) operation, or
+    /// a request if `operation` is not one the ingest endpoint takes
+    /// ([`BulkOperation::is_ingest`]), or if `object` is set for a
+    /// [`ConsentImport`](BulkOperation::ConsentImport) operation or
     /// unset for any other — see [`BulkIngestSpec::object`].
     ///
     /// Calls `POST /services/data/{api_version}/jobs/ingest`.
     ///
     /// [Create a Job](https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm)
     pub async fn create(&self, spec: &BulkIngestSpec) -> CirrusResult<BulkIngestJob> {
-        match (spec.operation, spec.object.is_some()) {
-            (BulkOperation::ConsentImport, true) => Err(CirrusError::InvalidInput {
-                field: "object",
-                message: "must be omitted for consentImport: consent ingest isn't backed \
-                          by an object type, and Salesforce rejects a create-job request \
-                          that names one"
-                    .into(),
-            }),
-            (op, false) if op != BulkOperation::ConsentImport => Err(CirrusError::InvalidInput {
-                field: "object",
-                message: "required for every ingest operation except consentImport".into(),
-            }),
-            _ => self.client.post("jobs/ingest", spec).await,
-        }
+        check_ingest_spec(spec)?;
+        self.client.post("jobs/ingest", spec).await
     }
 
     /// Uploads CSV record data for a job. The job must be in `Open` state.
@@ -322,8 +304,21 @@ pub struct BulkQueryHandler<'a> {
 impl BulkQueryHandler<'_> {
     /// Creates a new query job.
     ///
+    /// Rejects `spec` with [`CirrusError::InvalidInput`] before issuing
+    /// a request if `operation` is not [`Query`](BulkOperation::Query)
+    /// or [`QueryAll`](BulkOperation::QueryAll)
+    /// ([`BulkOperation::is_query`]).
+    ///
     /// Calls `POST /services/data/{api_version}/jobs/query`.
     pub async fn create(&self, spec: &BulkQuerySpec) -> CirrusResult<BulkQueryJob> {
+        if !spec.operation.is_query() {
+            return Err(CirrusError::InvalidInput {
+                field: "operation",
+                message: "a query job runs `query` or `queryAll`; ingest operations go \
+                          through BulkIngestHandler"
+                    .into(),
+            });
+        }
         self.client.post("jobs/query", spec).await
     }
 
@@ -427,10 +422,26 @@ impl BulkQueryHandler<'_> {
 
 /// Request body for [`BulkIngestHandler::create`].
 ///
+/// Build one with [`new`](Self::new) (or
+/// [`consent_import`](Self::consent_import)) and the setters; the
+/// struct is `#[non_exhaustive]` so a field Salesforce adds to the
+/// create-job request later stays an additive change. The fields are
+/// public for reading and for in-place edits.
+///
 /// `content_type` is fixed to `"CSV"` server-side (the only supported
 /// value) and is not exposed here. Salesforce defaults `column_delimiter`
 /// to `Comma` and `line_ending` to `LF` when omitted.
+///
+/// ```
+/// use cirrus::{BulkColumnDelimiter, BulkIngestSpec, BulkOperation};
+///
+/// let spec = BulkIngestSpec::new("Account", BulkOperation::Upsert)
+///     .external_id_field_name("External_Id__c")
+///     .column_delimiter(BulkColumnDelimiter::Tab);
+/// assert_eq!(spec.object.as_deref(), Some("Account"));
+/// ```
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct BulkIngestSpec {
     /// API name of the object the data belongs to — for a marketing
     /// object, its API name. Required for every operation except
@@ -481,6 +492,65 @@ pub struct BulkIngestSpec {
     pub assignment_rule_id: Option<String>,
 }
 
+impl BulkIngestSpec {
+    /// A job running `operation` against `object`, with every optional
+    /// field unset so Salesforce applies its defaults. For
+    /// [`ConsentImport`](BulkOperation::ConsentImport), which takes no
+    /// object, use [`consent_import`](Self::consent_import).
+    pub fn new(object: impl Into<String>, operation: BulkOperation) -> Self {
+        Self {
+            object: Some(object.into()),
+            operation,
+            external_id_field_name: None,
+            line_ending: None,
+            column_delimiter: None,
+            assignment_rule_id: None,
+        }
+    }
+
+    /// A consent ingest job. The create-job request carries no `object`,
+    /// as the [Create a Job] page requires for this operation.
+    ///
+    /// [Create a Job]: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+    pub fn consent_import() -> Self {
+        Self {
+            object: None,
+            operation: BulkOperation::ConsentImport,
+            external_id_field_name: None,
+            line_ending: None,
+            column_delimiter: None,
+            assignment_rule_id: None,
+        }
+    }
+
+    /// Sets the external ID field an upsert matches on — see
+    /// [`external_id_field_name`](Self::external_id_field_name).
+    pub fn external_id_field_name(mut self, field: impl Into<String>) -> Self {
+        self.external_id_field_name = Some(field.into());
+        self
+    }
+
+    /// Sets the CSV line ending — see [`line_ending`](Self::line_ending).
+    pub fn line_ending(mut self, line_ending: crate::response::BulkLineEnding) -> Self {
+        self.line_ending = Some(line_ending);
+        self
+    }
+
+    /// Sets the CSV column delimiter — see
+    /// [`column_delimiter`](Self::column_delimiter).
+    pub fn column_delimiter(mut self, delimiter: crate::response::BulkColumnDelimiter) -> Self {
+        self.column_delimiter = Some(delimiter);
+        self
+    }
+
+    /// Sets the Case or Lead assignment rule to run — see
+    /// [`assignment_rule_id`](Self::assignment_rule_id).
+    pub fn assignment_rule_id(mut self, rule_id: impl Into<String>) -> Self {
+        self.assignment_rule_id = Some(rule_id.into());
+        self
+    }
+}
+
 /// Request body for [`BulkQueryHandler::create`].
 ///
 /// Salesforce retries a query job's processing automatically; a job
@@ -492,9 +562,15 @@ pub struct BulkIngestSpec {
 /// [Understanding Bulk API 2.0 Query] and the [Bulk API limits]
 /// cheatsheet.
 ///
+/// Build one with [`new`](Self::new) and the setters; the struct is
+/// `#[non_exhaustive]` so a field Salesforce adds to the create-job
+/// request later stays an additive change. The fields are public for
+/// reading and for in-place edits.
+///
 /// [Understanding Bulk API 2.0 Query]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/queries.htm
 /// [Bulk API limits]: https://developer.salesforce.com/docs/atlas.en-us.salesforce_app_limits_cheatsheet.meta/salesforce_app_limits_cheatsheet/salesforce_app_limits_platform_bulkapi.htm
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct BulkQuerySpec {
     /// SOQL to execute.
     pub query: String,
@@ -507,6 +583,62 @@ pub struct BulkQuerySpec {
     /// CSV column delimiter. Defaults server-side to `Comma` when `None`.
     #[serde(rename = "columnDelimiter", skip_serializing_if = "Option::is_none")]
     pub column_delimiter: Option<crate::response::BulkColumnDelimiter>,
+}
+
+impl BulkQuerySpec {
+    /// A job running `query` under `operation`
+    /// ([`Query`](BulkOperation::Query) or
+    /// [`QueryAll`](BulkOperation::QueryAll)), with the CSV formatting
+    /// fields unset so Salesforce applies its defaults.
+    pub fn new(query: impl Into<String>, operation: BulkOperation) -> Self {
+        Self {
+            query: query.into(),
+            operation,
+            line_ending: None,
+            column_delimiter: None,
+        }
+    }
+
+    /// Sets the CSV line ending — see [`line_ending`](Self::line_ending).
+    pub fn line_ending(mut self, line_ending: crate::response::BulkLineEnding) -> Self {
+        self.line_ending = Some(line_ending);
+        self
+    }
+
+    /// Sets the CSV column delimiter — see
+    /// [`column_delimiter`](Self::column_delimiter).
+    pub fn column_delimiter(mut self, delimiter: crate::response::BulkColumnDelimiter) -> Self {
+        self.column_delimiter = Some(delimiter);
+        self
+    }
+}
+
+/// The pre-flight checks a create-job request has to pass. Each failure
+/// is a 400 from Salesforce otherwise, and a job is never created, so
+/// refusing locally costs nothing but saves the round trip.
+fn check_ingest_spec(spec: &BulkIngestSpec) -> CirrusResult<()> {
+    if !spec.operation.is_ingest() {
+        return Err(CirrusError::InvalidInput {
+            field: "operation",
+            message: "an ingest job runs insert, update, upsert, delete, hardDelete, refresh \
+                      or consentImport; query operations go through BulkQueryHandler"
+                .into(),
+        });
+    }
+    match (spec.operation, spec.object.is_some()) {
+        (BulkOperation::ConsentImport, true) => Err(CirrusError::InvalidInput {
+            field: "object",
+            message: "must be omitted for consentImport: consent ingest isn't backed \
+                      by an object type, and Salesforce rejects a create-job request \
+                      that names one"
+                .into(),
+        }),
+        (op, false) if op != BulkOperation::ConsentImport => Err(CirrusError::InvalidInput {
+            field: "object",
+            message: "required for every ingest operation except consentImport".into(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Serialize)]
@@ -1250,5 +1382,141 @@ mod tests {
         let job = sf.bulk().query().abort("750xx").await.unwrap();
         assert_eq!(job.operation, BulkOperation::Query);
         assert_eq!(job.state, BulkJobState::Aborted);
+    }
+
+    #[tokio::test]
+    async fn ingest_create_rejects_a_query_or_unknown_operation_without_a_request() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // `operation` "Valid values are: insert, delete, hardDelete, update,
+        // upsert, refresh, consentImport". `query` / `queryAll` belong to
+        // `/jobs/query`, and `Unknown` names nothing, so each is refused
+        // locally rather than round-tripped for a 400.
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        for operation in [
+            BulkOperation::Query,
+            BulkOperation::QueryAll,
+            BulkOperation::Unknown,
+        ] {
+            let err = sf
+                .bulk()
+                .ingest()
+                .create(&BulkIngestSpec::new("Account", operation))
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "operation"),
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+        // The operation is checked before the object pairing, so a query
+        // operation with no object is reported as the wrong operation,
+        // not as a missing object.
+        let mut spec = BulkIngestSpec::new("Account", BulkOperation::Query);
+        spec.object = None;
+        match sf.bulk().ingest().create(&spec).await.unwrap_err() {
+            crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "operation"),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_create_rejects_an_ingest_or_unknown_operation_without_a_request() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-create-job.html
+        // `operation` "Possible values are: query, queryAll".
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        for operation in [
+            BulkOperation::Insert,
+            BulkOperation::Update,
+            BulkOperation::Upsert,
+            BulkOperation::Delete,
+            BulkOperation::HardDelete,
+            BulkOperation::Refresh,
+            BulkOperation::ConsentImport,
+            BulkOperation::Unknown,
+        ] {
+            let err = sf
+                .bulk()
+                .query()
+                .create(&BulkQuerySpec::new("SELECT Id FROM Account", operation))
+                .await
+                .unwrap_err();
+            match err {
+                crate::CirrusError::InvalidInput { field, .. } => assert_eq!(field, "operation"),
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_spec_constructor_serializes_only_object_and_operation() {
+        let spec = BulkIngestSpec::new("Account", BulkOperation::Insert);
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            json!({"object": "Account", "operation": "insert"})
+        );
+    }
+
+    #[test]
+    fn ingest_spec_consent_import_constructor_omits_object() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // "Omit this property for the consentImport operation."
+        let spec = BulkIngestSpec::consent_import();
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            json!({"operation": "consentImport"})
+        );
+    }
+
+    #[test]
+    fn ingest_spec_setters_serialize_under_the_documented_keys() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // Request-body parameter names.
+        let spec = BulkIngestSpec::new("Account", BulkOperation::Upsert)
+            .external_id_field_name("External_Id__c")
+            .line_ending(BulkLineEnding::CRLF)
+            .column_delimiter(BulkColumnDelimiter::Tab)
+            .assignment_rule_id("01Q000000000001AAA");
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            json!({
+                "object": "Account",
+                "operation": "upsert",
+                "externalIdFieldName": "External_Id__c",
+                "lineEnding": "CRLF",
+                "columnDelimiter": "TAB",
+                "assignmentRuleId": "01Q000000000001AAA"
+            })
+        );
+    }
+
+    #[test]
+    fn query_spec_constructor_and_setters_serialize_under_the_documented_keys() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-create-job.html
+        assert_eq!(
+            serde_json::to_value(BulkQuerySpec::new(
+                "SELECT Id FROM Account",
+                BulkOperation::Query
+            ))
+            .unwrap(),
+            json!({"query": "SELECT Id FROM Account", "operation": "query"})
+        );
+        let spec = BulkQuerySpec::new("SELECT Id FROM Account", BulkOperation::QueryAll)
+            .line_ending(BulkLineEnding::CRLF)
+            .column_delimiter(BulkColumnDelimiter::Pipe);
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap(),
+            json!({
+                "query": "SELECT Id FROM Account",
+                "operation": "queryAll",
+                "lineEnding": "CRLF",
+                "columnDelimiter": "PIPE"
+            })
+        );
     }
 }

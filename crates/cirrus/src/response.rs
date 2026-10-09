@@ -319,6 +319,35 @@ pub enum BulkOperation {
     Unknown,
 }
 
+impl BulkOperation {
+    /// `true` for an operation the ingest endpoint (`/jobs/ingest`)
+    /// accepts: `insert`, `update`, `upsert`, `delete`, `hardDelete`,
+    /// `refresh` and `consentImport`. [`Unknown`](Self::Unknown) is
+    /// neither an ingest nor a query operation.
+    ///
+    /// [Create a Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html)
+    pub fn is_ingest(self) -> bool {
+        matches!(
+            self,
+            Self::Insert
+                | Self::Update
+                | Self::Upsert
+                | Self::Delete
+                | Self::HardDelete
+                | Self::Refresh
+                | Self::ConsentImport
+        )
+    }
+
+    /// `true` for an operation the query endpoint (`/jobs/query`)
+    /// accepts: `query` and `queryAll`.
+    ///
+    /// [Create a Query Job](https://developer.salesforce.com/docs/platform/api-asynch/guide/query-create-job.html)
+    pub fn is_query(self) -> bool {
+        matches!(self, Self::Query | Self::QueryAll)
+    }
+}
+
 /// State of a Bulk API 2.0 job.
 ///
 /// Ingest job lifecycle: `Open` → `UploadComplete` → `InProgress` →
@@ -354,6 +383,19 @@ pub enum BulkJobState {
     /// [`unprocessed_records`]: crate::handlers::bulk::BulkIngestHandler::unprocessed_records
     /// [Get Job Info]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
     Failed,
+}
+
+impl BulkJobState {
+    /// `true` once Salesforce has stopped processing the job, for any
+    /// reason: `JobComplete`, `Failed` or `Aborted`. A poll loop over
+    /// [`BulkIngestHandler::get`] or [`BulkQueryHandler::get`] can stop
+    /// once this returns `true`.
+    ///
+    /// [`BulkIngestHandler::get`]: crate::handlers::bulk::BulkIngestHandler::get
+    /// [`BulkQueryHandler::get`]: crate::handlers::bulk::BulkQueryHandler::get
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::JobComplete | Self::Failed | Self::Aborted)
+    }
 }
 
 /// CSV line ending used in Bulk 2.0 job payloads and result downloads.
@@ -1881,6 +1923,53 @@ mod tests {
             (BulkOperation::ConsentImport, "consentImport"),
         ] {
             assert_eq!(serde_json::to_value(op).unwrap(), json!(wire));
+        }
+    }
+
+    #[test]
+    fn bulk_operation_knows_which_endpoint_takes_it() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/create-job.html
+        // and query-create-job.html: the ingest endpoint lists insert,
+        // delete, hardDelete, update, upsert, refresh and consentImport;
+        // the query endpoint lists query and queryAll.
+        for op in [
+            BulkOperation::Insert,
+            BulkOperation::Update,
+            BulkOperation::Upsert,
+            BulkOperation::Delete,
+            BulkOperation::HardDelete,
+            BulkOperation::Refresh,
+            BulkOperation::ConsentImport,
+        ] {
+            assert!(op.is_ingest(), "{op:?}");
+            assert!(!op.is_query(), "{op:?}");
+        }
+        for op in [BulkOperation::Query, BulkOperation::QueryAll] {
+            assert!(op.is_query(), "{op:?}");
+            assert!(!op.is_ingest(), "{op:?}");
+        }
+        assert!(!BulkOperation::Unknown.is_ingest());
+        assert!(!BulkOperation::Unknown.is_query());
+    }
+
+    #[test]
+    fn bulk_job_state_is_terminal_once_processing_has_ended() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/get-job-info.html
+        // `state`: JobComplete, Failed and Aborted end a job; Open,
+        // UploadComplete and InProgress precede processing or are it.
+        for state in [
+            BulkJobState::JobComplete,
+            BulkJobState::Failed,
+            BulkJobState::Aborted,
+        ] {
+            assert!(state.is_terminal(), "{state:?}");
+        }
+        for state in [
+            BulkJobState::Open,
+            BulkJobState::UploadComplete,
+            BulkJobState::InProgress,
+        ] {
+            assert!(!state.is_terminal(), "{state:?}");
         }
     }
 

@@ -30,14 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bulk = sf.bulk();
     let ingest = bulk.ingest();
 
-    let spec = BulkIngestSpec {
-        object: Some("Account".into()),
-        operation: BulkOperation::Insert,
-        external_id_field_name: None,
-        line_ending: None,
-        column_delimiter: None,
-        assignment_rule_id: None,
-    };
+    let spec = BulkIngestSpec::new("Account", BulkOperation::Insert);
     let job = ingest.create(&spec).await?;
     println!("created job: id={}, state={:?}", job.id, job.state);
 
