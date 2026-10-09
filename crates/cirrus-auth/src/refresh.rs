@@ -122,6 +122,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 /// Salesforce production login URL — also the default token-exchange host.
 pub const PRODUCTION_LOGIN_URL: &str = "https://login.salesforce.com";
@@ -384,15 +385,23 @@ impl AuthSession for RefreshTokenAuth {
         // finishes, and the cache write stays inside the task so a cancelled
         // caller still leaves the outcome behind for the callers queued
         // after it.
+        //
+        // The task carries the caller's span: the mint and rotation events
+        // and the `RotationHandler` call all happen inside it, and an
+        // operator filtering logs by a request-scoped field has to find
+        // them under the request that triggered them.
         let mut guard = Arc::clone(&self.state).write_owned().await;
         if let Some(outcome) = guard.mint.shared_outcome(started) {
             return outcome.map(Cow::Owned);
         }
         let config = Arc::clone(&self.config);
-        let task = tokio::spawn(async move {
-            let minted = config.mint_token(&mut guard).await;
-            guard.mint.record("refresh-token", minted)
-        });
+        let task = tokio::spawn(
+            async move {
+                let minted = config.mint_token(&mut guard).await;
+                guard.mint.record("refresh-token", minted)
+            }
+            .in_current_span(),
+        );
         match task.await {
             Ok(result) => result.map(Cow::Owned),
             // Report only *that* the task failed. `JoinError`'s `Display`
@@ -1154,6 +1163,48 @@ mod tests {
         async fn on_rotation(&self, new_refresh_token: &str) {
             self.seen.lock().await.push(new_refresh_token.to_string());
         }
+    }
+
+    /// Records the span that is current when the rotation handler runs.
+    struct SpanRecordingHandler {
+        seen: Arc<std::sync::Mutex<Option<tracing::span::Id>>>,
+    }
+
+    #[async_trait]
+    impl RotationHandler for SpanRecordingHandler {
+        async fn on_rotation(&self, _: &str) {
+            *self.seen.lock().unwrap() = tracing::Span::current().id();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_detached_mint_runs_in_the_callers_span() {
+        use tracing::Instrument;
+        // The mint, its events and the rotation handler run in a task
+        // detached from the caller. An operator filtering logs by a
+        // request-scoped field must still find the rotation event for that
+        // request, so the task has to carry the caller's span.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(token_response("at-1", Some("rt-2")))
+            .mount(&server)
+            .await;
+        let _recording = crate::test_support::Capture::record();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .on_rotation(Arc::new(SpanRecordingHandler { seen: seen.clone() }))
+            .build()
+            .unwrap();
+
+        let span = tracing::info_span!("request", tenant = "acme");
+        let expected = span
+            .id()
+            .expect("the test subscriber enables spans under cirrus_auth");
+        auth.access_token().instrument(span).await.unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), Some(expected));
     }
 
     #[tokio::test]

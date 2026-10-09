@@ -468,8 +468,7 @@ impl JwtAuthBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use crate::test_support::decode_jwt_segment;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{body_string_contains, method, path};
@@ -959,13 +958,6 @@ mod tests {
     }
 
     /// Base64url-decodes one dot-separated JWT segment into JSON.
-    fn decode_jwt_segment(segment: &str) -> serde_json::Value {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(segment)
-            .expect("segment is base64url");
-        serde_json::from_slice(&bytes).expect("segment is JSON")
-    }
-
     /// Captures the request body so assertions can read individual form
     /// parameters rather than substring-matching the whole body.
     struct BodyCapturingResponder {

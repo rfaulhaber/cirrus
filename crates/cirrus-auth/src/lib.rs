@@ -72,6 +72,8 @@ pub mod jwt;
 mod mint;
 pub mod refresh;
 pub mod static_token;
+#[cfg(test)]
+mod test_support;
 mod token_endpoint;
 pub mod token_exchange;
 pub mod transport;
