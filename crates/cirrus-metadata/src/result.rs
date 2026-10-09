@@ -1461,6 +1461,21 @@ mod tests {
         assert_eq!(parsed.problem, DeployProblemType::Unknown);
     }
 
+    #[test]
+    fn unnamed_manageable_state_writes_its_own_literal_and_reads_back_as_unknown() {
+        // The literal Salesforce sent is not kept: `Unknown` serializes as
+        // its own name, camelCased like the enum's other variants, and
+        // parses as itself.
+        let state: ManageableState = serde_json::from_str("\"brandNewState\"").unwrap();
+        assert_eq!(state, ManageableState::Unknown);
+        let written = serde_json::to_string(&state).unwrap();
+        assert_eq!(written, "\"unknown\"");
+        assert_eq!(
+            serde_json::from_str::<ManageableState>(&written).unwrap(),
+            ManageableState::Unknown
+        );
+    }
+
     /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
     /// DeployResult.status is a "DeployStatus (enumeration of type
     /// string)" whose valid values are Pending, InProgress,

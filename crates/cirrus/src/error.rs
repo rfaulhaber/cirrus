@@ -152,7 +152,19 @@ pub enum CirrusError {
     /// Log the error with `{}` where record data must not reach the log.
     ///
     /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
-    /// later field is an additive change.
+    /// later field is an additive change. Naming only `records` does not
+    /// compile outside this crate:
+    ///
+    /// ```compile_fail
+    /// use cirrus::CirrusError;
+    ///
+    /// fn count(err: &CirrusError) -> usize {
+    ///     match err {
+    ///         CirrusError::MultipleMatches { records } => records.len(),
+    ///         _ => 0,
+    ///     }
+    /// }
+    /// ```
     ///
     /// [upsert]: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
     //

@@ -7,7 +7,9 @@
 //!   [`describe_global`].
 //! - [`SObjectHandler`] (from [`Cirrus::sobject`]): per-object
 //!   operations — describe metadata, retrieve, create, update, delete,
-//!   and retrieve, upsert and delete by external ID. Generic over
+//!   the conditional record calls ([`retrieve_if_modified_since`] and
+//!   [`update_if_unmodified_since`]), [`retrieve_blob`], and retrieve,
+//!   upsert and delete by external ID. Generic over
 //!   caller-supplied record types: every method that
 //!   produces a record returns `serde_json::Value` by default, with an
 //!   `_as::<T>()` variant for typed deserialization.
@@ -40,6 +42,9 @@
 //! ```
 //!
 //! [`describe_global`]: SObjectsHandler::describe_global
+//! [`retrieve_if_modified_since`]: SObjectHandler::retrieve_if_modified_since
+//! [`update_if_unmodified_since`]: SObjectHandler::update_if_unmodified_since
+//! [`retrieve_blob`]: SObjectHandler::retrieve_blob
 //! [`Cirrus::sobjects`]: crate::Cirrus::sobjects
 //! [`Cirrus::sobject`]: crate::Cirrus::sobject
 
@@ -115,7 +120,7 @@ impl SObjectsHandler<'_> {
     ///
     /// `since` is formatted as RFC 7231 IMF-fixdate (e.g.
     /// `"Wed, 21 Oct 2015 07:28:00 GMT"`) before being sent. A `since`
-    /// before the Unix epoch, or in year 9999 or later, can't be
+    /// before the Unix epoch, or in year 10000 or later, can't be
     /// expressed in that format and returns
     /// [`CirrusError::InvalidHeader`].
     pub async fn describe_global_if_modified_since(
@@ -243,7 +248,7 @@ impl<'a> SObjectHandler<'a> {
     /// `since` is sent as an RFC 7231 IMF-fixdate in GMT, a form of the
     /// `EEE, dd MMM yyyy HH:mm:ss z` pattern the resource pages give. A
     /// time that format can't express — before the Unix epoch, or in year
-    /// 9999 or later — returns [`CirrusError::InvalidHeader`] without a
+    /// 10000 or later — returns [`CirrusError::InvalidHeader`] without a
     /// request.
     ///
     /// The `If-Match` and `If-None-Match` ETag headers are documented for
@@ -762,13 +767,13 @@ impl<'a> SObjectHandler<'a> {
 /// conditional-request header.
 ///
 /// `httpdate::fmt_http_date` is partial: it panics for times before the
-/// Unix epoch and for year 9999 onwards. Both bounds are checked here so
+/// Unix epoch and for year 10000 onwards. Both bounds are checked here so
 /// a caller-supplied watermark — a stored sentinel, a clock skewed
 /// backwards — surfaces as an error instead of unwinding the calling
 /// task.
 fn http_date(header: &str, since: SystemTime) -> CirrusResult<String> {
-    // httpdate's own ceiling, in seconds since the epoch: 9999-01-01.
-    const YEAR_9999: u64 = 253_402_300_800;
+    // httpdate's own ceiling, in seconds since the epoch: 10000-01-01.
+    const YEAR_10000: u64 = 253_402_300_800;
 
     let secs = since
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -778,9 +783,9 @@ fn http_date(header: &str, since: SystemTime) -> CirrusResult<String> {
             ))
         })?
         .as_secs();
-    if secs >= YEAR_9999 {
+    if secs >= YEAR_10000 {
         return Err(CirrusError::InvalidHeader(format!(
-            "{header} requires a time before year 9999"
+            "{header} requires a time before year 10000"
         )));
     }
     Ok(httpdate::fmt_http_date(since))
@@ -1761,12 +1766,21 @@ mod tests {
         }
 
         #[test]
-        fn http_date_rejects_year_9999_and_later() {
+        fn http_date_rejects_year_10000_and_later() {
             let t = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800);
             assert!(matches!(
                 http_date("If-Modified-Since", t),
                 Err(crate::CirrusError::InvalidHeader(_))
             ));
+        }
+
+        #[test]
+        fn http_date_accepts_the_last_second_of_year_9999() {
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_799);
+            assert_eq!(
+                http_date("If-Modified-Since", t).unwrap(),
+                "Fri, 31 Dec 9999 23:59:59 GMT"
+            );
         }
 
         #[tokio::test]
@@ -2250,10 +2264,11 @@ mod tests {
 
         #[tokio::test]
         async fn retrieve_blob_surfaces_the_error_array_on_404() {
-            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
-            // The page's 404 body for an unknown resource, wrapped in the
-            // error array the REST API returns for a non-2xx response; the
-            // blob page prints no error body of its own.
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/errorcodes.html
+            // The "Resource doesn't exist" body, `[{"message": "The requested
+            // resource does not exist", "errorCode": "NOT_FOUND"}]`, under a
+            // 404, which the status table describes as "The requested resource
+            // couldn't be found." The endpoint's own page prints no error body.
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path(

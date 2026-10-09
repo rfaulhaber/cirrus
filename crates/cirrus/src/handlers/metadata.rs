@@ -464,6 +464,14 @@ pub struct DeployResult {
 }
 
 /// Deprecated alias of [`DeployResult`].
+///
+/// ```
+/// # #![allow(deprecated)]
+/// fn accepts(_: &cirrus::DeployResultDetails) {}
+/// fn passes(value: &cirrus::DeployResult) {
+///     accepts(value)
+/// }
+/// ```
 #[deprecated(since = "0.8.0", note = "renamed to `DeployResult`")]
 pub type DeployResultDetails = DeployResult;
 
@@ -522,6 +530,14 @@ pub struct DeployDetails {
 }
 
 /// Deprecated alias of [`DeployDetails`].
+///
+/// ```
+/// # #![allow(deprecated)]
+/// fn accepts(_: &cirrus::DeployResultInnerDetails) {}
+/// fn passes(value: &cirrus::DeployDetails) {
+///     accepts(value)
+/// }
+/// ```
 #[deprecated(since = "0.8.0", note = "renamed to `DeployDetails`")]
 pub type DeployResultInnerDetails = DeployDetails;
 
@@ -641,6 +657,14 @@ pub struct RunTestsResult {
 }
 
 /// Deprecated alias of [`RunTestsResult`].
+///
+/// ```
+/// # #![allow(deprecated)]
+/// fn accepts(_: &cirrus::RunTestResults) {}
+/// fn passes(value: &cirrus::RunTestsResult) {
+///     accepts(value)
+/// }
+/// ```
 #[deprecated(since = "0.8.0", note = "renamed to `RunTestsResult`")]
 pub type RunTestResults = RunTestsResult;
 

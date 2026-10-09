@@ -2410,6 +2410,20 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_bulk_operation_writes_its_own_literal_and_reads_back_as_unknown() {
+        // The literal Salesforce sent is not kept: `Unknown` serializes as
+        // its own name, which no endpoint accepts, and parses as itself.
+        let op: BulkOperation = serde_json::from_value(json!("someFutureOperation")).unwrap();
+        assert_eq!(op, BulkOperation::Unknown);
+        let written = serde_json::to_value(op).unwrap();
+        assert_eq!(written, json!("Unknown"));
+        assert_eq!(
+            serde_json::from_value::<BulkOperation>(written).unwrap(),
+            BulkOperation::Unknown
+        );
+    }
+
+    #[test]
     fn bulk_operation_serializes_to_the_documented_wire_names() {
         // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
         for (op, wire) in [

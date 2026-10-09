@@ -1243,8 +1243,10 @@ impl Cirrus {
     ///
     /// Used by Bulk 2.0 result downloads — the response body is `text/csv`
     /// and the caller may need response headers for cursor pagination
-    /// (`Sforce-Locator`, `Sforce-NumberOfRecords`). Path resolution still
-    /// follows [`Cirrus`]'s three-mode semantics.
+    /// (`Sforce-Locator`, `Sforce-NumberOfRecords`) — and by the other
+    /// raw-body downloads: Event Monitoring log files, sObject blob fields
+    /// and the Apex log body. Path resolution still follows [`Cirrus`]'s
+    /// three-mode semantics.
     pub(crate) async fn fetch_raw(
         &self,
         method: reqwest::Method,

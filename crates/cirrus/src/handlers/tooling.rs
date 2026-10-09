@@ -1153,10 +1153,11 @@ mod tests {
 
     #[tokio::test]
     async fn apex_log_body_surfaces_the_error_array_on_404() {
-        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
-        // The page's 404 body for an unknown resource, wrapped in the
-        // error array the REST API returns for a non-2xx response; the
-        // Tooling page prints no error body of its own.
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/errorcodes.html
+        // The "Resource doesn't exist" body, `[{"message": "The requested
+        // resource does not exist", "errorCode": "NOT_FOUND"}]`, under a
+        // 404, which the status table describes as "The requested resource
+        // couldn't be found." The endpoint's own page prints no error body.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(

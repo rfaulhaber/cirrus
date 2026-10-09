@@ -455,6 +455,29 @@ impl<T> SObjectCollection<T> {
 /// row refused up front, and a row's own `attributes` member dropped or
 /// checked against the target type, send their rows through
 /// [`CompositeSObjectsHandler::create_records`] and its siblings.
+///
+/// A record of another type than the rest of the collection is built from
+/// its parts:
+///
+/// ```no_run
+/// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+/// # use std::sync::Arc;
+/// use cirrus::{COLLECTION_MAX_RECORDS, CollectionRecord, RecordAttributes, SObjectCollection};
+/// use serde_json::json;
+/// # async fn example() -> Result<(), cirrus::CirrusError> {
+/// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+/// # let sf = Cirrus::builder().auth(auth).build()?;
+/// let mut collection = SObjectCollection::new("Account", [json!({ "Name": "Acme" })]);
+/// collection.push(CollectionRecord {
+///     attributes: RecordAttributes::new("Contact"),
+///     record: json!({ "LastName": "Doe" }),
+/// });
+/// assert!(collection.records.len() <= COLLECTION_MAX_RECORDS);
+/// let results = sf.composite().sobjects().create(&collection).await?;
+/// # let _ = results;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionRecord<T> {
     /// The `attributes` map Salesforce requires on every record.
