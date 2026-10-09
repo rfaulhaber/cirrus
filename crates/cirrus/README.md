@@ -70,8 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `cirrus::soql::escape_like` (part of a `LIKE` pattern).
 - **SOSL** — `sf.search(...)` and `sf.parameterized_search(...)`;
   `cirrus::sosl::escape_term` escapes a `FIND` term.
-- **Composite** — all four shapes: `composite/batch`, `composite/tree`,
-  `composite/sobjects` (collections), and the generic chained-reference
+- **Composite** — every documented shape: `composite/batch`, `composite/tree`,
+  `composite/sobjects` (collections), `composite/graph` (up to 500 record
+  nodes in per-graph all-or-nothing units), and the generic chained-reference
   `/composite` endpoint.
 - **Bulk API 2.0** — ingest (`bulk().ingest()`) and query (`bulk().query()`)
   with the full lifecycle: `create` (or the one-request multipart

@@ -77,8 +77,9 @@ pub use handlers::bulk::{
     BulkIngestSpec, BulkJobListOptions, BulkQuerySpec, MAX_MULTIPART_JOB_DATA_CHARS,
 };
 pub use handlers::composite::{
-    BatchRequest, BatchSubrequest, COLLECTION_MAX_RECORDS, CollectionRecord, CompositeRequest,
-    CompositeSubrequest, RecordAttributes, SObjectCollection,
+    BatchRequest, BatchSubrequest, COLLECTION_MAX_RECORDS, CollectionRecord, CompositeGraph,
+    CompositeGraphRequest, CompositeRequest, CompositeSubrequest, RecordAttributes,
+    SObjectCollection,
 };
 pub use handlers::metadata::{
     DeployDetails, DeployMessage, DeployOptions, DeployRequest, DeployResult, DeployStatus,
@@ -94,10 +95,10 @@ pub use response::{
     ApiVersion, BatchResponse, BatchSubresult, BulkColumnDelimiter, BulkIngestJob, BulkJobList,
     BulkJobState, BulkJobStateChange, BulkJobSummary, BulkJobType, BulkLineEnding, BulkOperation,
     BulkQueryJob, BulkQueryResults, BulkResultPage, BulkResultPages, CompositeError,
-    CompositeResponse, CompositeSubresponse, CompositeTreeResponse, CompositeTreeResult,
-    DescribeGlobal, EventLogFileRecord, ExecuteAnonymousResult, Limit, OrgLimits, QueryResult,
-    RawBody, RawResponse, SObjectCollectionResult, SObjectCreateResult, SObjectMetadata,
-    SearchResult,
+    CompositeGraphResponse, CompositeGraphResult, CompositeResponse, CompositeSubresponse,
+    CompositeTreeResponse, CompositeTreeResult, DescribeGlobal, EventLogFileRecord,
+    ExecuteAnonymousResult, Limit, OrgLimits, QueryResult, RawBody, RawResponse,
+    SObjectCollectionResult, SObjectCreateResult, SObjectMetadata, SearchResult,
 };
 pub use retry::{Replay, RetryPolicy};
 

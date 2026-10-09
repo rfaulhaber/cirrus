@@ -9,6 +9,10 @@
 //!   sub-requests in one call. Sub-requests run serially; the outer call
 //!   always returns HTTP 200 for a well-formed batch and per-subrequest
 //!   failures surface via [`BatchResponse::has_errors`].
+//! - [`CompositeHandler::graph`] — `POST /composite/graph`, up to 500
+//!   record nodes across as many as 75 graphs, each graph committed or
+//!   rolled back as a unit and reporting its own
+//!   [`CompositeGraphResult::is_successful`](crate::CompositeGraphResult::is_successful).
 //!
 //! # Sub-request URL shape
 //!
@@ -24,8 +28,8 @@
 use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
 use crate::response::{
-    BatchResponse, CompositeResponse, CompositeTreeResponse, SObjectCollectionResult,
-    parse_error_response, parse_response_bytes,
+    BatchResponse, CompositeGraphResponse, CompositeResponse, CompositeTreeResponse,
+    SObjectCollectionResult, parse_error_response, parse_response_bytes,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -269,6 +273,82 @@ impl<'a> CompositeHandler<'a> {
     {
         self.client.post("composite", body).await
     }
+
+    /// Executes one or more composite graphs in a single round trip via
+    /// `POST /services/data/{api_version}/composite/graph` (API 50.0
+    /// and later).
+    ///
+    /// A graph is a set of record subrequests (its *nodes*) that
+    /// Salesforce commits or rolls back together, so a caller does not
+    /// have to work out which nodes succeeded: each graph's
+    /// [`CompositeGraphResult::is_successful`](crate::CompositeGraphResult::is_successful) says whether the whole
+    /// graph went through. Where [`execute`](Self::execute) takes 25
+    /// subrequests, one request here carries up to 500 nodes, spread
+    /// over as many as 75 graphs of at most 15 levels of `@{ref}`
+    /// dependency depth. The graphs in one request are independent;
+    /// after 14 graphs have failed Salesforce stops, and the remaining
+    /// graphs report `PROCESSING_HALTED`.
+    ///
+    /// Nodes are confined to record resources: `sobjects/{type}` with
+    /// POST, `sobjects/{type}/{id}` with GET, PATCH or DELETE, and
+    /// `sobjects/{type}/{field}/{externalId}` with any of the four. Each
+    /// node's `url` carries the full `/services/data/vXX.X/` prefix,
+    /// as for `execute`, and `graphId` values must be unique, start
+    /// with a letter or digit, stay under 40 characters and contain
+    /// no period.
+    ///
+    /// `body` is any [`Serialize`] value matching the documented
+    /// envelope — typically a [`CompositeGraphRequest`]. A request the
+    /// endpoint refuses as a whole (a duplicate `graphId`, too many
+    /// nodes) is a [`CirrusError::Api`]; a graph that fails inside an
+    /// accepted request is reported through its result, not as an
+    /// error.
+    ///
+    /// ```ignore
+    /// use cirrus::{CompositeGraph, CompositeGraphRequest, CompositeSubrequest};
+    /// use serde_json::json;
+    ///
+    /// let req = CompositeGraphRequest {
+    ///     graphs: vec![CompositeGraph {
+    ///         graph_id: "acme".into(),
+    ///         composite_request: vec![
+    ///             CompositeSubrequest {
+    ///                 method: "POST".into(),
+    ///                 url: "/services/data/v66.0/sobjects/Account".into(),
+    ///                 reference_id: "account".into(),
+    ///                 body: Some(json!({"Name": "Acme"})),
+    ///                 http_headers: None,
+    ///             },
+    ///             CompositeSubrequest {
+    ///                 method: "POST".into(),
+    ///                 url: "/services/data/v66.0/sobjects/Contact".into(),
+    ///                 reference_id: "contact".into(),
+    ///                 body: Some(json!({
+    ///                     "LastName": "Doe",
+    ///                     "AccountId": "@{account.id}"
+    ///                 })),
+    ///                 http_headers: None,
+    ///             },
+    ///         ],
+    ///     }],
+    /// };
+    /// let resp = sf.composite().graph(&req).await?;
+    /// for graph in &resp.graphs {
+    ///     if !graph.is_successful {
+    ///         for node in &graph.graph_response.composite_response {
+    ///             if node.is_error() {
+    ///                 eprintln!("{} failed: {}", node.reference_id, node.body);
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub async fn graph<B>(&self, body: &B) -> CirrusResult<CompositeGraphResponse>
+    where
+        B: Serialize + ?Sized,
+    {
+        self.client.post("composite/graph", body).await
+    }
 }
 
 /// Parses a `/composite/tree` response, accepting the documented rollback
@@ -349,6 +429,34 @@ pub struct CompositeSubrequest {
     /// Setting any header also opts the sub-request out of collation.
     #[serde(rename = "httpHeaders", skip_serializing_if = "Option::is_none")]
     pub http_headers: Option<BTreeMap<String, String>>,
+}
+
+/// Request body for [`CompositeHandler::graph`].
+///
+/// Serializes to the documented `{"graphs": [...]}` envelope. Equivalent
+/// to a `serde_json::json!({...})` literal of the same shape; both flow
+/// through the method's generic [`Serialize`] bound.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CompositeGraphRequest {
+    /// The graphs to execute, at most 75 in one request and at most 500
+    /// nodes across all of them. Each graph is its own unit of work.
+    pub graphs: Vec<CompositeGraph>,
+}
+
+/// One graph in [`CompositeGraphRequest::graphs`]: a set of record
+/// subrequests that Salesforce commits or rolls back together.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompositeGraph {
+    /// Identifies the graph in the response. Must be unique within the
+    /// request, start with a letter or digit, be under 40 characters,
+    /// and contain no period.
+    #[serde(rename = "graphId")]
+    pub graph_id: String,
+    /// The graph's nodes. Salesforce documents `method`, `url`,
+    /// `referenceId` and `body` for a graph node, so leave
+    /// [`CompositeSubrequest::http_headers`] as `None` here.
+    #[serde(rename = "compositeRequest")]
+    pub composite_request: Vec<CompositeSubrequest>,
 }
 
 /// Maximum number of records one sObject Collections create, update,
@@ -1679,6 +1787,271 @@ mod tests {
         let err = sf
             .composite()
             .execute(&json!({"compositeRequest": []}))
+            .await
+            .unwrap_err();
+        match err {
+            crate::CirrusError::Api { status, errors, .. } => {
+                assert_eq!(status, 400);
+                assert_eq!(errors[0].error_code, "INVALID_INPUT");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    /// The request and response bodies printed on the Composite Graph
+    /// resource page, trimmed to the first graph's first two nodes and
+    /// the whole second graph.
+    //
+    // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-graph.html
+    fn documented_graph_request() -> serde_json::Value {
+        json!({
+            "graphs": [
+                {
+                    "graphId": "1",
+                    "compositeRequest": [
+                        {
+                            "url": "/services/data/v68.0/sobjects/Account/",
+                            "body": { "name": "Cloudy Consulting" },
+                            "method": "POST",
+                            "referenceId": "reference_id_account_1"
+                        },
+                        {
+                            "url": "/services/data/v68.0/sobjects/Contact/",
+                            "body": {
+                                "FirstName": "Nellie",
+                                "LastName": "Cashman",
+                                "AccountId": "@{reference_id_account_1.id}"
+                            },
+                            "method": "POST",
+                            "referenceId": "reference_id_contact_1"
+                        }
+                    ]
+                },
+                {
+                    "graphId": "2",
+                    "compositeRequest": [
+                        {
+                            "url": "/services/data/v68.0/sobjects/Account/",
+                            "body": { "name": "Easy Spaces" },
+                            "method": "POST",
+                            "referenceId": "reference_id_account_2"
+                        }
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn documented_graph_response() -> serde_json::Value {
+        json!({
+            "graphs": [
+                {
+                    "graphId": "1",
+                    "graphResponse": {
+                        "compositeResponse": [
+                            {
+                                "body": {
+                                    "id": "001R00000064wc7IAA",
+                                    "success": true,
+                                    "errors": []
+                                },
+                                "httpHeaders": {
+                                    "Location": "/services/data/v68.0/sobjects/Account/001R00000064wc7IAA"
+                                },
+                                "httpStatusCode": 201,
+                                "referenceId": "reference_id_account_1"
+                            },
+                            {
+                                "body": {
+                                    "id": "003R000000DDMlTIAX",
+                                    "success": true,
+                                    "errors": []
+                                },
+                                "httpHeaders": {
+                                    "Location": "/services/data/v68.0/sobjects/Contact/003R000000DDMlTIAX"
+                                },
+                                "httpStatusCode": 201,
+                                "referenceId": "reference_id_contact_1"
+                            }
+                        ]
+                    },
+                    "isSuccessful": true
+                },
+                {
+                    "graphId": "2",
+                    "graphResponse": {
+                        "compositeResponse": [
+                            {
+                                "body": {
+                                    "id": "001R00000064wc8IAA",
+                                    "success": true,
+                                    "errors": []
+                                },
+                                "httpHeaders": {
+                                    "Location": "/services/data/v68.0/sobjects/Account/001R00000064wc8IAA"
+                                },
+                                "httpStatusCode": 201,
+                                "referenceId": "reference_id_account_2"
+                            }
+                        ]
+                    },
+                    "isSuccessful": true
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn graph_posts_the_documented_body_and_parses_each_graph() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/graph"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(documented_graph_request()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_graph_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let resp = sf
+            .composite()
+            .graph(&documented_graph_request())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.graphs.len(), 2);
+        let first = &resp.graphs[0];
+        assert_eq!(first.graph_id, "1");
+        assert!(first.is_successful);
+        let nodes = &first.graph_response.composite_response;
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].reference_id, "reference_id_account_1");
+        assert_eq!(nodes[0].http_status_code, 201);
+        assert!(nodes[0].is_success());
+        assert_eq!(nodes[0].body["id"], "001R00000064wc7IAA");
+        assert_eq!(
+            nodes[0].http_headers.get("location").unwrap(),
+            "/services/data/v68.0/sobjects/Account/001R00000064wc7IAA"
+        );
+        let second = &resp.graphs[1];
+        assert_eq!(second.graph_id, "2");
+        assert_eq!(second.graph_response.composite_response.len(), 1);
+    }
+
+    #[test]
+    fn graph_typed_request_serializes_the_documented_keys() {
+        // Pins `graphId` / `compositeRequest` and the subrequest keys to
+        // the documented spelling by comparing against the resource
+        // page's body, with the optional members omitted as that body
+        // omits them.
+        let req = CompositeGraphRequest {
+            graphs: vec![
+                CompositeGraph {
+                    graph_id: "1".into(),
+                    composite_request: vec![
+                        CompositeSubrequest {
+                            method: "POST".into(),
+                            url: "/services/data/v68.0/sobjects/Account/".into(),
+                            reference_id: "reference_id_account_1".into(),
+                            body: Some(json!({ "name": "Cloudy Consulting" })),
+                            http_headers: None,
+                        },
+                        CompositeSubrequest {
+                            method: "POST".into(),
+                            url: "/services/data/v68.0/sobjects/Contact/".into(),
+                            reference_id: "reference_id_contact_1".into(),
+                            body: Some(json!({
+                                "FirstName": "Nellie",
+                                "LastName": "Cashman",
+                                "AccountId": "@{reference_id_account_1.id}"
+                            })),
+                            http_headers: None,
+                        },
+                    ],
+                },
+                CompositeGraph {
+                    graph_id: "2".into(),
+                    composite_request: vec![CompositeSubrequest {
+                        method: "POST".into(),
+                        url: "/services/data/v68.0/sobjects/Account/".into(),
+                        reference_id: "reference_id_account_2".into(),
+                        body: Some(json!({ "name": "Easy Spaces" })),
+                        http_headers: None,
+                    }],
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            documented_graph_request()
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_reports_a_failed_graph_through_is_successful() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-graph.html
+        // `isSuccessful`: "Whether this graph was processed successfully
+        // (true) or not (false)". The failing node carries the error
+        // array the Composite Subrequest Result page prints for a
+        // subrequest "that had an error while trying to create a
+        // Contact". A failed graph still arrives in a 200: the outer
+        // call succeeded, each graph reports its own outcome.
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/graph"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "graphs": [{
+                    "graphId": "1",
+                    "graphResponse": {
+                        "compositeResponse": [{
+                            "body": [{
+                                "message": "Email: invalid email address: Not a real email address",
+                                "errorCode": "INVALID_EMAIL_ADDRESS",
+                                "fields": ["Email"]
+                            }],
+                            "httpHeaders": {},
+                            "httpStatusCode": 400,
+                            "referenceId": "badContact"
+                        }]
+                    },
+                    "isSuccessful": false
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let resp = sf.composite().graph(&json!({"graphs": []})).await.unwrap();
+        let graph = &resp.graphs[0];
+        assert!(!graph.is_successful);
+        let node = &graph.graph_response.composite_response[0];
+        assert!(node.is_error());
+        assert_eq!(node.body[0]["errorCode"], "INVALID_EMAIL_ADDRESS");
+    }
+
+    #[tokio::test]
+    async fn graph_top_level_400_surfaces_as_api_error() {
+        // A request the endpoint refuses as a whole answers with the
+        // standard error array, like every other composite resource.
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/graph"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!([{
+                "message": "Graph ID must be unique: 1",
+                "errorCode": "INVALID_INPUT"
+            }])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .composite()
+            .graph(&json!({"graphs": []}))
             .await
             .unwrap_err();
         match err {
