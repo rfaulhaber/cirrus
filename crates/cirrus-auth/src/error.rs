@@ -150,7 +150,7 @@ pub enum AuthError {
     Randomness(String),
 
     /// Catch-all for auth failures not modelled by a dedicated variant
-    /// (system clock outside the UNIX epoch, private-key loading, a
+    /// (system clock outside the UNIX epoch, reading a private-key file, a
     /// token-mint task that did not run to completion). Carries the
     /// underlying message.
     #[error("authentication failed: {0}")]

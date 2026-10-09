@@ -40,6 +40,7 @@
 //! own purposes does not affect token minting here.
 
 use crate::AuthSession;
+use crate::assertion::private_key_from_pem;
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
@@ -294,24 +295,44 @@ impl JwtAuthBuilder {
     }
 
     /// Loads the RSA private key from a PEM file at the given path.
+    ///
+    /// The path is a [`camino::Utf8PathBuf`] or anything that converts
+    /// into one, such as a `&str`. A `std::path::PathBuf` from an argument
+    /// parser or an environment variable converts with
+    /// [`Utf8PathBuf::try_from`](camino::Utf8PathBuf::try_from); `camino`
+    /// is re-exported as [`cirrus_auth::camino`](crate::camino) for that,
+    /// and [`private_key_pem_bytes`](Self::private_key_pem_bytes) takes
+    /// the file's contents when the path cannot be UTF-8.
+    ///
+    /// ```no_run
+    /// use cirrus_auth::{JwtAuth, camino::Utf8PathBuf};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let key_path = std::path::PathBuf::from("./private.pem");
+    /// let builder = JwtAuth::builder().private_key_pem_file(Utf8PathBuf::try_from(key_path)?)?;
+    /// # let _ = builder;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn private_key_pem_file(mut self, path: impl Into<Utf8PathBuf>) -> AuthResult<Self> {
         let path = path.into();
         let bytes = fs_err::read(path.as_std_path())
             .map_err(|e| AuthError::Other(format!("failed to read private key: {e}")))?;
-        self.encoding_key = Some(
-            EncodingKey::from_rsa_pem(&bytes)
-                .map_err(|e| AuthError::Other(format!("invalid RSA PEM key: {e}")))?,
-        );
+        self.encoding_key = Some(private_key_from_pem(&bytes)?);
         Ok(self)
     }
 
     /// Loads the RSA private key directly from PEM-encoded bytes. Useful
     /// when the key is held in memory (e.g. fetched from a secret manager).
+    ///
+    /// Both setters accept a PKCS#1 `RSA PRIVATE KEY` or a PKCS#8
+    /// `PRIVATE KEY` block, reading the first block of a bundle. Anything
+    /// else, such as the `PUBLIC KEY` or `CERTIFICATE` that sits next to
+    /// the key in a Salesforce JWT setup, is refused here with
+    /// [`AuthError::InvalidArgument`] naming the block, rather than
+    /// failing to sign on the first token request.
     pub fn private_key_pem_bytes(mut self, bytes: &[u8]) -> AuthResult<Self> {
-        self.encoding_key = Some(
-            EncodingKey::from_rsa_pem(bytes)
-                .map_err(|e| AuthError::Other(format!("invalid RSA PEM key: {e}")))?,
-        );
+        self.encoding_key = Some(private_key_from_pem(bytes)?);
         Ok(self)
     }
 
@@ -515,11 +536,90 @@ mod tests {
     }
 
     #[test]
-    fn invalid_pem_is_surfaced_as_auth_error() {
+    fn invalid_pem_is_refused_as_an_invalid_private_key() {
         let err = JwtAuth::builder()
             .private_key_pem_bytes(b"not a pem")
             .unwrap_err();
-        assert!(matches!(err, AuthError::Other(_)));
+        assert!(
+            matches!(
+                err,
+                AuthError::InvalidArgument {
+                    name: "private_key",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The public half of `TEST_PEM` and a self-signed certificate for it.
+    /// jsonwebtoken's PEM reader accepts both as RSA material, and
+    /// Salesforce's JWT setup creates `server.key` and `server.crt` side by
+    /// side, so loading the wrong file has to be caught here rather than
+    /// at the first mint.
+    const TEST_PUBLIC_KEY_PEM: &[u8] = include_bytes!("../tests/fixtures/test_rsa_public_key.pem");
+    const TEST_CERTIFICATE_PEM: &[u8] =
+        include_bytes!("../tests/fixtures/test_rsa_certificate.pem");
+
+    fn is_invalid_private_key_naming(err: &AuthError, label: &str) -> bool {
+        matches!(
+            err,
+            AuthError::InvalidArgument {
+                name: "private_key",
+                reason,
+            } if reason.contains(label)
+        )
+    }
+
+    #[test]
+    fn a_public_key_is_refused_when_loaded() {
+        let err = JwtAuth::builder()
+            .private_key_pem_bytes(TEST_PUBLIC_KEY_PEM)
+            .unwrap_err();
+        assert!(is_invalid_private_key_naming(&err, "PUBLIC KEY"), "{err:?}");
+    }
+
+    #[test]
+    fn a_certificate_is_refused_when_loaded() {
+        let err = JwtAuth::builder()
+            .private_key_pem_bytes(TEST_CERTIFICATE_PEM)
+            .unwrap_err();
+        assert!(
+            is_invalid_private_key_naming(&err, "CERTIFICATE"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_is_read_from_its_first_block() {
+        let mut key_first = TEST_PEM.to_vec();
+        key_first.extend_from_slice(TEST_CERTIFICATE_PEM);
+        JwtAuth::builder()
+            .private_key_pem_bytes(&key_first)
+            .unwrap();
+
+        let mut certificate_first = TEST_CERTIFICATE_PEM.to_vec();
+        certificate_first.extend_from_slice(TEST_PEM);
+        let err = JwtAuth::builder()
+            .private_key_pem_bytes(&certificate_first)
+            .unwrap_err();
+        assert!(
+            is_invalid_private_key_naming(&err, "CERTIFICATE"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_file_holding_a_certificate_is_refused() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test_rsa_certificate.pem"
+        );
+        let err = JwtAuth::builder().private_key_pem_file(path).unwrap_err();
+        assert!(
+            is_invalid_private_key_naming(&err, "CERTIFICATE"),
+            "{err:?}"
+        );
     }
 
     #[test]

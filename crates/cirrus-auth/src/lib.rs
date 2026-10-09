@@ -62,10 +62,10 @@
 //! Flows Salesforce lists as legacy or deprecated are intentionally not
 //! supported.
 
-use async_trait::async_trait;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+mod assertion;
 pub mod client_credentials;
 mod error;
 pub mod jwt;
@@ -84,6 +84,19 @@ pub mod web_server;
 /// `reqwest` dependency keeps the caller's `reqwest` version aligned
 /// with the SDK's.
 pub use reqwest;
+
+/// Re-export of the [`async_trait`](https://docs.rs/async-trait) attribute
+/// macro that [`AuthSession`] and
+/// [`RotationHandler`](refresh::RotationHandler) are declared with. An
+/// implementation of either trait needs the same macro on its `impl`
+/// block; using this re-export instead of a separate `async-trait`
+/// dependency keeps the macro's version aligned with the trait's.
+pub use async_trait::async_trait;
+
+/// Re-export of [`camino`], whose `Utf8PathBuf` is the path type
+/// [`JwtAuthBuilder::private_key_pem_file`] takes. A `std::path::PathBuf`
+/// converts with `Utf8PathBuf::try_from`.
+pub use camino;
 
 pub use client_credentials::{ClientCredentialsAuth, ClientCredentialsAuthBuilder};
 pub use error::{AuthError, AuthResult};
@@ -113,9 +126,40 @@ pub struct ReadmeDoctests;
 /// produces a bearer access token on demand (refreshing if necessary), and
 /// reports the instance URL that REST requests should target.
 ///
-/// The trait is `Send + Sync` and uses [`async_trait`](mod@async_trait) to remain
-/// `dyn`-compatible — the client stores `Arc<dyn AuthSession>` so handlers
-/// don't care which flow was configured.
+/// The trait is `Send + Sync` and uses [`async_trait`](macro@crate::async_trait)
+/// to remain `dyn`-compatible — the client stores `Arc<dyn AuthSession>` so
+/// handlers don't care which flow was configured.
+///
+/// # Implementing the trait
+///
+/// A session that obtains its token elsewhere (a secrets manager, a
+/// sidecar, a test double) implements the trait under the same macro,
+/// which this crate re-exports so the implementation needs no dependency
+/// of its own:
+///
+/// ```
+/// use cirrus_auth::{AuthResult, AuthSession, async_trait};
+/// use std::borrow::Cow;
+///
+/// struct VaultSession {
+///     token: String,
+///     instance_url: String,
+/// }
+///
+/// #[async_trait]
+/// impl AuthSession for VaultSession {
+///     async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
+///         Ok(Cow::Borrowed(&self.token))
+///     }
+///
+///     fn instance_url(&self) -> &str {
+///         &self.instance_url
+///     }
+/// }
+/// ```
+///
+/// Override [`invalidate`](Self::invalidate) as well when the token can
+/// be re-obtained, so a `401 INVALID_SESSION_ID` leads to a fresh one.
 #[async_trait]
 pub trait AuthSession: Send + Sync {
     /// Returns a valid bearer access token. Implementations may refresh
