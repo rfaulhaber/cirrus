@@ -78,9 +78,23 @@
 //! secret. With a setting on and no secret, the token endpoint answers
 //! with an [`AuthError::OAuth`] that names no setting.
 //!
+//! A confidential client that must not hold the secret on the host can
+//! authenticate both requests with a `client_assertion` instead: give
+//! [`WebServerFlowBuilder::private_key_pem_bytes`] (or its file form) the
+//! private key behind the app's uploaded certificate, and the code
+//! exchange and the refresh grant each carry a freshly signed RS256 JWT
+//! in place of `client_secret`. Salesforce reads the assertion only when
+//! no secret is present, so the builder refuses both.
+//!
 //! (`isConsumerSecretOptional`, `isSecretRequiredForRefreshToken`:
-//! <https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
+//! <https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>;
+//! `client_assertion`:
+//! <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5>)
 
+use crate::assertion::{
+    CLIENT_ASSERTION_TYPE_JWT_BEARER, check_client_authentication, client_assertion,
+    private_key_from_pem, private_key_from_pem_file,
+};
 use crate::error::{AuthError, AuthResult};
 use crate::refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
 use crate::token_endpoint::{
@@ -88,6 +102,8 @@ use crate::token_endpoint::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use camino::Utf8PathBuf;
+use jsonwebtoken::EncodingKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -121,6 +137,7 @@ const STATE_BYTES: usize = 16;
 pub struct WebServerFlow {
     consumer_key: String,
     consumer_secret: Option<String>,
+    client_assertion_key: Option<EncodingKey>,
     redirect_uri: String,
     login_url: String,
     scopes: Vec<String>,
@@ -140,6 +157,7 @@ impl std::fmt::Debug for WebServerFlow {
                 "consumer_secret",
                 &self.consumer_secret.as_ref().map(|_| "[redacted]"),
             )
+            .field("client_assertion", &self.client_assertion_key.is_some())
             .field("redirect_uri", &self.redirect_uri)
             .field("login_url", &self.login_url)
             .field("scopes", &self.scopes)
@@ -299,6 +317,10 @@ impl WebServerFlow {
             return Err(AuthError::FlowMismatch);
         }
 
+        // The client authenticates with its secret or with a freshly
+        // signed assertion, never both: Salesforce reads the assertion
+        // only when no secret is present, and `build` refuses the pair.
+        let assertion;
         let mut body: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -308,6 +330,11 @@ impl WebServerFlow {
         ];
         if let Some(secret) = self.consumer_secret.as_deref() {
             body.push(("client_secret", secret));
+        }
+        if let Some(key) = &self.client_assertion_key {
+            assertion = client_assertion(&self.consumer_key, &self.login_url, key)?;
+            body.push(("client_assertion", assertion.as_str()));
+            body.push(("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER));
         }
 
         let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
@@ -330,7 +357,8 @@ impl WebServerFlow {
     /// completed, so the rest of the SDK can keep renewing it.
     ///
     /// The builder carries over the connected app's consumer key and
-    /// secret, this flow's `login_url` and HTTP client, the session's
+    /// secret (or the private key that signs its `client_assertion`),
+    /// this flow's `login_url` and HTTP client, the session's
     /// `instance_url` and refresh token, and the access token that came
     /// with it (see
     /// [`initial_access_token`](RefreshTokenAuthBuilder::initial_access_token)),
@@ -372,6 +400,9 @@ impl WebServerFlow {
             .http_client(self.http.clone());
         if let Some(secret) = &self.consumer_secret {
             builder = builder.consumer_secret(secret);
+        }
+        if let Some(key) = &self.client_assertion_key {
+            builder = builder.client_assertion_key(key.clone());
         }
         Ok(builder)
     }
@@ -648,6 +679,7 @@ impl std::fmt::Debug for CompletedSession {
 pub struct WebServerFlowBuilder {
     consumer_key: Option<String>,
     consumer_secret: Option<String>,
+    private_key: Option<EncodingKey>,
     redirect_uri: Option<String>,
     login_url: Option<String>,
     scopes: Vec<String>,
@@ -661,6 +693,7 @@ impl std::fmt::Debug for WebServerFlowBuilder {
         f.debug_struct("WebServerFlowBuilder")
             .field("consumer_key", &self.consumer_key.is_some())
             .field("consumer_secret", &self.consumer_secret.is_some())
+            .field("private_key", &self.private_key.is_some())
             .field("redirect_uri", &self.redirect_uri)
             .field("login_url", &self.login_url)
             .field("scopes", &self.scopes)
@@ -680,11 +713,41 @@ impl WebServerFlowBuilder {
     /// Connected App's Consumer Secret. Salesforce requires it on the code
     /// exchange unless the app's "Require Secret for Web Server Flow"
     /// setting is off (`isConsumerSecretOptional = true`), which is not
-    /// the default; the refresh grant has a setting of its own, see the
+    /// the default, or the exchange authenticates with a
+    /// [`client_assertion`](Self::private_key_pem_bytes) instead; the
+    /// refresh grant has a setting of its own, see the
     /// [module docs](self). Sent only when set.
     pub fn consumer_secret(mut self, secret: impl Into<String>) -> Self {
         self.consumer_secret = Some(secret.into());
         self
+    }
+
+    /// Authenticates the code exchange, and the refresh grant that
+    /// [`WebServerFlow::refresh_auth`] sets up, with a `client_assertion`
+    /// signed by this RSA private key instead of with `consumer_secret`,
+    /// for a host that must not hold the secret. The key is the one
+    /// behind the certificate uploaded to the connected app. Each token
+    /// request carries a fresh RS256 JWT naming the consumer key as `iss`
+    /// and `sub` and the token endpoint as `aud`, plus
+    /// `client_assertion_type`, and no `client_secret`.
+    ///
+    /// Set this or `consumer_secret`, not both: Salesforce reads the
+    /// assertion only when no secret is present, so
+    /// [`build`](Self::build) refuses the pair with
+    /// [`AuthError::InvalidArgument`]. Accepts the same PEM as
+    /// [`JwtAuthBuilder::private_key_pem_bytes`](crate::JwtAuthBuilder::private_key_pem_bytes):
+    /// an `RSA PRIVATE KEY` or `PRIVATE KEY` block first.
+    pub fn private_key_pem_bytes(mut self, bytes: &[u8]) -> AuthResult<Self> {
+        self.private_key = Some(private_key_from_pem(bytes)?);
+        Ok(self)
+    }
+
+    /// The file form of
+    /// [`private_key_pem_bytes`](Self::private_key_pem_bytes). The path
+    /// is a [`camino::Utf8PathBuf`] or anything that converts into one.
+    pub fn private_key_pem_file(mut self, path: impl Into<Utf8PathBuf>) -> AuthResult<Self> {
+        self.private_key = Some(private_key_from_pem_file(&path.into())?);
+        Ok(self)
     }
 
     /// Redirect URI registered on the Connected App. Required. Must match
@@ -791,10 +854,12 @@ impl WebServerFlowBuilder {
                 .unwrap_or_else(|| PRODUCTION_LOGIN_URL.to_string()),
         );
         require_secure_login_url(&login_url)?;
+        check_client_authentication(self.consumer_secret.as_deref(), self.private_key.as_ref())?;
         let http = self.http.into_client()?;
         Ok(WebServerFlow {
             consumer_key,
             consumer_secret: self.consumer_secret,
+            client_assertion_key: self.private_key,
             redirect_uri,
             login_url,
             scopes: self.scopes,
@@ -841,6 +906,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::AuthSession;
+    use crate::test_support::decode_jwt_segment;
     use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -1542,6 +1608,121 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::StateMismatch), "{err:?}");
+    }
+
+    /// Throwaway RSA key shared with the JWT tests; see
+    /// `tests/fixtures/test_rsa_key.pem`.
+    const TEST_PEM: &[u8] = include_bytes!("../tests/fixtures/test_rsa_key.pem");
+
+    #[tokio::test]
+    async fn complete_signs_a_client_assertion_when_a_private_key_is_set() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5
+        // (release 264), "Use client_assertion instead of client_secret":
+        // iss and sub are the client_id, aud is the token servlet URL, exp
+        // is within 5 minutes, and only RS256 is supported.
+        let server = MockServer::start().await;
+        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(BodyCapturingResponder {
+                captured: captured.clone(),
+                response: ResponseTemplate::new(200).set_body_json(documented_token_response()),
+            })
+            .mount(&server)
+            .await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .private_key_pem_bytes(TEST_PEM)
+            .unwrap()
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        flow.complete(pending, "c", &state).await.unwrap();
+
+        let body = captured.lock().await;
+        let params: Vec<(String, String)> = serde_urlencoded::from_str(&body).unwrap();
+        let field = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name} missing from body: {body}"))
+        };
+        assert!(params.iter().all(|(k, _)| k != "client_secret"), "{body}");
+        assert_eq!(
+            field("client_assertion_type"),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        );
+        let assertion = field("client_assertion");
+        let mut parts = assertion.split('.');
+        let header = decode_jwt_segment(parts.next().unwrap());
+        let claims = decode_jwt_segment(parts.next().unwrap());
+        assert!(parts.next().is_some(), "assertion must carry a signature");
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(claims["iss"], "consumer-key-123");
+        assert_eq!(claims["sub"], "consumer-key-123");
+        assert_eq!(
+            claims["aud"],
+            format!("{}/services/oauth2/token", server.uri())
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_carries_the_private_key_into_the_refresh_grant() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let mut refreshed = documented_token_response();
+        refreshed["access_token"] = serde_json::Value::String("REFRESHED".into());
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_assertion="))
+            .and(body_string_contains(
+                "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(refreshed))
+            .mount(&server)
+            .await;
+
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .private_key_pem_bytes(TEST_PEM)
+            .unwrap()
+            .build()
+            .unwrap();
+        let (_, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        let session = flow.complete(pending, "c", &state).await.unwrap();
+
+        let auth = flow.refresh_auth(&session).unwrap().build().unwrap();
+        auth.invalidate(&session.access_token).await;
+        assert_eq!(auth.access_token().await.unwrap(), "REFRESHED");
+    }
+
+    #[test]
+    fn builder_refuses_a_private_key_alongside_a_consumer_secret() {
+        let err = flow_with_required_fields()
+            .consumer_secret("hunter2")
+            .private_key_pem_bytes(TEST_PEM)
+            .unwrap()
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::InvalidArgument {
+                    name: "private_key",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

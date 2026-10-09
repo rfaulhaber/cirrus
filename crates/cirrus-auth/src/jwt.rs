@@ -40,7 +40,7 @@
 //! own purposes does not affect token minting here.
 
 use crate::AuthSession;
-use crate::assertion::private_key_from_pem;
+use crate::assertion::{bearer_assertion, private_key_from_pem, private_key_from_pem_file};
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
@@ -48,14 +48,10 @@ use crate::token_endpoint::{
     require_secure_login_url,
 };
 use async_trait::async_trait;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use camino::Utf8PathBuf;
-use jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use serde::Serialize;
+use jsonwebtoken::EncodingKey;
 use std::borrow::Cow;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Salesforce production login URL — the default JWT audience and token
@@ -67,44 +63,6 @@ pub const SANDBOX_LOGIN_URL: &str = "https://test.salesforce.com";
 
 /// Default cache TTL for an access token after it's issued.
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
-
-/// JWT validity window, in seconds.
-///
-/// The signed assertion is a bearer credential in flight, so the window
-/// is deliberately short: it only has to cover a single token request.
-/// RFC 7523 §3 requires the authorization server to reject an `exp`
-/// that has already passed and permits it to reject one that is
-/// "unreasonably far in the future", so the slack that remains is there
-/// for clock skew — it is the token endpoint's clock, not this host's,
-/// that decides whether `exp` is still ahead.
-// Salesforce is sometimes said to reject an assertion whose `exp` is
-// more than three minutes ahead of its own clock. No fetchable doc page
-// states such a ceiling and RFC 7523 sets no numeric bound, so this
-// window sits under the reputed limit rather than at it: correct
-// whether or not the ceiling is real.
-const JWT_VALIDITY_SECS: i64 = 170;
-
-#[derive(Serialize)]
-struct JwtClaims {
-    iss: String,
-    sub: String,
-    aud: String,
-    exp: i64,
-}
-
-// `iss` is the Connected App consumer key (a credential identifier) and
-// `sub` is the Salesforce username (PII). Redact both so a stray
-// `{:?}` in error-handling code never leaks them.
-impl std::fmt::Debug for JwtClaims {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JwtClaims")
-            .field("iss", &"[redacted]")
-            .field("sub", &"[redacted]")
-            .field("aud", &self.aud)
-            .field("exp", &self.exp)
-            .finish()
-    }
-}
 
 /// JWT Bearer flow auth session.
 ///
@@ -170,19 +128,12 @@ impl JwtAuth {
             login_url = %self.login_url,
             "minting fresh access token",
         );
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .map_err(|e| AuthError::Other(format!("system clock before UNIX epoch: {e}")))?;
-
-        let claims = JwtClaims {
-            iss: self.consumer_key.clone(),
-            sub: self.username.clone(),
-            aud: self.login_url.clone(),
-            exp: now_secs + JWT_VALIDITY_SECS,
-        };
-
-        let assertion = sign_assertion(&claims, &self.encoding_key)?;
+        let assertion = bearer_assertion(
+            &self.consumer_key,
+            &self.username,
+            &self.login_url,
+            &self.encoding_key,
+        )?;
 
         let body = [
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -194,27 +145,6 @@ impl JwtAuth {
 
         Ok(CachedToken::from_response(token, self.token_ttl))
     }
-}
-
-/// Produces the compact JWS for `claims` with the aws-lc-rs backend
-/// directly.
-///
-/// `jsonwebtoken::encode` resolves the process-global `CryptoProvider`,
-/// and a downstream build that enables both of jsonwebtoken's backend
-/// features leaves that provider unusable: its signer panics instead of
-/// erroring, which would unwind out of `access_token`. Binding to the one
-/// backend this crate compiles against keeps the mint independent of the
-/// host application's feature set and of any provider it installs.
-fn sign_assertion(claims: &JwtClaims, key: &EncodingKey) -> AuthResult<String> {
-    let signer = (DEFAULT_PROVIDER.signer_factory)(&Algorithm::RS256, key)
-        .map_err(|e| AuthError::Signing(e.to_string()))?;
-    let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Header::new(Algorithm::RS256))?);
-    let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
-    let message = format!("{header}.{claims}");
-    let signature = signer
-        .try_sign(message.as_bytes())
-        .map_err(|e| AuthError::Signing(e.to_string()))?;
-    Ok(format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature)))
 }
 
 #[async_trait]
@@ -315,10 +245,7 @@ impl JwtAuthBuilder {
     /// # }
     /// ```
     pub fn private_key_pem_file(mut self, path: impl Into<Utf8PathBuf>) -> AuthResult<Self> {
-        let path = path.into();
-        let bytes = fs_err::read(path.as_std_path())
-            .map_err(|e| AuthError::Other(format!("failed to read private key: {e}")))?;
-        self.encoding_key = Some(private_key_from_pem(&bytes)?);
+        self.encoding_key = Some(private_key_from_pem_file(&path.into())?);
         Ok(self)
     }
 
@@ -468,9 +395,11 @@ impl JwtAuthBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::assertion::ASSERTION_VALIDITY_SECS;
     use crate::test_support::decode_jwt_segment;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -949,10 +878,10 @@ mod tests {
             exp > now,
             "assertion is already expired: exp={exp} now={now}"
         );
-        // Pins this crate's own validity window; RFC 7523 sets no
-        // numeric bound and makes no claim about Salesforce's tolerance.
+        // Pins this crate's own validity window, which sits under the
+        // five minutes Salesforce allows a client assertion.
         assert!(
-            exp <= now + JWT_VALIDITY_SECS,
+            exp <= now + ASSERTION_VALIDITY_SECS,
             "exp exceeds the SDK's validity window: exp={exp} now={now}"
         );
     }
