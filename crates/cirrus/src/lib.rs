@@ -101,7 +101,7 @@ pub use retry::{Replay, RetryPolicy};
 
 use cirrus_auth::transport::{CollectBodyError, collect_body};
 use percent_encoding::{AsciiSet, CONTROLS};
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::borrow::Cow;
@@ -919,9 +919,13 @@ impl Cirrus {
     /// `make_request` builds a fresh request from the current bearer
     /// token, once per attempt ([`reqwest::RequestBuilder`] is consumed
     /// by `send`); an `Err` from it aborts the whole call without
-    /// retrying. `parse` maps the terminal response into the caller's
-    /// result shape. `Sforce-Limit-Info` capture happens here, on every
-    /// response, so no send path can forget it.
+    /// retrying. `headers` are the caller's request headers, checked
+    /// here before any request and attached to every attempt, so a
+    /// malformed pair is [`CirrusError::InvalidHeader`] rather than the
+    /// builder failure reqwest would defer to `send`. `parse` maps the
+    /// terminal response into the caller's result shape.
+    /// `Sforce-Limit-Info` capture happens here, on every response, so
+    /// no send path can forget it.
     ///
     /// `replay` replaces the method-derived idempotency assumption where
     /// the HTTP method misstates an endpoint's effect: Apex REST,
@@ -932,6 +936,7 @@ impl Cirrus {
         method: &reqwest::Method,
         url: &str,
         replay: retry::Replay,
+        headers: &[(&str, &str)],
         make_request: MakeReq,
         parse: Parse,
     ) -> CirrusResult<T>
@@ -940,6 +945,7 @@ impl Cirrus {
         Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
     {
         self.check_transport_security(url)?;
+        let headers = validate_headers(headers)?;
         let mut auth_retried = false;
         let mut attempt: u32 = 0;
         // The token the 401 refresh obtained, carried into the next pass
@@ -952,7 +958,10 @@ impl Cirrus {
             };
 
             let result: CirrusResult<T> = loop {
-                let request = make_request(&token)?;
+                let mut request = make_request(&token)?;
+                for (name, value) in &headers {
+                    request = request.header(name.clone(), value.clone());
+                }
 
                 // Both a request that never got a response and a
                 // response whose body dies mid-stream are transport
@@ -1009,6 +1018,30 @@ impl Cirrus {
                             // `CollectBodyError` is `non_exhaustive`.
                             Err(other) => CirrusError::InvalidResponse(other.to_string()),
                         }
+                    }
+                    // reqwest keeps a request it could not build and
+                    // reports it here, from `send`. Nothing left the
+                    // machine, so it is the caller's input at fault,
+                    // not the transport: `Http` would invite a caller's
+                    // own retry wrapper to re-run a deterministic
+                    // failure. The send paths check their inputs
+                    // before the loop; this catches what they miss.
+                    Err(mut e) if e.is_builder() => {
+                        // The query string is caller data (SOQL, an
+                        // Apex script), dropped as `From<reqwest::Error>`
+                        // drops it. reqwest's own text stops short of the
+                        // cause, which is the part that says what to fix.
+                        if let Some(url) = e.url_mut() {
+                            url.set_query(None);
+                        }
+                        let message = match std::error::Error::source(&e) {
+                            Some(cause) => format!("{e}: {cause}"),
+                            None => e.to_string(),
+                        };
+                        break Err(CirrusError::InvalidInput {
+                            field: "request",
+                            message,
+                        });
                     }
                     Err(e) => e.into(),
                 };
@@ -1118,20 +1151,41 @@ impl Cirrus {
         B: Serialize + ?Sized,
         P: Fn(u16, &[u8]) -> CirrusResult<R> + Send + Sync,
     {
+        // The query and the body are encoded once, before the loop:
+        // a value that cannot be encoded is the caller's mistake and is
+        // reported as such, and the attempts then share one buffer.
+        let url = match parts.query {
+            Some(query) => Cow::Owned(url_with_query(url, query)?),
+            None => Cow::Borrowed(url),
+        };
+        let body = parts
+            .body
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map(bytes::Bytes::from);
+        // A caller-supplied Content-Type wins over the JSON default,
+        // as it does on `reqwest::RequestBuilder::json`.
+        let content_type_set = parts
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()));
         self.dispatch(
             &method,
-            url,
+            &url,
             replay,
+            parts.headers,
             |token: &str| {
-                let mut request = self.client.request(method.clone(), url).bearer_auth(token);
-                for (name, value) in parts.headers {
-                    request = request.header(*name, *value);
-                }
-                if let Some(q) = parts.query {
-                    request = request.query(q);
-                }
-                if let Some(b) = parts.body {
-                    request = request.json(b);
+                let mut request = self
+                    .client
+                    .request(method.clone(), url.as_ref())
+                    .bearer_auth(token);
+                if let Some(body) = &body {
+                    if !content_type_set {
+                        request = request
+                            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    }
+                    // bytes::Bytes is Arc-backed — clone is cheap.
+                    request = request.body(body.clone());
                 }
                 Ok(request)
             },
@@ -1166,6 +1220,7 @@ impl Cirrus {
             &method,
             &url,
             replay,
+            &[],
             |token: &str| {
                 // bytes::Bytes is Arc-backed — clone is cheap.
                 Ok(self
@@ -1217,6 +1272,7 @@ impl Cirrus {
             &method,
             &url,
             retry::Replay::ByMethod,
+            &[],
             |token: &str| {
                 // Build a fresh Form per attempt — Form isn't Clone.
                 // The Vec<u8> JSON clone is one alloc (typically <1KB
@@ -1272,6 +1328,7 @@ impl Cirrus {
             &method,
             &url,
             retry::Replay::ByMethod,
+            &[],
             |token: &str| {
                 let mut request = self
                     .client
@@ -1313,6 +1370,7 @@ impl Cirrus {
             &method,
             &url,
             retry::Replay::ByMethod,
+            &[],
             |token: &str| {
                 Ok(self
                     .client
@@ -1597,6 +1655,49 @@ fn check_transport_security(
              opt out with CirrusBuilder::allow_insecure_transport if the plaintext hop is deliberate",
         ),
     })
+}
+
+/// Checks caller-supplied request headers before any request is built.
+///
+/// reqwest accepts an invalid name or value on the builder and fails
+/// the request at `send`, as a builder error; checking here reports the
+/// pair as [`CirrusError::InvalidHeader`] without a request, and lets
+/// every attempt reuse the parsed pairs. The message names the header,
+/// never its value, which can be a credential or record data.
+fn validate_headers(headers: &[(&str, &str)]) -> CirrusResult<Vec<(HeaderName, HeaderValue)>> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let parsed_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| CirrusError::InvalidHeader(format!("header name {name:?}: {e}")))?;
+            let parsed_value = HeaderValue::from_str(value).map_err(|e| {
+                CirrusError::InvalidHeader(format!("value of header {name:?}: {e}"))
+            })?;
+            Ok((parsed_name, parsed_value))
+        })
+        .collect()
+}
+
+/// Appends `query` to `url` as form-encoded pairs, the way
+/// `reqwest::RequestBuilder::query` does, so that a value the encoder
+/// rejects (a nested structure, say) is reported before any request as
+/// [`CirrusError::InvalidInput`] rather than deferred to `send`.
+fn url_with_query<Q: Serialize + ?Sized>(url: &str, query: &Q) -> CirrusResult<String> {
+    let mut url = url::Url::parse(url)?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        let serializer = serde_urlencoded::Serializer::new(&mut pairs);
+        query
+            .serialize(serializer)
+            .map_err(|e| CirrusError::InvalidInput {
+                field: "query",
+                message: format!("cannot be form-encoded: {e}"),
+            })?;
+    }
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
+    Ok(url.into())
 }
 
 /// Accepts the two forms Salesforce documents for the version segment
@@ -2059,6 +2160,96 @@ mod tests {
                 .unwrap();
             assert_eq!(result["done"], true);
             assert_eq!(sf.last_limit_info().unwrap().used, 7);
+        }
+
+        #[tokio::test]
+        async fn send_with_headers_refuses_a_malformed_header_without_a_request() {
+            // reqwest defers a header it cannot build until `send`, where
+            // it would surface as a transport failure; the client checks
+            // the pair first so a caller can tell a local mistake from
+            // a network one. The name and the value are each refused.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            for (name, value) in [
+                ("Sforce-Call-Options", "client=a\nb"),
+                ("Sforce Call Options", "client=a"),
+            ] {
+                let err = sf
+                    .send_with_headers::<Value, ()>(
+                        reqwest::Method::GET,
+                        "limits",
+                        None,
+                        &[(name, value)],
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, CirrusError::InvalidHeader(_)),
+                    "{name:?}: {value:?}: {err:?}"
+                );
+            }
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn post_reports_an_unserializable_body_as_serialization() {
+            // serde_json refuses a map whose keys are not strings.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            let body: std::collections::HashMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+            let err = sf
+                .post::<Value, _>("sobjects/Account", &body)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CirrusError::Serialization(_)), "{err:?}");
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn get_with_query_reports_an_unencodable_query_as_invalid_input() {
+            // A nested value has no form encoding.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            let err = sf
+                .get_with_query::<Value, _>("query", &json!({"q": {"nested": 1}}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidInput { field: "query", .. }),
+                "{err:?}"
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_request_the_client_cannot_build_is_not_a_transport_failure() {
+            // The internal paths set headers of their own inside the
+            // loop; one reqwest refuses must not come back as `Http`,
+            // which a caller's own retry wrapper may treat as transient.
+            let server = MockServer::start().await;
+            let sf = server_fixture(server.uri());
+            let err = sf
+                .send_with_body::<Value>(
+                    reqwest::Method::POST,
+                    "jobs/ingest/750R/batches",
+                    Bytes::new(),
+                    "text/csv\r\n",
+                    Replay::Never,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CirrusError::InvalidInput {
+                        field: "request",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
         }
 
         #[tokio::test]
