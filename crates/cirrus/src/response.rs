@@ -1436,17 +1436,26 @@ fn capped_serde_message(err: &serde_json::Error) -> String {
     format!("{}… <truncated>{suffix}", &code[..end])
 }
 
-/// Parses a non-2xx response body into a [`CirrusError::Api`].
+/// Parses a non-2xx response body into a [`CirrusError::Api`], or into
+/// [`CirrusError::MultipleMatches`] for the 300 an upsert by external ID
+/// answers with when the value matches several records.
 ///
-/// Tries the documented Salesforce error array first, then a bare error
-/// object, which some per-operation pages print in place of the array.
-/// When neither parses, the body is preserved in `raw` (capped at
-/// [`RAW_ERROR_BODY_CAP`] bytes) for debugging — unless it was empty, in
-/// which case `raw` stays `None` and the error reads as having no body.
-/// Used both by [`parse_response_bytes`] (JSON success path) and the
-/// raw-body transport path that bypasses JSON deserialization on success
-/// (Bulk API CSV downloads).
+/// A 300 whose body is a JSON array is that list of matching records and
+/// is kept whole, uncapped (the transport already bounds a non-2xx body).
+/// Any other body is tried as the documented Salesforce error array
+/// first, then a bare error object, which some per-operation pages print
+/// in place of the array. When neither parses, the body is preserved in
+/// `raw` (capped at [`RAW_ERROR_BODY_CAP`] bytes) for debugging — unless
+/// it was empty, in which case `raw` stays `None` and the error reads as
+/// having no body. Used both by [`parse_response_bytes`] (JSON success
+/// path) and the raw-body transport path that bypasses JSON
+/// deserialization on success (Bulk API CSV downloads).
 pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
+    if status == 300
+        && let Ok(records) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+    {
+        return CirrusError::MultipleMatches { records };
+    }
     let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes)
         .or_else(|_| serde_json::from_slice::<SalesforceError>(bytes).map(|e| vec![e]))
         .unwrap_or_default();
@@ -1659,6 +1668,40 @@ mod tests {
                 );
             }
             other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
+
+    // Wire-shape provenance: the Upsert page (https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html)
+    // says a non-unique external ID answers 300 "plus a list of the
+    // records that matched the query" and prints no example body, so the
+    // entries below are invented. The fixture pins only that an array
+    // longer than the raw-body cap passes through whole.
+    #[test]
+    fn a_300_with_an_array_body_keeps_every_matching_record() {
+        let matches: Vec<Value> = (0..100)
+            .map(|i| json!({"Id": format!("001xx000003DGb{i:03}"), "Name": format!("Company {i:03}")}))
+            .collect();
+        let body = serde_json::to_vec(&matches).unwrap();
+        assert!(body.len() > RAW_ERROR_BODY_CAP);
+
+        match parse_error_response(300, &body) {
+            CirrusError::MultipleMatches { records, .. } => {
+                assert_eq!(records.len(), 100);
+                assert_eq!(records[99], matches[99]);
+            }
+            other => panic!("expected MultipleMatches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_300_with_a_non_array_body_stays_an_api_error() {
+        match parse_error_response(300, b"<html>") {
+            CirrusError::Api {
+                status: 300,
+                raw: Some(raw),
+                ..
+            } => assert_eq!(raw, "<html>"),
+            other => panic!("expected Api with a raw body, got {other:?}"),
         }
     }
 

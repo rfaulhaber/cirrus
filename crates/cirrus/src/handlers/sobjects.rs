@@ -487,7 +487,8 @@ impl<'a> SObjectHandler<'a> {
     /// documented exception under [External IDs](Self#external-ids).
     ///
     /// If multiple records match the external ID, Salesforce returns 300
-    /// — surfaced as [`crate::CirrusError::Api`].
+    /// with the list of matches and writes nothing; that list arrives as
+    /// [`crate::CirrusError::MultipleMatches::records`].
     ///
     /// Needs API v46.0 or later. Through v45.0 Salesforce answers a
     /// successful update with 204 and no body, which leaves nothing to
@@ -1226,6 +1227,40 @@ mod tests {
             .unwrap();
         assert_eq!(result.id, "001xx0000000001");
         assert_eq!(result.created, Some(true));
+    }
+
+    #[tokio::test]
+    async fn upsert_surfaces_the_matching_records_of_a_300() {
+        // Wire-shape provenance: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+        // says a non-unique external ID answers 300 "plus a list of the
+        // records that matched the query" and prints no example body; the
+        // two entries are invented to pin that the array reaches the caller.
+        let server = MockServer::start().await;
+
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Contact/Email__c/a@b.example",
+            ))
+            .respond_with(ResponseTemplate::new(300).set_body_json(json!([
+                {"Id": "003xx000004TmiQAAS", "Email__c": "a@b.example"},
+                {"Id": "003xx000004TmiRAAS", "Email__c": "a@b.example"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .sobject("Contact")
+            .upsert("Email__c", "a@b.example", &json!({"LastName": "Smith"}))
+            .await
+            .unwrap_err();
+        match err {
+            CirrusError::MultipleMatches { records, .. } => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[1]["Id"], "003xx000004TmiRAAS");
+            }
+            other => panic!("expected MultipleMatches, got {other:?}"),
+        }
     }
 
     #[tokio::test]

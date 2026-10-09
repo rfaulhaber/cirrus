@@ -90,6 +90,10 @@ pub enum CirrusError {
     /// some per-operation pages print); if the body could not be parsed
     /// as either, the raw body is in `raw`.
     ///
+    /// The one exception is a 300 whose body is a JSON array, which is
+    /// [`MultipleMatches`](Self::MultipleMatches): that array lists
+    /// records, not errors.
+    ///
     /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
     /// later field is an additive change.
     #[error("Salesforce API error (status {status}): {}", display_errors(.errors, .raw))]
@@ -120,6 +124,36 @@ pub enum CirrusError {
         /// replays — can wait as long as the server asked. `None` when
         /// the header was absent or unreadable.
         retry_after: Option<Duration>,
+    },
+
+    /// An upsert by external ID matched more than one record.
+    ///
+    /// Salesforce answers such an upsert with status 300 and the list of
+    /// matching records instead of a record, and neither creates nor
+    /// updates anything. `records` is that list, each entry untouched, so
+    /// a caller can pick the record it meant and retry by ID. Salesforce
+    /// documents the status and the list but not the shape of the
+    /// entries, which is why they are [`serde_json::Value`]s.
+    ///
+    /// The list is bounded only by the client's 256 KiB cap on non-2xx
+    /// bodies, not by the 2 KiB cap on [`Api`](Self::Api)'s `raw`.
+    /// `Display` reports only how many records matched, because the
+    /// entries are record data.
+    ///
+    /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
+    /// later field is an additive change.
+    //
+    // Wire-shape provenance: the Upsert page
+    // (https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html)
+    // says "an HTTP status code 300 is returned, plus a list of the
+    // records that matched the query" and prints no example body. That the
+    // list is a JSON array of objects is the reading of "a list"; the
+    // entries' members are not documented anywhere fetchable.
+    #[error("{} records match the external ID value; the value is not unique", .records.len())]
+    #[non_exhaustive]
+    MultipleMatches {
+        /// The matching records as Salesforce sent them.
+        records: Vec<serde_json::Value>,
     },
 
     /// An auth flow (token acquisition, refresh, OAuth exchange) failed.
@@ -349,6 +383,19 @@ mod tests {
         assert!(msg.contains("400"));
         assert!(msg.contains("REQUIRED_FIELD_MISSING"));
         assert!(msg.contains("Name"));
+    }
+
+    #[test]
+    fn multiple_matches_display_reports_the_count_and_no_record_data() {
+        let err = CirrusError::MultipleMatches {
+            records: vec![
+                serde_json::json!({"Name": "Acme Confidential"}),
+                serde_json::json!({"Name": "Globex Confidential"}),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains('2'), "{msg}");
+        assert!(!msg.contains("Confidential"), "{msg}");
     }
 
     #[test]
