@@ -887,6 +887,7 @@ impl Cirrus {
         )
         .await
     }
+
     /// GET with query parameters for a resource whose GET has side
     /// effects, so a lost response must never be replayed. Same wire
     /// behavior as [`Self::get_with_query`]; only the retry
@@ -915,8 +916,8 @@ impl Cirrus {
     /// POST a JSON body.
     ///
     /// Never replayed once the request has reached the server: only 429
-    /// and connect-phase failures retry. [`Self::send_with_replay`] with
-    /// [`Replay::Always`] opts a documented read-only POST back in.
+    /// and connect-phase failures retry. [`Self::send_json_with_replay`]
+    /// with [`Replay::Always`] opts a documented read-only POST back in.
     pub async fn post<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -932,7 +933,8 @@ impl Cirrus {
     /// Salesforce REST proper rarely uses PUT; provided for surfaces that
     /// do (Tooling API, Apex REST, etc.). Replayed after a 5xx or a lost
     /// response like GET; when the endpoint behind the PUT is not
-    /// idempotent, use [`Self::send_with_replay`] with [`Replay::Never`].
+    /// idempotent, use [`Self::send_json_with_replay`] with
+    /// [`Replay::Never`].
     pub async fn put<R, B>(&self, path: &str, body: &B) -> CirrusResult<R>
     where
         R: DeserializeOwned,
@@ -1052,8 +1054,10 @@ impl Cirrus {
     ///   stops advancing.
     ///
     /// To add Salesforce request headers and keep all of that, use
-    /// [`Self::send_with_headers`]; for a plain typed call, one of
-    /// the verb methods ([`Self::get`], [`Self::post`], …).
+    /// [`Self::send_with_headers`] or [`Self::send_json_with_headers`];
+    /// for a body or a response that is not JSON, [`Self::send_raw`];
+    /// for a plain typed call, one of the verb methods ([`Self::get`],
+    /// [`Self::post`], …).
     pub async fn request_builder(
         &self,
         method: reqwest::Method,
@@ -1146,8 +1150,9 @@ impl Cirrus {
     ///
     /// `attempt` resets to zero when the outer loop re-enters with the
     /// token the refresh obtained: transient flakiness and credential
-    /// staleness are independent failure classes, so retries burned on throttling
-    /// before a 401 must not starve the post-refresh request. The reset
+    /// staleness are independent failure classes, so retries burned on
+    /// throttling before a 401 must not starve the post-refresh request.
+    /// The reset
     /// also restarts the backoff schedule from `base_delay`. Total work
     /// stays bounded at `2 * (max_retries + 1)` requests because the
     /// outer loop is latched.
@@ -2208,25 +2213,27 @@ mod tests {
         }
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/services/data/v66.0/limits"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
         // A port nothing listens on.
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        // SAFETY: this test runs in its own process (checked above), so
-        // no other thread reads the environment while it is modified.
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before the mock server or
+        // any other thread of that process exists, so nothing reads the
+        // environment while it is modified.
         unsafe {
             std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
             std::env::remove_var("NO_PROXY");
             std::env::remove_var("no_proxy");
         }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/limits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
 
         // The variable is in effect: a stock client goes to the proxy.
         let stock = reqwest::Client::new();
@@ -2712,7 +2719,9 @@ mod tests {
         async fn send_raw_carries_the_query_and_replays_by_method() {
             // The raw send is the same loop as the typed verbs: the
             // query is encoded, the 503 is retried under Replay::ByMethod,
-            // and the terminal response comes back whole.
+            // and the terminal response comes back whole. The path and
+            // the query are arbitrary; the test is about the loop, not
+            // a documented resource.
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path(

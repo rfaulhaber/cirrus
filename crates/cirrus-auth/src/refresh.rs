@@ -625,8 +625,8 @@ impl RefreshTokenAuthBuilder {
     /// Supplies a pre-configured `reqwest::Client`. Useful for sharing a
     /// connection pool.
     ///
-    /// The client built by default applies connect and request timeouts
-    /// and refuses to follow redirects, so a stalled endpoint cannot park
+    /// The client built by default applies connect and request timeouts,
+    /// uses no proxy and refuses to follow redirects, so a stalled endpoint cannot park
     /// a mint indefinitely and a redirect cannot replay the refresh token
     /// to another host. A client supplied here replaces those defaults
     /// wholesale: without its own timeouts, a token endpoint that accepts

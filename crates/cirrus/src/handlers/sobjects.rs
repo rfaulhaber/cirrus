@@ -421,8 +421,8 @@ impl<'a> SObjectHandler<'a> {
     /// can't express.
     ///
     /// The `If-Match` and `If-None-Match` ETag headers are documented for
-    /// Account records only and are not wrapped; send them with
-    /// [`Cirrus::send_json_with_headers`].
+    /// Account records only and are not wrapped; send them through
+    /// [`update_with_headers`](Self::update_with_headers).
     ///
     /// [Conditional Request Headers]: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
     ///

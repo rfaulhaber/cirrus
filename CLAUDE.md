@@ -64,7 +64,7 @@ When adding a new typed handler, **layer over the public verbs** — don't intro
 
 ### Send-method family
 
-Four internal send paths cover every wire shape we've needed. Pick by request/response shape, not by handler name. All four go through the same retry policy, 401 auto-refresh, and `Sforce-Limit-Info` capture.
+Five send paths cover every wire shape we've needed, four internal and one public. Pick by request/response shape, not by handler name. All five go through the same retry policy, 401 auto-refresh, and `Sforce-Limit-Info` capture.
 
 | Helper | Request body | Response | Used by |
 |---|---|---|---|
@@ -72,8 +72,9 @@ Four internal send paths cover every wire shape we've needed. Pick by request/re
 | `send_with_body` | raw `bytes::Bytes` + Content-Type | typed JSON → `R` | Bulk 2.0 CSV ingest upload |
 | `fetch_raw` | query params only | `(HeaderMap, bytes::Bytes)` | Bulk 2.0 query results, Event Monitoring downloads, sObject blob downloads, the Tooling Apex log body |
 | `send_multipart` | JSON metadata part + binary part | typed JSON → `R` | sObject blob inserts/updates (ContentVersion / Document / Attachment) |
+| `send_raw` (public) | optional `RawBody` (bytes + its Content-Type) or none | `RawResponse` (status, headers, bytes) for any status; only an `INVALID_SESSION_ID` 401 is an error, and a non-2xx body is token-scrubbed | `Cirrus::send_raw`, `ApexHandler::send_raw` |
 
-If you find yourself wanting a fifth, first check whether the existing four would work with caller-side adaptation.
+If you find yourself wanting a sixth, first check whether the existing five would work with caller-side adaptation.
 
 ### Handler module conventions (cirrus)
 

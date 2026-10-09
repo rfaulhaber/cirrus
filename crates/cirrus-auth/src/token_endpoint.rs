@@ -184,7 +184,10 @@ pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// and an ambient proxy would carry the form body, credentials included,
 /// off it in the clear. Call `.proxy(..)` on the returned builder for a
 /// deployment that needs one; an `https` login URL is then tunneled
-/// through it.
+/// through it, while a plaintext loopback login URL stays accepted and
+/// reaches that proxy in the clear, since the login-URL rule knows
+/// nothing of the client: keep such a proxy's `NoProxy` rules covering
+/// loopback, or use `https`.
 ///
 /// Start from this builder when the token client needs a setting the
 /// flow builders do not expose, such as a private root CA, a proxy or a
@@ -1305,24 +1308,27 @@ mod tests {
         }
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
+        // A port nothing listens on.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before the mock server or
+        // any other thread of that process exists, so nothing reads the
+        // environment while it is modified.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        // SAFETY: this test runs in its own process (checked above), so
-        // no other thread reads the environment while it is modified.
-        unsafe {
-            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
-            std::env::remove_var("NO_PROXY");
-            std::env::remove_var("no_proxy");
-        }
         let url = format!("{}/services/oauth2/token", server.uri());
 
         let err = reqwest::Client::new().post(&url).send().await.unwrap_err();

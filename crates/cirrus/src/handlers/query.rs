@@ -341,6 +341,7 @@ impl Cirrus {
         self.send_with_headers(reqwest::Method::GET, &path, None, &headers)
             .await
     }
+
     /// Streams query records lazily, walking `nextRecordsUrl` locators
     /// across pages. Yields one record at a time; subsequent pages are
     /// fetched on demand as the consumer drains the buffer.
@@ -443,6 +444,7 @@ impl Cirrus {
         Records::new(self.clone(), initial, options.clone())
     }
 }
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

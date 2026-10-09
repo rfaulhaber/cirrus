@@ -748,24 +748,27 @@ mod tests {
         }
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        // A port nothing listens on.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before the mock server or
+        // any other thread of that process exists, so nothing reads the
+        // environment while it is modified.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/Soap/m/66.0"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        // SAFETY: this test runs in its own process (checked above), so
-        // no other thread reads the environment while it is modified.
-        unsafe {
-            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{closed}"));
-            std::env::remove_var("NO_PROXY");
-            std::env::remove_var("no_proxy");
-        }
 
         let err = reqwest::Client::new()
             .post(format!("{}/services/Soap/m/66.0", server.uri()))

@@ -211,6 +211,11 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
     /// resource is yielded as [`CirrusError::InvalidInput`] without a
     /// request. Salesforce keeps a cursor and its results for two days.
     ///
+    /// The pages are fetched with the default [`QueryOptions`]: a stream
+    /// opened with
+    /// [`query_stream_with_options`](crate::Cirrus::query_stream_with_options)
+    /// and resumed here no longer asks for its page size.
+    ///
     /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
     pub fn from_locator(client: Cirrus, next_records_url: impl Into<String>) -> Self {
         let options = QueryOptions::default();
