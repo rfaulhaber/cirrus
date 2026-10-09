@@ -101,13 +101,21 @@
 //! stored token must back exactly one session: share a single
 //! `Arc<RefreshTokenAuth>` across clients rather than building several
 //! sessions from the same token.
+//!
+//! ## Signing out
+//!
+//! [`RefreshTokenAuth::revoke`] posts the live refresh token to the
+//! revocation endpoint, which also revokes the access tokens issued
+//! through it, and clears the local cache. Under rotation the live token
+//! is the one the session adopted last, so this is the only way to end a
+//! rotated session without a handler having recorded every replacement.
 
 use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
     GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
-    require_secure_login_url,
+    require_secure_login_url, revoke_token,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -317,6 +325,33 @@ impl RefreshTokenAuth {
         // The detached mint holds the write lock until it has recorded
         // its outcome, so acquiring it is exactly "wait for the mint".
         drop(self.state.write().await);
+    }
+
+    /// Revokes the session's refresh token at Salesforce, which revokes
+    /// every access token issued through it as well, and clears the cached
+    /// access token. This is the sign-out for a session: once it returns
+    /// `Ok`, nothing the session holds is valid, and the next
+    /// [`access_token`](AuthSession::access_token) call would present the
+    /// dead refresh token and fail with `invalid_grant`. Drop the session,
+    /// and the copy of the token a [`RotationHandler`] persisted.
+    ///
+    /// The token revoked is the live one, which under Refresh Token
+    /// Rotation is the latest replacement the session adopted rather than
+    /// the token the builder was given. The call waits for an in-flight
+    /// mint first, like [`quiesce`](Self::quiesce), so a rotation cannot
+    /// slip in between. On an error nothing is cleared locally and the
+    /// call can be repeated; see [`revoke_token`] for
+    /// the wire contract.
+    pub async fn revoke(&self) -> AuthResult<()> {
+        let mut guard = self.state.write().await;
+        revoke_token(
+            &self.config.http,
+            &self.config.login_url,
+            &guard.refresh_token,
+        )
+        .await?;
+        guard.mint = MintState::default();
+        Ok(())
     }
 }
 
@@ -1119,6 +1154,48 @@ mod tests {
         async fn on_rotation(&self, new_refresh_token: &str) {
             self.seen.lock().await.push(new_refresh_token.to_string());
         }
+    }
+
+    #[tokio::test]
+    async fn revoke_sends_the_live_refresh_token_and_clears_the_cached_access_token() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_revoke_token.htm&type=5
+        // (release 264): "If a refresh token is included, Salesforce
+        // revokes it and any associated access tokens." Under rotation the
+        // live token is the rotated one, which only the session holds.
+        let server = MockServer::start().await;
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: token_hits.clone(),
+                response: token_response("at-1", Some("rt-2")),
+            })
+            .mount(&server)
+            .await;
+        let revoked = Arc::new(tokio::sync::Mutex::new(String::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .respond_with(BodyCapturingResponder {
+                captured: revoked.clone(),
+                response: ResponseTemplate::new(200),
+            })
+            .mount(&server)
+            .await;
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        auth.access_token().await.unwrap();
+
+        auth.revoke().await.unwrap();
+
+        assert_eq!(*revoked.lock().await, "token=rt-2");
+        auth.access_token().await.unwrap();
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            2,
+            "the cached access token outlived the revoke"
+        );
     }
 
     #[tokio::test]

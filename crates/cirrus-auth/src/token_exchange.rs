@@ -54,7 +54,7 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
+    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url, revoke_token,
 };
 use std::time::Duration;
 
@@ -147,6 +147,15 @@ impl TokenExchangeFlow {
     /// Begins constructing a [`TokenExchangeFlow`].
     pub fn builder() -> TokenExchangeFlowBuilder {
         TokenExchangeFlowBuilder::default()
+    }
+
+    /// Revokes a token this flow's login host issued: a
+    /// [`TokenExchangeSession`]'s refresh token, which revokes its access
+    /// tokens with it, or an access token alone. Posts to
+    /// `{login_url}/services/oauth2/revoke` with this flow's HTTP client;
+    /// see [`revoke_token`] for the wire contract.
+    pub async fn revoke(&self, token: &str) -> AuthResult<()> {
+        revoke_token(&self.http, &self.login_url, token).await
     }
 
     /// Performs the token exchange and returns the resulting Salesforce
@@ -537,6 +546,23 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn revoke_posts_the_token_to_the_flows_login_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .and(body_string_contains("token=5Aep861KIwKdekr...refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let flow = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        flow.revoke("5Aep861KIwKdekr...refresh").await.unwrap();
     }
 
     #[tokio::test]

@@ -84,7 +84,7 @@
 use crate::error::{AuthError, AuthResult};
 use crate::refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
+    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url, revoke_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -342,6 +342,18 @@ impl WebServerFlow {
     /// the session has none: the connected app's scopes must include
     /// `refresh_token` and the user must have granted it.
     ///
+    /// Revokes a token this flow's login host issued: a
+    /// [`CompletedSession`]'s refresh token, which revokes its access
+    /// tokens with it, or an access token alone. Posts to
+    /// `{login_url}/services/oauth2/revoke` with this flow's HTTP client;
+    /// see [`revoke_token`] for the wire contract. A
+    /// session that has become a [`RefreshTokenAuth`] is revoked through
+    /// [`RefreshTokenAuth::revoke`] instead, which knows the live,
+    /// possibly rotated, token.
+    pub async fn revoke(&self, token: &str) -> AuthResult<()> {
+        revoke_token(&self.http, &self.login_url, token).await
+    }
+
     /// Whether the refresh grant itself needs the consumer secret is the
     /// app's "Require Secret for Refresh Token Flow" setting, which is
     /// separate from the web-server one; see the
@@ -1186,6 +1198,23 @@ mod tests {
             !json.contains("app.example.com"),
             "unexpected flow config in the persisted value: {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn revoke_posts_the_token_to_the_flows_login_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .and(body_string_contains("token=5Aep861KIwKdekr...refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        flow.revoke("5Aep861KIwKdekr...refresh").await.unwrap();
     }
 
     #[tokio::test]

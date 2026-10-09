@@ -104,7 +104,8 @@ pub use jwt::{JwtAuth, JwtAuthBuilder};
 pub use refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
 pub use static_token::StaticTokenAuth;
 pub use token_endpoint::{
-    DEFAULT_TOKEN_CONNECT_TIMEOUT, DEFAULT_TOKEN_REQUEST_TIMEOUT, token_client_builder,
+    DEFAULT_TOKEN_CONNECT_TIMEOUT, DEFAULT_TOKEN_REQUEST_TIMEOUT, revoke_token,
+    token_client_builder,
 };
 pub use token_exchange::{
     SubjectTokenType, TokenExchangeFlow, TokenExchangeFlowBuilder, TokenExchangeSession,

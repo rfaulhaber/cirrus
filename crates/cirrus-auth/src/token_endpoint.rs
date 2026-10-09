@@ -579,6 +579,65 @@ pub(super) fn check_instance_url(expected: &str, response: &TokenResponse) -> Au
     Ok(())
 }
 
+/// Revokes an access or refresh token at `{login_url}/services/oauth2/revoke`.
+///
+/// Salesforce invalidates an access token outright and, given a refresh
+/// token, revokes it together with every access token issued through it,
+/// which is what a sign-out needs. `login_url` is the host that issued
+/// the token, normally the org's My Domain login URL; it must be `https`
+/// (loopback excepted) like every login URL in this crate, and the token
+/// travels in the form body.
+///
+/// A 200 is success. Salesforce answers every failure with a 400 and an
+/// OAuth error body whose code is `unsupported_token_type` or
+/// `invalid_token`, surfaced as [`AuthError::OAuth`]; a body in any other
+/// shape is [`AuthError::UnexpectedResponse`]. The request is sent once:
+/// repeating a revocation whose answer was lost is harmless, but a repeat
+/// of one that landed answers `invalid_token`, so the caller decides
+/// whether to retry.
+///
+/// The flows that hold a client offer this as
+/// [`RefreshTokenAuth::revoke`](crate::RefreshTokenAuth::revoke), which
+/// knows the live refresh token, [`WebServerFlow::revoke`](crate::WebServerFlow::revoke)
+/// and [`TokenExchangeFlow::revoke`](crate::TokenExchangeFlow::revoke).
+/// Use this function with [`token_client_builder`] for a token held
+/// outside them.
+///
+/// (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_revoke_token.htm&type=5>)
+pub async fn revoke_token(http: &reqwest::Client, login_url: &str, token: &str) -> AuthResult<()> {
+    let login_url = normalize_url(login_url);
+    require_secure_login_url(&login_url)?;
+    let form = [("token", token)];
+    let response = http
+        .post(format!("{login_url}/services/oauth2/revoke"))
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let bytes = match collect_body(response, TOKEN_RESPONSE_BODY_CAP).await {
+        Ok(bytes) => bytes,
+        Err(CollectBodyError::TooLarge { limit }) => {
+            return Err(AuthError::ResponseTooLarge { status, limit });
+        }
+        Err(CollectBodyError::Transport(e)) => return Err(e.into()),
+    };
+    if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
+        return Err(oauth_error(oauth_err, &form));
+    }
+    // Same rule as `exchange`: a body outside the OAuth error shape is an
+    // intermediary's page and may echo the token it was sent.
+    tracing::trace!(
+        target: "cirrus_auth::token_endpoint",
+        status,
+        body_len = bytes.len(),
+        "revoke endpoint returned a non-2xx body that did not parse as an OAuth error",
+    );
+    Err(AuthError::UnexpectedResponse { status })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -963,6 +1022,95 @@ mod tests {
         assert!(description.chars().count() <= 300, "{}", description.len());
         assert!(description.starts_with("éééé"), "{description}");
         assert!(description.ends_with("..."), "{description}");
+    }
+
+    // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_revoke_token.htm&type=5
+    // (release 264): a form POST to `/services/oauth2/revoke` with a single
+    // `token` field; "Salesforce indicates successful processing of the
+    // request by returning an HTTP 200 status code. For all error
+    // conditions, Salesforce returns a 400 status code along with one of
+    // these error responses": `unsupported_token_type` or `invalid_token`.
+    #[tokio::test]
+    async fn revoke_token_posts_the_token_as_a_form_and_accepts_200() {
+        use wiremock::matchers::{body_string, header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string("token=5Aep861KIwKdekr...refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        revoke_token(
+            &http,
+            &format!("{}/", server.uri()),
+            "5Aep861KIwKdekr...refresh",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_token_maps_the_documented_400_to_a_scrubbed_oauth_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_token",
+                "error_description": "token 5Aep861KIwKdekr...refresh was invalid",
+            })))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = revoke_token(&http, &server.uri(), "5Aep861KIwKdekr...refresh")
+            .await
+            .unwrap_err();
+        match err {
+            AuthError::OAuth {
+                error,
+                error_description,
+            } => {
+                assert_eq!(error, "invalid_token");
+                assert_eq!(
+                    error_description.as_deref(),
+                    Some("token [redacted] was invalid")
+                );
+            }
+            other => panic!("expected an OAuth error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_token_reports_an_unrecognized_body_by_status_without_retrying() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/revoke"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("<html>gateway</html>"))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = revoke_token(&http, &server.uri(), "t").await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnexpectedResponse { status: 503 }),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoke_token_refuses_a_cleartext_login_url() {
+        let http = token_client_builder().build().unwrap();
+        let err = revoke_token(&http, "http://example.com", "t")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InsecureLoginUrl { .. }), "{err:?}");
     }
 
     #[test]
