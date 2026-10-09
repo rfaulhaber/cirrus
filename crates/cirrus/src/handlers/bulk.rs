@@ -484,6 +484,16 @@ impl BulkQueryHandler<'_> {
     /// about the end of the result set — keep draining until
     /// [`BulkQueryResults::locator`] returns `None`.
     ///
+    /// # Errors
+    ///
+    /// Salesforce marks the last page with the literal `Sforce-Locator:
+    /// null`, and that literal is the only thing read as the end of the
+    /// results. A 2xx page with no `Sforce-Locator` header, or one whose
+    /// value is not text, is [`CirrusError::InvalidResponse`]: it is the
+    /// shape an intermediary produces when it strips or rewrites
+    /// headers, and treating it as the last page would end a drain loop
+    /// early with the export reported as complete.
+    ///
     /// The request goes out at this client's API version, which must be
     /// the version the job was created with — Salesforce returns a 409
     /// error for any other ([`BulkQueryJob::api_version`] records the
@@ -520,9 +530,10 @@ impl BulkQueryHandler<'_> {
             .client
             .fetch_raw(reqwest::Method::GET, &path, CSV_ACCEPT, query_slice)
             .await?;
+        let locator = next_locator(&headers, csv.len())?;
         Ok(BulkQueryResults {
             csv,
-            locator: header_string(&headers, SFORCE_LOCATOR).filter(|s| s != "null"),
+            locator,
             number_of_records: header_string(&headers, SFORCE_NUM_RECORDS)
                 .and_then(|s| s.parse().ok()),
         })
@@ -934,6 +945,40 @@ fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Str
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+}
+
+/// Reads the cursor for the next results page off a 2xx response.
+///
+/// Only the documented end marker, the literal string `null`, becomes
+/// `None`. An absent or unreadable header is refused: it would otherwise
+/// be indistinguishable from the last page, and a drain loop would stop
+/// with the export incomplete. The message names the response's content
+/// type and size rather than quoting the body, which is the caller's
+/// exported data when the header was merely stripped in transit.
+fn next_locator(
+    headers: &reqwest::header::HeaderMap,
+    body_len: usize,
+) -> CirrusResult<Option<String>> {
+    let describe = || {
+        let content_type = header_string(headers, reqwest::header::CONTENT_TYPE.as_str())
+            .unwrap_or_else(|| "none".to_owned());
+        format!("(content type {content_type}, {body_len} bytes)")
+    };
+    match headers.get(SFORCE_LOCATOR) {
+        None => Err(CirrusError::InvalidResponse(format!(
+            "Bulk query results page carries no {SFORCE_LOCATOR} header {}; Salesforce \
+             marks the last page with the literal value `null`",
+            describe()
+        ))),
+        Some(value) => match value.to_str() {
+            Ok("null") => Ok(None),
+            Ok(locator) => Ok(Some(locator.to_owned())),
+            Err(_) => Err(CirrusError::InvalidResponse(format!(
+                "Bulk query results page carries a {SFORCE_LOCATOR} header that is not text {}",
+                describe()
+            ))),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1631,13 +1676,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_results_rejects_a_page_without_a_locator_header() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-job-results.html
+        // "If there are no more sets of query results, this value is the
+        // string 'null'." The literal is the only documented end marker,
+        // so a 200 with no Sforce-Locator at all is not a last page: an
+        // intermediary that strips the header must not end a drain loop
+        // early with a partial export reported as complete.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/750xx/results"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Id,Name\n001xx,Acme\n")
+                    .insert_header("Sforce-NumberOfRecords", "1"),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .bulk()
+            .query()
+            .results("750xx", None, None)
+            .await
+            .unwrap_err();
+        match err {
+            CirrusError::InvalidResponse(message) => {
+                assert!(message.contains("Sforce-Locator"), "{message}");
+                assert!(
+                    !message.contains("Acme"),
+                    "the CSV body must stay out of the error: {message}"
+                );
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_results_rejects_a_locator_header_that_is_not_text() {
+        // A locator the client cannot read back is as unusable as a
+        // missing one; it must not pass as the end of the results.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/jobs/query/750xx/results"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Id\n")
+                    .insert_header(
+                        "Sforce-Locator",
+                        reqwest::header::HeaderValue::from_bytes(b"MTAw\xffMA").unwrap(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .bulk()
+            .query()
+            .results("750xx", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CirrusError::InvalidResponse(m) if m.contains("Sforce-Locator")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn query_results_serializes_max_records() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/services/data/v66.0/jobs/query/750xx/results"))
             .and(query_param("maxRecords", "10000"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("Id\n"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("Id\n")
+                    .insert_header("Sforce-Locator", "null"),
+            )
             .mount(&server)
             .await;
 

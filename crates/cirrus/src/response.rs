@@ -719,7 +719,10 @@ pub struct BulkQueryJob {
 /// Carries the CSV body alongside the cursor headers Salesforce uses for
 /// pagination. `locator` is `None` when the result set is fully drained;
 /// pass it back to [`crate::handlers::bulk::BulkQueryHandler::results`]
-/// in subsequent calls to fetch the next page.
+/// in subsequent calls to fetch the next page. A page that arrives
+/// without the `Sforce-Locator` header never becomes a value of this
+/// type; `results` refuses it, so `None` here always means Salesforce
+/// sent its documented end marker.
 ///
 /// The [`Debug`] rendering reports the CSV length in place of the body:
 /// one page holds up to tens of thousands of exported records, and the
@@ -729,7 +732,8 @@ pub struct BulkQueryResults {
     /// CSV body of this result page.
     pub csv: bytes::Bytes,
     /// Pagination cursor (`Sforce-Locator` response header). `None` when
-    /// the job has emitted all rows.
+    /// the job has emitted all rows, which Salesforce signals with the
+    /// literal header value `null`.
     pub locator: Option<String>,
     /// Number of records included in this page (`Sforce-NumberOfRecords`
     /// response header).
