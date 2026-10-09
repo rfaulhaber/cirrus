@@ -63,7 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **SOQL** — `sf.query(...)`, `sf.query_all(...)`, `sf.query_more(...)`. Typed
   variants (`query_as::<T>(...)`) and a `futures::Stream` pagination iterator
   (`query_stream(...)`) that walks `nextRecordsUrl` locators transparently.
-- **SOSL** — `sf.search(...)` and `sf.parameterized_search(...)`.
+  The query resource has no bind parameters, so a value interpolated into a
+  statement goes through `cirrus::soql::quote` (a string literal) or
+  `cirrus::soql::escape_like` (part of a `LIKE` pattern).
+- **SOSL** — `sf.search(...)` and `sf.parameterized_search(...)`;
+  `cirrus::sosl::escape_term` escapes a `FIND` term.
 - **Composite** — all four shapes: `composite/batch`, `composite/tree`,
   `composite/sobjects` (collections), and the generic chained-reference
   `/composite` endpoint.

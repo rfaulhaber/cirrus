@@ -25,11 +25,19 @@ use serde_json::Value;
 impl Cirrus {
     /// Runs a SOSL search.
     ///
-    /// Calls `GET /services/data/{api_version}/search?q={sosl}`. The SOSL
-    /// is URL-encoded automatically — pass plain SOSL.
+    /// Calls `GET /services/data/{api_version}/search?q={sosl}`. Pass plain
+    /// SOSL: the statement is percent-encoded for the URI here, which is
+    /// transport encoding only. A search term that comes from outside the
+    /// program goes through [`sosl::escape_term`](crate::sosl::escape_term)
+    /// first, or a reserved character in it (`}` among them) rewrites the
+    /// `FIND` clause. The 16,384-byte URI cap described under
+    /// [Request size](crate::handlers::query#request-size) applies here
+    /// too.
     ///
     /// SOSL example:
     /// `FIND {Acme} IN NAME FIELDS RETURNING Account(Id, Name), Contact(Id)`.
+    /// Field labels come back on [`SearchResult::metadata`] when the
+    /// statement ends in `WITH METADATA='LABELS'`.
     pub async fn search(&self, sosl: &str) -> CirrusResult<SearchResult<Value>> {
         self.search_as(sosl).await
     }

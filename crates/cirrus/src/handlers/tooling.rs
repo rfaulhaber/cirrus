@@ -152,7 +152,10 @@ impl<'a> ToolingHandler<'a> {
     /// Calls `GET /services/data/{api_version}/tooling/query?q={soql}`.
     /// Tooling SOQL targets the metadata tier — regular sObjects
     /// (`Account`, `Contact`) are *not* visible here; reach for them via
-    /// [`Cirrus::query`] instead.
+    /// [`Cirrus::query`] instead. The escaping and request-size notes on
+    /// that method apply here too: a value interpolated into the
+    /// statement goes through [`soql::quote`](crate::soql::quote) first,
+    /// and the encoded statement has to fit the 16,384-byte URI cap.
     pub async fn query(&self, soql: &str) -> CirrusResult<QueryResult<Value>> {
         self.query_as(soql).await
     }
@@ -196,7 +199,9 @@ impl<'a> ToolingHandler<'a> {
     /// Calls `GET /services/data/{api_version}/tooling/search?q={sosl}`.
     /// Returns the same [`SearchResult<R>`] envelope as the regular
     /// REST search; per-object SOSL restrictions on the Tooling tier
-    /// are listed in the [SOSL Operation Limitations] doc page.
+    /// are listed in the [SOSL Operation Limitations] doc page. As with
+    /// [`Cirrus::search`], a term from outside the program goes through
+    /// [`sosl::escape_term`](crate::sosl::escape_term) first.
     ///
     /// [SOSL Operation Limitations]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/reference_objects_sosl_limits.htm
     pub async fn search(&self, sosl: &str) -> CirrusResult<SearchResult<Value>> {

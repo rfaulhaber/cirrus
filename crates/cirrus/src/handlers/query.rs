@@ -24,6 +24,32 @@
 //! [`pagination`](crate::pagination) module docs for the full
 //! contract.
 //!
+//! # Escaping values
+//!
+//! The query resources have no bind parameters: the statement goes out as
+//! the `q` parameter, percent-encoded for transport and nothing more. A
+//! value that comes from outside the program and is interpolated into a
+//! statement goes through [`soql::quote`](crate::soql::quote) (a string
+//! literal) or [`soql::escape_like`](crate::soql::escape_like) (part of a
+//! `LIKE` pattern) first; an unescaped `'` ends the literal early and lets
+//! the rest of the value rewrite the `WHERE` clause. SOQL is read-only and
+//! runs under the user's sharing and field-level security, so the exposure
+//! is every record the integration user can see. The same applies to the
+//! Tooling query and to SOSL, which has its own
+//! [`sosl::escape_term`](crate::sosl::escape_term).
+//!
+//! # Request size
+//!
+//! Salesforce caps the combined URI and headers of a REST call at 16,384
+//! bytes and answers a longer one with HTTP 414, which surfaces as a
+//! [`CirrusError::Api`] with no error entries. The statement travels in
+//! the URI, and a quote, comma or parenthesis costs three bytes once
+//! encoded, so an `IN` list of about 500 18-character IDs reaches the cap
+//! long before SOQL's own 100,000-character limit. Chunk the list across
+//! calls, or submit the statement as a Bulk 2.0 query job
+//! ([`BulkQueryHandler::create`](crate::handlers::bulk::BulkQueryHandler::create)),
+//! which carries it in a JSON body, runs asynchronously, and returns CSV.
+//!
 //! [`query`]: Cirrus::query
 //! [`query_all`]: Cirrus::query_all
 //! [`query_more`]: Cirrus::query_more
@@ -73,8 +99,14 @@ const NEXT_RECORDS_URL: &[&[Segment]] = &[
 impl Cirrus {
     /// Runs a SOQL query and returns the first batch of active records.
     ///
-    /// Calls `GET /services/data/{api_version}/query?q={soql}`. The query
-    /// string is URL-encoded automatically — pass plain SOQL.
+    /// Calls `GET /services/data/{api_version}/query?q={soql}`. Pass plain
+    /// SOQL: the statement is percent-encoded for the URI here, which is
+    /// transport encoding only. A value interpolated into the statement
+    /// goes through [`soql::quote`](crate::soql::quote) or
+    /// [`soql::escape_like`](crate::soql::escape_like) first (see
+    /// [Escaping values](crate::handlers::query#escaping-values)), and
+    /// the encoded statement has to fit the 16,384-byte URI cap (see
+    /// [Request size](crate::handlers::query#request-size)).
     ///
     /// # Example
     ///
@@ -105,6 +137,8 @@ impl Cirrus {
     /// archived records. The returned envelope still uses
     /// [`QueryResult`] — soft-deleted rows are surfaced via the
     /// `IsDeleted` field on each record (when included in the SELECT).
+    /// The escaping and request-size notes on [`query`](Self::query)
+    /// apply here too.
     pub async fn query_all(&self, soql: &str) -> CirrusResult<QueryResult<Value>> {
         self.query_all_as(soql).await
     }

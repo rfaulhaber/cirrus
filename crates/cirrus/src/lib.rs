@@ -48,6 +48,8 @@ mod locator;
 pub mod pagination;
 mod response;
 pub mod retry;
+pub mod soql;
+pub mod sosl;
 
 /// Re-export of the [`cirrus_auth`] crate as `cirrus::auth`.
 ///
