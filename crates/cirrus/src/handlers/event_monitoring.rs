@@ -16,12 +16,20 @@
 //!    [`download`](EventMonitoringHandler::download) (by record ID) and
 //!    [`download_url`](EventMonitoringHandler::download_url) (by the
 //!    `LogFile` field's instance-relative URL — typically what you have
-//!    in hand from the query).
+//!    in hand from the query), which return the whole file as
+//!    `bytes::Bytes`, and their streaming forms
+//!    [`download_stream`](EventMonitoringHandler::download_stream) and
+//!    [`download_url_stream`](EventMonitoringHandler::download_url_stream),
+//!    which hand the file over as a [`ByteStream`] of chunks.
 //!
-//! Both download methods reuse the [`Cirrus::fetch_raw`] transport
-//! shared with Bulk 2.0 — the response comes back as `bytes::Bytes`,
-//! and non-2xx still surfaces as the standard
-//! [`crate::CirrusError::Api`].
+//! All four go through the client's request loop, so a non-2xx still
+//! surfaces as the standard [`crate::CirrusError::Api`]. They differ in
+//! what happens to the body: the buffering pair holds the whole
+//! decompressed file in memory, bounded by the client's
+//! `max_response_size`, and a failed transfer is retried from the first
+//! byte; the streaming pair holds one chunk at a time, is not bounded
+//! by that cap, and retries nothing once the body has started. For the
+//! files Salesforce describes as larger than 100 MB, stream.
 //!
 //! # Wire shape
 //!
@@ -66,12 +74,12 @@
 //!
 //! [`Cirrus::query`]: crate::Cirrus::query
 //! [`Cirrus::query_as`]: crate::Cirrus::query_as
-//! [`Cirrus::fetch_raw`]: crate::Cirrus
+//! [`ByteStream`]: crate::ByteStream
 //! [`EventLogFileRecord`]: crate::EventLogFileRecord
 
-use crate::Cirrus;
 use crate::error::{CirrusError, CirrusResult};
 use crate::locator::{self, Segment};
+use crate::{ByteStream, Cirrus};
 
 const CSV_ACCEPT: &str = "text/csv";
 
@@ -134,6 +142,12 @@ impl EventMonitoringHandler<'_> {
     /// with `Accept: text/csv`. Returns the raw bytes — decoding the
     /// CSV is left to the caller (column sets are EventType-dependent;
     /// see the module-level docs).
+    ///
+    /// The whole file is held in memory, decompressed, and must fit the
+    /// client's `max_response_size`; a transfer that fails partway is
+    /// retried from the first byte under the retry policy. For a log too
+    /// large to hold, or too large to transfer twice, use
+    /// [`download_stream`](Self::download_stream).
     pub async fn download(&self, log_file_id: &str) -> CirrusResult<bytes::Bytes> {
         // Percent-encode the record ID as its own path segment. `fetch_raw`
         // resolves the resulting fully-qualified URL through passthrough
@@ -181,6 +195,60 @@ impl EventMonitoringHandler<'_> {
         Ok(bytes)
     }
 
+    /// Downloads the CSV log for a given `EventLogFile` record ID as a
+    /// stream of chunks.
+    ///
+    /// Sends the same request as [`download`](Self::download) and
+    /// returns once the response head is in: the retry policy, the
+    /// session refresh and `Sforce-Limit-Info` capture have all applied
+    /// by then, and a non-2xx answer is the usual
+    /// [`CirrusError::Api`]. The body is then handed over as it arrives,
+    /// one chunk at a time, outside the client's `max_response_size`,
+    /// and nothing is replayed once it has started: a transport failure
+    /// mid-body is the stream's error item, and a caller that wants
+    /// another attempt starts the download again.
+    ///
+    /// ```no_run
+    /// # use cirrus::Cirrus;
+    /// use futures::TryStreamExt;
+    /// use tokio::io::{AsyncWrite, AsyncWriteExt};
+    ///
+    /// async fn save_log(
+    ///     sf: &Cirrus,
+    ///     log_file_id: &str,
+    ///     mut out: impl AsyncWrite + Unpin,
+    /// ) -> Result<(), Box<dyn std::error::Error>> {
+    ///     let mut log = sf.event_monitoring().download_stream(log_file_id).await?;
+    ///     while let Some(chunk) = log.try_next().await? {
+    ///         out.write_all(&chunk).await?;
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// [`CirrusError::Api`]: crate::CirrusError::Api
+    pub async fn download_stream(&self, log_file_id: &str) -> CirrusResult<ByteStream> {
+        let url =
+            self.client
+                .versioned_url(&["sobjects", "EventLogFile", log_file_id, "LogFile"])?;
+        self.client
+            .fetch_stream(reqwest::Method::GET, &url, CSV_ACCEPT, None)
+            .await
+    }
+
+    /// Downloads the CSV log given a `LogFile` URL as a stream of
+    /// chunks.
+    ///
+    /// Accepts and confines the URL exactly as
+    /// [`download_url`](Self::download_url) does, and delivers the body
+    /// as [`download_stream`](Self::download_stream) does.
+    pub async fn download_url_stream(&self, log_file_url: &str) -> CirrusResult<ByteStream> {
+        let path = self.instance_rooted(log_file_url)?;
+        self.client
+            .fetch_stream(reqwest::Method::GET, &path, CSV_ACCEPT, None)
+            .await
+    }
+
     /// Normalizes a `LogFile` value into the instance-rooted path it
     /// names, rejecting an absolute URL on another host and any path
     /// that is not the documented `LogFile` resource.
@@ -195,8 +263,12 @@ impl EventMonitoringHandler<'_> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::auth::StaticTokenAuth;
+    use crate::auth::{AuthResult, AuthSession, StaticTokenAuth};
+    use async_trait::async_trait;
+    use futures::TryStreamExt;
+    use std::borrow::Cow;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -512,5 +584,315 @@ mod tests {
         assert_eq!(rec.interval.as_deref(), Some("Hourly"));
         assert_eq!(rec.sequence, Some(3));
         assert!(rec.created_date.is_some());
+    }
+
+    const LOG_PATH: &str = "/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile";
+
+    fn fixture_with_fast_retries(uri: String) -> Cirrus {
+        let auth = Arc::new(StaticTokenAuth::new("tok", uri));
+        Cirrus::builder()
+            .auth(auth)
+            .retry_policy(crate::RetryPolicy {
+                base_delay: std::time::Duration::ZERO,
+                max_delay: std::time::Duration::ZERO,
+                jitter: false,
+                ..crate::RetryPolicy::default()
+            })
+            .build()
+            .unwrap()
+    }
+
+    async fn collect(stream: crate::ByteStream) -> Vec<u8> {
+        stream
+            .try_collect::<Vec<bytes::Bytes>>()
+            .await
+            .unwrap()
+            .concat()
+    }
+
+    /// Test-only session that hands out `stale` until that token is
+    /// invalidated and `fresh` from then on, so a refresh after an
+    /// INVALID_SESSION_ID 401 is observable on the wire.
+    struct TwoTokenAuth {
+        instance_url: String,
+        refreshed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AuthSession for TwoTokenAuth {
+        async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed(if self.refreshed.load(Ordering::SeqCst) {
+                "fresh"
+            } else {
+                "stale"
+            }))
+        }
+
+        fn instance_url(&self) -> &str {
+            &self.instance_url
+        }
+
+        async fn invalidate(&self, stale_token: &str) {
+            if stale_token == "stale" {
+                self.refreshed.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn download_stream_future_and_stream_are_send() {
+        // The streaming path shares the request loop with every other
+        // send path through a generic finish step; this pins that the
+        // generic shape keeps the futures `Send`, so a download can be
+        // spawned onto a multi-threaded runtime like any other call.
+        fn require_send<T: Send>(value: T) -> T {
+            value
+        }
+        fn require_send_unpin<T: Send + Unpin>() {}
+
+        let sf = fixture("https://x.my.salesforce.com".into());
+        let handler = sf.event_monitoring();
+        drop(require_send(handler.download_stream("0ATD000000001bROAQ")));
+        drop(require_send(handler.download_url_stream(LOG_PATH)));
+        drop(require_send(sf.get::<serde_json::Value>("limits")));
+        require_send_unpin::<ByteStream>();
+    }
+
+    #[tokio::test]
+    async fn download_stream_yields_the_body_and_sends_the_csv_accept() {
+        let server = MockServer::start().await;
+
+        let csv = "TIMESTAMP,EVENT_TYPE,USER_ID\n2024-01-01T00:00:00.000Z,API,005xx\n";
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .and(header("authorization", "Bearer tok"))
+            .and(header("accept", "text/csv"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(csv))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let stream = sf
+            .event_monitoring()
+            .download_stream("0ATD000000001bROAQ")
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), 200);
+        assert!(stream.headers().contains_key("content-type"));
+        assert_eq!(collect(stream).await, csv.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn download_stream_is_not_bounded_by_the_response_size_cap() {
+        // The cap exists because the buffering paths hold the whole body;
+        // a stream hands each chunk to the caller and holds none, so the
+        // same download that the buffering path refuses goes through.
+        let server = MockServer::start().await;
+
+        let csv = "A,B\n".repeat(16);
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(csv.clone()))
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .max_response_size(8)
+            .build()
+            .unwrap();
+        let err = sf
+            .event_monitoring()
+            .download("0ATD000000001bROAQ")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CirrusError::ResponseTooLarge { limit: 8, .. }),
+            "{err:?}"
+        );
+
+        let stream = sf
+            .event_monitoring()
+            .download_stream("0ATD000000001bROAQ")
+            .await
+            .unwrap();
+        assert_eq!(collect(stream).await, csv.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn download_stream_retries_a_503_before_the_body_starts() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string("X,Y\n1,2\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture_with_fast_retries(server.uri());
+        let stream = sf
+            .event_monitoring()
+            .download_stream("0ATD000000001bROAQ")
+            .await
+            .unwrap();
+        assert_eq!(collect(stream).await, b"X,Y\n1,2\n");
+    }
+
+    #[tokio::test]
+    async fn download_stream_refreshes_the_session_after_an_invalid_session_401() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .and(header("authorization", "Bearer stale"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(serde_json::json!([{
+                    "message": "Session expired or invalid",
+                    "errorCode": "INVALID_SESSION_ID"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .and(header("authorization", "Bearer fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(TwoTokenAuth {
+            instance_url: server.uri(),
+            refreshed: AtomicBool::new(false),
+        });
+        let sf = Cirrus::builder().auth(auth.clone()).build().unwrap();
+        let stream = sf
+            .event_monitoring()
+            .download_stream("0ATD000000001bROAQ")
+            .await
+            .unwrap();
+        assert_eq!(collect(stream).await, b"ok\n");
+        assert!(auth.refreshed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn download_stream_surfaces_404_as_api_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/sobjects/EventLogFile/0ATmissing/LogFile",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!([{
+                    "errorCode": "NOT_FOUND",
+                    "message": "The requested resource does not exist"
+                }])),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .event_monitoring()
+            .download_stream("0ATmissing")
+            .await
+            .unwrap_err();
+        match err {
+            CirrusError::Api { status, errors, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(errors[0].error_code, "NOT_FOUND");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_stream_records_limit_info_from_the_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("ok\n")
+                    .insert_header("Sforce-Limit-Info", "api-usage=7/15000"),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        assert!(sf.last_limit_info().is_none());
+        let stream = sf
+            .event_monitoring()
+            .download_stream("0ATD000000001bROAQ")
+            .await
+            .unwrap();
+        let info = sf.last_limit_info().unwrap();
+        assert_eq!((info.used, info.allowed), (7, 15000));
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn download_url_stream_sends_the_path_as_issued() {
+        // The client is built for v61.0; the LogFile value names v66.0
+        // and must go out as issued, as `download_url` sends it.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(LOG_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string("X,Y\n1,2\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v61.0")
+            .build()
+            .unwrap();
+        let stream = sf
+            .event_monitoring()
+            .download_url_stream(LOG_PATH)
+            .await
+            .unwrap();
+        assert_eq!(collect(stream).await, b"X,Y\n1,2\n");
+    }
+
+    #[tokio::test]
+    async fn download_url_stream_refuses_a_foreign_host_and_another_resource() {
+        // Same confinement as `download_url`: a bearer-authenticated GET
+        // follows only the documented LogFile path on the instance host.
+        let server = MockServer::start().await;
+        let sf = fixture(server.uri());
+
+        for value in [
+            "https://collector.attacker.example/x",
+            "/services/data/v66.0/query?q=SELECT+Id+FROM+Contact",
+            "/services/data/v66.0/sobjects/Contact/003xx",
+        ] {
+            let err = sf
+                .event_monitoring()
+                .download_url_stream(value)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CirrusError::InvalidResponse(_)),
+                "{value}: {err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
