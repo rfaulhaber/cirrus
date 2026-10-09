@@ -140,8 +140,10 @@ boundary between auth and REST without extra plumbing.
   async ecosystem, so the consumer API surface isn't tied to a specific
   combinator crate. Drop the stream → no further fetches. (Execution still
   runs on tokio, like the rest of the crate.)
-- **Conditional requests** — `describe_*_if_modified_since(SystemTime)` returns
-  `Option<T>`; `None` on 304 Not Modified.
+- **Conditional requests** — `describe_*_if_modified_since(SystemTime)` and
+  `retrieve_if_modified_since[_as]` return `Option<T>`; `None` on 304 Not
+  Modified. `update_if_unmodified_since` sends `If-Unmodified-Since` on a
+  PATCH, and a 412 Precondition Failed stays `CirrusError::Api`.
 - **Structured `tracing` events** — `cirrus::retry`, `cirrus::auth` (the
   401 refresh) and `cirrus::limit_info` targets; the auth flows themselves
   log under `cirrus_auth::*` (see the `cirrus-auth` README). No event
@@ -149,7 +151,9 @@ boundary between auth and REST without extra plumbing.
 - **Transport defaults** — the HTTP client the builder creates advertises
   gzip and decompresses responses, applies a 10 s connect timeout and a 120 s
   read timeout, and doesn't follow redirects — a 3xx surfaces as
-  `CirrusError::Api` rather than re-sending the token to the `Location` host.
+  `CirrusError::Api` (a 300 whose body is a JSON array of records, as an
+  upsert by a non-unique external ID answers, is `CirrusError::MultipleMatches`)
+  rather than re-sending the token to the `Location` host.
   The read timeout runs until the response head arrives, so it bounds the
   request-body upload and the org's processing time too, and only then becomes
   a per-chunk deadline; widen it with `CirrusBuilder::read_timeout` for large
@@ -212,10 +216,13 @@ let created: Value = sf
     .await?;
 ```
 
-For the remaining unusual cases (binary download, SSE), `request_builder` and
-`execute` give you a pre-authenticated `reqwest::RequestBuilder` and a full
-bypass respectively. Both step outside the request loop, so retry, the 401
-auto-refresh and the limit-info capture don't apply to them.
+Binary downloads stay inside the request loop: `retrieve_blob` on a
+`sf.sobject(..)` handler fetches a blob field, and `sf.event_monitoring().download`
+an Event Monitoring log file. For the remaining unusual cases (SSE),
+`request_builder` and `execute` give you a pre-authenticated
+`reqwest::RequestBuilder` and a full bypass respectively. Both step outside the
+request loop, so retry, the 401 auto-refresh and the limit-info capture don't
+apply to them.
 
 ## Examples
 

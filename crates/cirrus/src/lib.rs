@@ -77,12 +77,15 @@ pub use handlers::bulk::{
     BulkIngestSpec, BulkJobListOptions, BulkQuerySpec, MAX_MULTIPART_JOB_DATA_CHARS,
 };
 pub use handlers::composite::{
-    BatchRequest, BatchSubrequest, CompositeRequest, CompositeSubrequest,
+    BatchRequest, BatchSubrequest, COLLECTION_MAX_RECORDS, CollectionRecord, CompositeRequest,
+    CompositeSubrequest, RecordAttributes, SObjectCollection,
 };
 pub use handlers::metadata::{
-    DeployMessage, DeployOptions, DeployRequest, DeployResultDetails, DeployResultInnerDetails,
-    DeployStatus, MetadataHandler, RunTestResults, TestLevel,
+    DeployDetails, DeployMessage, DeployOptions, DeployRequest, DeployResult, DeployStatus,
+    MetadataHandler, RunTestsResult, TestLevel,
 };
+#[allow(deprecated)]
+pub use handlers::metadata::{DeployResultDetails, DeployResultInnerDetails, RunTestResults};
 pub use handlers::sobjects::{BlobUploadSpec, UpsertOptions};
 pub use pagination::Records;
 pub use response::LimitInfo;
@@ -1240,8 +1243,10 @@ impl Cirrus {
     ///
     /// Used by Bulk 2.0 result downloads — the response body is `text/csv`
     /// and the caller may need response headers for cursor pagination
-    /// (`Sforce-Locator`, `Sforce-NumberOfRecords`). Path resolution still
-    /// follows [`Cirrus`]'s three-mode semantics.
+    /// (`Sforce-Locator`, `Sforce-NumberOfRecords`) — and by the other
+    /// raw-body downloads: Event Monitoring log files, sObject blob fields
+    /// and the Apex log body. Path resolution still follows [`Cirrus`]'s
+    /// three-mode semantics.
     pub(crate) async fn fetch_raw(
         &self,
         method: reqwest::Method,

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 ///
 /// Generic over the record type `R` — the SDK never assumes a record shape.
 /// Use `serde_json::Value` for ad-hoc, or supply a typed struct.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult<R> {
     /// Total number of records matched by the query (across all pages).
     #[serde(rename = "totalSize")]
@@ -94,7 +94,7 @@ pub struct QueryResult<R> {
 /// since API 37.0; 31.0 through 36.0 answered a bare array of hits, a
 /// version range [`CirrusBuilder::build`](crate::CirrusBuilder::build)
 /// refuses.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult<R> {
     /// Hit records, in Salesforce-defined relevance order.
     #[serde(rename = "searchRecords", default = "Vec::new")]
@@ -105,7 +105,7 @@ pub struct SearchResult<R> {
 }
 
 /// Result of a single-record create/upsert via REST sObjects endpoints.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SObjectCreateResult {
     /// ID of the created (or upserted) record.
     pub id: String,
@@ -129,7 +129,7 @@ pub struct SObjectCreateResult {
 /// Most limits are flat `{Max, Remaining}` pairs. A few (notably
 /// `PermissionSets`) embed sub-limits with the same shape — those are
 /// captured in [`Limit::nested`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Limit {
     /// Maximum allocation for the org.
     #[serde(rename = "Max")]
@@ -225,7 +225,7 @@ impl LimitInfo {
 
 /// Response from `GET /sobjects` (describe global). Schema-independent
 /// platform metadata — concrete because every org returns the same shape.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeGlobal {
     /// Org's character encoding (typically `"UTF-8"`).
     pub encoding: String,
@@ -238,7 +238,7 @@ pub struct DescribeGlobal {
 
 /// Per-object metadata returned in [`DescribeGlobal::sobjects`]. Mirrors the
 /// flags Salesforce documents for the describe-global response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SObjectMetadata {
     pub activateable: bool,
     pub createable: bool,
@@ -518,7 +518,7 @@ pub enum BulkColumnDelimiter {
 /// `Failed`; `content_url` is populated only while the job is in `Open`
 /// state; and the create response (`POST`) omits `job_type`, which only
 /// the `GET` response carries.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkIngestJob {
     pub id: String,
     pub operation: BulkOperation,
@@ -613,7 +613,7 @@ pub struct BulkIngestJob {
 // - `externalIdFieldName` and `assignmentRuleId` are listed as
 //   conditionally present on the ingest pages; they never apply to
 //   query jobs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkJobStateChange {
     pub id: String,
     pub operation: BulkOperation,
@@ -660,7 +660,7 @@ pub struct BulkJobStateChange {
 /// calling [`crate::handlers::bulk::BulkQueryHandler::create`].
 ///
 /// [`BulkQuerySpec`]: crate::handlers::bulk::BulkQuerySpec
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkQueryJob {
     pub id: String,
     pub operation: BulkOperation,
@@ -797,7 +797,7 @@ impl BulkJobType {
 /// listing methods guarantee it is present in that case.
 ///
 /// [Get Information About All Ingest Jobs](https://developer.salesforce.com/docs/platform/api-asynch/guide/get-all-jobs.html)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkJobList {
     /// `false` while more pages remain.
     pub done: bool,
@@ -838,7 +838,7 @@ impl BulkJobList {
 // while the example prints `68.0`, and asynch-api-reference-jobinfo.html
 // (the Bulk API 1.0 JobInfo a listing can include) types it as a string
 // too, so either form is read.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkJobSummary {
     pub id: String,
     pub operation: BulkOperation,
@@ -874,6 +874,9 @@ pub struct BulkJobSummary {
 
 /// Reads `apiVersion` as the JSON number the examples print or the
 /// string the field tables declare.
+///
+/// Serialization needs no counterpart: the `f64` is written as a JSON
+/// number, one of the two forms this reads.
 fn api_version_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -907,7 +910,7 @@ where
 // Wire-shape provenance: query-get-parallel-job-results.html. Its
 // element table spells the continuation `nextRecordUrl` while its example
 // response spells it `nextRecordsUrl`, so both are read.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkResultPages {
     /// Up to five result links.
     #[serde(rename = "resultPages", default)]
@@ -931,7 +934,7 @@ impl BulkResultPages {
 }
 
 /// One result link from [`BulkResultPages`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkResultPage {
     /// The results URL as Salesforce wrote it, with its `locator`.
     #[serde(rename = "resultUrl")]
@@ -981,7 +984,7 @@ fn query_value(url: &str, name: &str) -> Option<String> {
 /// All Optional fields are `None` when the SELECT clause didn't ask
 /// for them; serde's `default` attribute keeps deserialization robust
 /// against partial column sets.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventLogFileRecord {
     #[serde(rename = "Id")]
     pub id: String,
@@ -1020,7 +1023,7 @@ pub struct EventLogFileRecord {
 }
 
 /// One entry from `GET /services/data` — a Salesforce REST API version.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiVersion {
     /// Human-readable label, e.g. `"Winter '24"`.
     pub label: String,
@@ -1073,7 +1076,7 @@ impl ApiVersion {
 /// [`BatchSubresult`]. Translating sub-failures into transport errors would
 /// drop the partial successes in the same response, so callers inspect
 /// results directly.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchResponse {
     /// `true` when at least one sub-request returned a 4xx/5xx status.
     #[serde(rename = "hasErrors")]
@@ -1089,7 +1092,7 @@ pub struct BatchResponse {
 /// `null` for a 204 No Content (e.g. PATCH/DELETE), or a Salesforce error
 /// array on failure. Its shape is intentionally untyped because batch
 /// sub-requests are heterogeneous.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchSubresult {
     /// HTTP status code returned by this sub-request.
     #[serde(rename = "statusCode")]
@@ -1117,7 +1120,7 @@ impl BatchSubresult {
 /// The `results` collection therefore behaves differently in the two cases:
 /// on success it contains every record's `referenceId` → `id` mapping; on
 /// failure it contains *only* the records whose validation/save errored.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeTreeResponse {
     /// `true` when the request rolled back due to one or more record errors.
     #[serde(rename = "hasErrors")]
@@ -1138,7 +1141,7 @@ pub struct CompositeTreeResponse {
 /// Modeled as two `Option`s rather than a tagged enum because the wire
 /// shape doesn't carry a discriminator and callers usually inspect by
 /// field presence rather than matching variants.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeTreeResult {
     /// Caller-supplied reference ID echoed back from the request.
     #[serde(rename = "referenceId")]
@@ -1167,7 +1170,7 @@ impl CompositeTreeResult {
 /// (a string enum like `"INVALID_EMAIL_ADDRESS"` or `"DUPLICATE_VALUE"`,
 /// not an HTTP code) rather than `errorCode`. Don't try to deserialize
 /// this from the standard error array shape and vice versa.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeError {
     /// String enum identifying the error (e.g. `"INVALID_EMAIL_ADDRESS"`).
     #[serde(rename = "statusCode")]
@@ -1195,7 +1198,27 @@ pub struct CompositeError {
 /// [`CompositeSubresponse::is_error`]. A conditional request's 304 is a
 /// success and a 300 is neither; see those methods. The transactional
 /// rollback flag is on the *request* side (`allOrNone`).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// # Rollback under `allOrNone`
+///
+/// When the request sets `allOrNone: true` and any subrequest fails,
+/// Salesforce rolls the whole composite back, so none of it was
+/// committed, whatever the other subresponses show. A subresponse for an
+/// sObject Collections call can still answer 200 with rows that read
+/// `success: true`. Salesforce's [`allOrNone` Parameters in Composite and
+/// Collections Requests][allornone] page, on a response of that shape,
+/// says: "Even though the response body for sObject Collections request
+/// shows `"success" : true` for the creation of the first Account, the
+/// fact that the Composite request is rolled back means that the Account
+/// creation is rolled back."
+///
+/// With an outer `allOrNone: true`, then, any
+/// [`is_error`](CompositeSubresponse::is_error) subresponse means nothing
+/// in the composite was committed. Decide that from the whole response,
+/// not entry by entry.
+///
+/// [allornone]: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-allornone.html
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeResponse {
     /// One entry per sub-request, ordered by submission unless
     /// `collateSubrequests` reordered them server-side.
@@ -1213,7 +1236,7 @@ pub struct CompositeResponse {
 /// Headers are surfaced as a [`HeaderMap`] so lookups are case-insensitive
 /// — `headers.get("location")` and `headers.get("Location")` reach the
 /// same value, regardless of how Salesforce cased it on the wire.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeSubresponse {
     /// Sub-request response body — record on success, error array on
     /// failure, `Value::Null` for 204 No Content.
@@ -1238,6 +1261,11 @@ impl CompositeSubresponse {
     /// the resulting 304 in a response it calls successful. A 300 Multiple
     /// Choices — several records matched an external ID — is neither a
     /// success nor an [`error`](Self::is_error); inspect `body`.
+    ///
+    /// This describes the subrequest alone. When the composite request set
+    /// `allOrNone: true`, a successful subresponse was still rolled back if
+    /// any other subresponse is an error; see
+    /// [`CompositeResponse`](CompositeResponse#rollback-under-allornone).
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.http_status_code) || self.http_status_code == 304
     }
@@ -1261,12 +1289,18 @@ impl CompositeSubresponse {
 /// `ALL_OR_NONE_OPERATION_ROLLED_BACK` error — and, on update, upsert and
 /// delete, still carry their `id`.
 ///
+/// When these entries are the body of a subresponse in a composite
+/// request with `allOrNone: true`, a failure elsewhere in that composite
+/// rolls the whole call back, and a `success: true` entry here did not
+/// stick. See
+/// [`CompositeResponse`](CompositeResponse#rollback-under-allornone).
+///
 /// `created` is reported only by the upsert endpoint, and not on every
 /// entry: `Some(true)` when the upsert inserted a record, `Some(false)`
 /// when it updated one, and absent on some successful entries in the
 /// documented responses as well as on failures and on create, update and
 /// delete.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SObjectCollectionResult {
     /// Salesforce ID of the record. Absent when no record could be
     /// identified — a failed create, a malformed ID — but present on a
@@ -1317,7 +1351,7 @@ pub struct SObjectCollectionResult {
 // error" sentinel on `line`/`column` are not published anywhere fetchable;
 // they come from live API observation, which is why those two fields are
 // non-`Option` `i32`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteAnonymousResult {
     /// `true` if the Apex source compiled. `false` indicates a syntax
     /// or symbol-resolution failure — see
@@ -1347,9 +1381,10 @@ pub struct ExecuteAnonymousResult {
 /// On 2xx, the body is deserialized into `R` (use `serde_json::Value` for an
 /// untyped response); a body that doesn't fit `R` becomes a
 /// [`CirrusError::InvalidResponse`] carrying a short excerpt of what
-/// arrived. On 4xx/5xx, the body is parsed as a Salesforce error array; if
-/// that fails the raw body is preserved in [`CirrusError::Api::raw`] for
-/// debugging.
+/// arrived. Any other status goes to [`parse_error_response`]: a 300 whose
+/// body is a JSON array becomes [`CirrusError::MultipleMatches`], and any
+/// other body is parsed as a Salesforce error array, falling back to the
+/// raw body in [`CirrusError::Api::raw`] for debugging.
 pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
     status: u16,
     bytes: &[u8],
@@ -1433,17 +1468,26 @@ fn capped_serde_message(err: &serde_json::Error) -> String {
     format!("{}… <truncated>{suffix}", &code[..end])
 }
 
-/// Parses a non-2xx response body into a [`CirrusError::Api`].
+/// Parses a non-2xx response body into a [`CirrusError::Api`], or into
+/// [`CirrusError::MultipleMatches`] for the 300 an upsert by external ID
+/// answers with when the value matches several records.
 ///
-/// Tries the documented Salesforce error array first, then a bare error
-/// object, which some per-operation pages print in place of the array.
-/// When neither parses, the body is preserved in `raw` (capped at
-/// [`RAW_ERROR_BODY_CAP`] bytes) for debugging — unless it was empty, in
-/// which case `raw` stays `None` and the error reads as having no body.
-/// Used both by [`parse_response_bytes`] (JSON success path) and the
-/// raw-body transport path that bypasses JSON deserialization on success
-/// (Bulk API CSV downloads).
+/// A 300 whose body is a JSON array is that list of matching records and
+/// is kept whole, uncapped (the transport already bounds a non-2xx body).
+/// Any other body is tried as the documented Salesforce error array
+/// first, then a bare error object, which some per-operation pages print
+/// in place of the array. When neither parses, the body is preserved in
+/// `raw` (capped at [`RAW_ERROR_BODY_CAP`] bytes) for debugging — unless
+/// it was empty, in which case `raw` stays `None` and the error reads as
+/// having no body. Used both by [`parse_response_bytes`] (JSON success
+/// path) and the raw-body transport path that bypasses JSON
+/// deserialization on success (Bulk API CSV downloads).
 pub(crate) fn parse_error_response(status: u16, bytes: &[u8]) -> CirrusError {
+    if status == 300
+        && let Ok(records) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+    {
+        return CirrusError::MultipleMatches { records };
+    }
     let errors = serde_json::from_slice::<Vec<SalesforceError>>(bytes)
         .or_else(|_| serde_json::from_slice::<SalesforceError>(bytes).map(|e| vec![e]))
         .unwrap_or_default();
@@ -1492,6 +1536,189 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
 
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_describeGlobal.htm
+    /// "Example response body": the envelope with its first `sobjects` entry.
+    fn describe_global_example() -> Value {
+        json!({
+            "encoding": "UTF-8",
+            "maxBatchSize": 200,
+            "sobjects": [{
+                "activateable": false,
+                "custom": false,
+                "customSetting": false,
+                "createable": true,
+                "deletable": true,
+                "deprecatedAndHidden": false,
+                "feedEnabled": true,
+                "keyPrefix": "001",
+                "label": "Account",
+                "labelPlural": "Accounts",
+                "layoutable": true,
+                "mergeable": true,
+                "mruEnabled": true,
+                "name": "Account",
+                "queryable": true,
+                "replicateable": true,
+                "retrieveable": true,
+                "searchable": true,
+                "triggerable": true,
+                "undeletable": true,
+                "updateable": true,
+                "urls": {
+                    "sobject": "/services/data/v66.0/sobjects/Account",
+                    "describe": "/services/data/v66.0/sobjects/Account/describe",
+                    "rowTemplate": "/services/data/v66.0/sobjects/Account/{ID}"
+                }
+            }]
+        })
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_composite_record_manipulation.htm
+    /// "Response body after successfully executing the composite
+    /// request", verbatim apart from the prose placeholder the page uses
+    /// for the account body. The last subrequest sent `If-Modified-Since`
+    /// and came back 304 Not Modified with a null body.
+    fn composite_response_example() -> Value {
+        json!({
+            "compositeResponse": [{
+                "body": {"id": "001R00000033JNuIAM", "success": true, "errors": []},
+                "httpHeaders": {"Location": "/services/data/v67.0/sobjects/Account/001R00000033JNuIAM"},
+                "httpStatusCode": 201,
+                "referenceId": "NewAccount"
+            }, {
+                "body": {"attributes": {"type": "Account"}, "Id": "001R00000033JNuIAM", "Name": "Acme"},
+                "httpHeaders": {
+                    "ETag": "\"Jbjuzw7dbhaEG3fd90kJbx6A0ow=\"",
+                    "Last-Modified": "Fri, 22 Jul 2016 20:19:37 GMT"
+                },
+                "httpStatusCode": 200,
+                "referenceId": "NewAccountInfo"
+            }, {
+                "body": {"id": "003R00000025REHIA2", "success": true, "errors": []},
+                "httpHeaders": {"Location": "/services/data/v67.0/sobjects/Contact/003R00000025REHIA2"},
+                "httpStatusCode": 201,
+                "referenceId": "NewContact"
+            }, {
+                "body": {
+                    "attributes": {"type": "User", "url": "/services/data/v67.0/sobjects/User/005R0000000I90CIAS"},
+                    "Name": "Jane Doe",
+                    "CompanyName": "Salesforce",
+                    "Title": "Director",
+                    "City": "San Francisco",
+                    "State": "CA",
+                    "Id": "005R0000000I90CIAS"
+                },
+                "httpHeaders": {},
+                "httpStatusCode": 200,
+                "referenceId": "NewAccountOwner"
+            }, {
+                "body": null,
+                "httpHeaders": {
+                    "ETag": "\"f2293620\"",
+                    "Last-Modified": "Fri, 22 Jul 2016 18:45:56 GMT"
+                },
+                "httpStatusCode": 304,
+                "referenceId": "AccountMetadata"
+            }]
+        })
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
+    /// Example response for an Open ingest job, verbatim, including the
+    /// slash-less, instance-relative `contentUrl`.
+    fn bulk_ingest_open_job_example() -> Value {
+        json!({
+            "id": "7506g00000DhRA2AAN",
+            "operation": "insert",
+            "object": "Account",
+            "createdById": "0056g000005HQPyAAO",
+            "createdDate": "2018-12-18T22:51:36.000+0000",
+            "systemModstamp": "2018-12-18T22:51:58.000+0000",
+            "state": "Open",
+            "concurrencyMode": "Parallel",
+            "contentType": "CSV",
+            "apiVersion": 67.0,
+            "jobType": "V2Ingest",
+            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
+            "lineEnding": "LF",
+            "columnDelimiter": "COMMA",
+            "retries": 0,
+            "totalProcessingTime": 0,
+            "apiActiveProcessingTime": 0,
+            "apexProcessingTime": 0
+        })
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_update.htm
+    /// "Example Response Body (Some Items Failed and allOrNone is true)",
+    /// verbatim. The delete and upsert pages show the same shape: the
+    /// rolled-back record keeps its id, so only `success` says whether the
+    /// write stuck.
+    fn collections_rollback_example() -> Value {
+        json!([{
+            "id": "001RM000003oCprYAE",
+            "success": false,
+            "errors": [{
+                "statusCode": "ALL_OR_NONE_OPERATION_ROLLED_BACK",
+                "message": "Record rolled back because not all records were valid and the request was using AllOrNone header",
+                "fields": []
+            }]
+        }, {
+            "success": false,
+            "errors": [{
+                "statusCode": "MALFORMED_ID",
+                "message": "Contact ID: id value of incorrect type: 001xx000003DGb2999",
+                "fields": ["Id"]
+            }]
+        }])
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-allornone.html
+    /// "Case 4: `outerFlag` = `true`, `innerFlag` = `false`", the response
+    /// body verbatim. The page's request names the sObject Collections
+    /// subrequest `newAccounts` while this response prints its
+    /// `referenceId` as `collection1`; the response is kept as printed.
+    fn composite_all_or_none_case_4_example() -> Value {
+        json!({
+            "compositeResponse": [{
+                "body": [{
+                    "id": "001R00000066cndIAA",
+                    "success": true,
+                    "errors": []
+                }, {
+                    "success": false,
+                    "errors": [{
+                        "statusCode": "DUPLICATES_DETECTED",
+                        "message": "Use one of these records?",
+                        "fields": []
+                    }]
+                }],
+                "httpHeaders": {},
+                "httpStatusCode": 200,
+                "referenceId": "collection1"
+            }, {
+                "body": [{
+                    "errorCode": "PROCESSING_HALTED",
+                    "message": "The transaction was rolled back since another operation in the same transaction failed."
+                }],
+                "httpHeaders": {},
+                "httpStatusCode": 400,
+                "referenceId": "newContact"
+            }]
+        })
+    }
+
+    /// A query response with more pages to fetch: `done` is `false` and
+    /// `nextRecordsUrl` carries the locator.
+    fn paginated_query_example() -> Value {
+        json!({
+            "totalSize": 1500,
+            "done": false,
+            "nextRecordsUrl": "/services/data/v66.0/query/01g...-2000",
+            "records": []
+        })
+    }
+
     #[test]
     fn non_utf8_error_body_is_capped_after_lossy_decoding() {
         // Each invalid byte becomes a three-byte U+FFFD, so a byte-prefix
@@ -1508,6 +1735,40 @@ mod tests {
                 );
             }
             other => panic!("expected Api with raw body, got {other:?}"),
+        }
+    }
+
+    // Wire-shape provenance: the Upsert page (https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html)
+    // says a non-unique external ID answers 300 "plus a list of the
+    // records that matched the query" and prints no example body, so the
+    // entries below are invented. The fixture pins only that an array
+    // longer than the raw-body cap passes through whole.
+    #[test]
+    fn a_300_with_an_array_body_keeps_every_matching_record() {
+        let matches: Vec<Value> = (0..100)
+            .map(|i| json!({"Id": format!("001xx000003DGb{i:03}"), "Name": format!("Company {i:03}")}))
+            .collect();
+        let body = serde_json::to_vec(&matches).unwrap();
+        assert!(body.len() > RAW_ERROR_BODY_CAP);
+
+        match parse_error_response(300, &body) {
+            CirrusError::MultipleMatches { records, .. } => {
+                assert_eq!(records.len(), 100);
+                assert_eq!(records[99], matches[99]);
+            }
+            other => panic!("expected MultipleMatches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_300_with_a_non_array_body_stays_an_api_error() {
+        match parse_error_response(300, b"<html>") {
+            CirrusError::Api {
+                status: 300,
+                raw: Some(raw),
+                ..
+            } => assert_eq!(raw, "<html>"),
+            other => panic!("expected Api with a raw body, got {other:?}"),
         }
     }
 
@@ -1683,13 +1944,7 @@ mod tests {
 
     #[test]
     fn parses_paginated_query_result() {
-        let body = json!({
-            "totalSize": 1500,
-            "done": false,
-            "nextRecordsUrl": "/services/data/v66.0/query/01g...-2000",
-            "records": []
-        })
-        .to_string();
+        let body = paginated_query_example().to_string();
         let qr: QueryResult<Value> = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert!(!qr.done);
         assert_eq!(
@@ -1855,39 +2110,7 @@ mod tests {
 
     #[test]
     fn parses_describe_global() {
-        let body = json!({
-            "encoding": "UTF-8",
-            "maxBatchSize": 200,
-            "sobjects": [{
-                "activateable": false,
-                "custom": false,
-                "customSetting": false,
-                "createable": true,
-                "deletable": true,
-                "deprecatedAndHidden": false,
-                "feedEnabled": true,
-                "keyPrefix": "001",
-                "label": "Account",
-                "labelPlural": "Accounts",
-                "layoutable": true,
-                "mergeable": true,
-                "mruEnabled": true,
-                "name": "Account",
-                "queryable": true,
-                "replicateable": true,
-                "retrieveable": true,
-                "searchable": true,
-                "triggerable": true,
-                "undeletable": true,
-                "updateable": true,
-                "urls": {
-                    "sobject": "/services/data/v66.0/sobjects/Account",
-                    "describe": "/services/data/v66.0/sobjects/Account/describe",
-                    "rowTemplate": "/services/data/v66.0/sobjects/Account/{ID}"
-                }
-            }]
-        })
-        .to_string();
+        let body = describe_global_example().to_string();
         let dg: DescribeGlobal = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(dg.encoding, "UTF-8");
         assert_eq!(dg.max_batch_size, 200);
@@ -2037,30 +2260,7 @@ mod tests {
 
     #[test]
     fn parses_bulk_ingest_job_response() {
-        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/get_job_info.htm
-        // Example response for an Open ingest job, verbatim — including the
-        // slash-less, instance-relative `contentUrl`.
-        let body = json!({
-            "id": "7506g00000DhRA2AAN",
-            "operation": "insert",
-            "object": "Account",
-            "createdById": "0056g000005HQPyAAO",
-            "createdDate": "2018-12-18T22:51:36.000+0000",
-            "systemModstamp": "2018-12-18T22:51:58.000+0000",
-            "state": "Open",
-            "concurrencyMode": "Parallel",
-            "contentType": "CSV",
-            "apiVersion": 67.0,
-            "jobType": "V2Ingest",
-            "contentUrl": "services/data/v67.0/jobs/ingest/7506g00000DhRA2AAN/batches",
-            "lineEnding": "LF",
-            "columnDelimiter": "COMMA",
-            "retries": 0,
-            "totalProcessingTime": 0,
-            "apiActiveProcessingTime": 0,
-            "apexProcessingTime": 0
-        })
-        .to_string();
+        let body = bulk_ingest_open_job_example().to_string();
         let job: BulkIngestJob = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(job.id, "7506g00000DhRA2AAN");
         assert_eq!(job.operation, BulkOperation::Insert);
@@ -2207,6 +2407,20 @@ mod tests {
         let job: BulkJobStateChange = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(job.operation, BulkOperation::Unknown);
         assert_eq!(job.state, BulkJobState::JobComplete);
+    }
+
+    #[test]
+    fn unnamed_bulk_operation_writes_its_own_literal_and_reads_back_as_unknown() {
+        // The literal Salesforce sent is not kept: `Unknown` serializes as
+        // its own name, which no endpoint accepts, and parses as itself.
+        let op: BulkOperation = serde_json::from_value(json!("someFutureOperation")).unwrap();
+        assert_eq!(op, BulkOperation::Unknown);
+        let written = serde_json::to_value(op).unwrap();
+        assert_eq!(written, json!("Unknown"));
+        assert_eq!(
+            serde_json::from_value::<BulkOperation>(written).unwrap(),
+            BulkOperation::Unknown
+        );
     }
 
     #[test]
@@ -2553,56 +2767,7 @@ mod tests {
 
     #[test]
     fn parses_the_documented_composite_response_including_its_304_entry() {
-        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_composite_record_manipulation.htm
-        // "Response body after successfully executing the composite
-        // request", verbatim apart from the prose placeholder the page
-        // uses for the account body. The last subrequest sent
-        // If-Modified-Since and came back 304 Not Modified with a null
-        // body: on a request the page calls successful, that entry is not
-        // a failure.
-        let body = json!({
-            "compositeResponse": [{
-                "body": {"id": "001R00000033JNuIAM", "success": true, "errors": []},
-                "httpHeaders": {"Location": "/services/data/v67.0/sobjects/Account/001R00000033JNuIAM"},
-                "httpStatusCode": 201,
-                "referenceId": "NewAccount"
-            }, {
-                "body": {"attributes": {"type": "Account"}, "Id": "001R00000033JNuIAM", "Name": "Acme"},
-                "httpHeaders": {
-                    "ETag": "\"Jbjuzw7dbhaEG3fd90kJbx6A0ow=\"",
-                    "Last-Modified": "Fri, 22 Jul 2016 20:19:37 GMT"
-                },
-                "httpStatusCode": 200,
-                "referenceId": "NewAccountInfo"
-            }, {
-                "body": {"id": "003R00000025REHIA2", "success": true, "errors": []},
-                "httpHeaders": {"Location": "/services/data/v67.0/sobjects/Contact/003R00000025REHIA2"},
-                "httpStatusCode": 201,
-                "referenceId": "NewContact"
-            }, {
-                "body": {
-                    "attributes": {"type": "User", "url": "/services/data/v67.0/sobjects/User/005R0000000I90CIAS"},
-                    "Name": "Jane Doe",
-                    "CompanyName": "Salesforce",
-                    "Title": "Director",
-                    "City": "San Francisco",
-                    "State": "CA",
-                    "Id": "005R0000000I90CIAS"
-                },
-                "httpHeaders": {},
-                "httpStatusCode": 200,
-                "referenceId": "NewAccountOwner"
-            }, {
-                "body": null,
-                "httpHeaders": {
-                    "ETag": "\"f2293620\"",
-                    "Last-Modified": "Fri, 22 Jul 2016 18:45:56 GMT"
-                },
-                "httpStatusCode": 304,
-                "referenceId": "AccountMetadata"
-            }]
-        })
-        .to_string();
+        let body = composite_response_example().to_string();
         let resp: CompositeResponse = parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(resp.composite_response.len(), 5);
         assert_eq!(resp.composite_response[0].reference_id, "NewAccount");
@@ -2641,29 +2806,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_all_or_none_case_4_response() {
+        let body = composite_all_or_none_case_4_example().to_string();
+        let resp: CompositeResponse = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(resp.composite_response.len(), 2);
+
+        // The collections subrequest answers 200 and its first row says
+        // `success: true`, yet the outer `allOrNone: true` rolled it back
+        // along with the failed Contact create.
+        let collections = &resp.composite_response[0];
+        assert_eq!(collections.http_status_code, 200);
+        assert!(collections.is_success());
+        let rows: Vec<SObjectCollectionResult> =
+            serde_json::from_value(collections.body.clone()).unwrap();
+        assert!(rows[0].success);
+        assert_eq!(rows[1].errors[0].status_code, "DUPLICATES_DETECTED");
+
+        let halted = &resp.composite_response[1];
+        assert_eq!(halted.http_status_code, 400);
+        assert!(halted.is_error());
+        let errors: Vec<SalesforceError> = serde_json::from_value(halted.body.clone()).unwrap();
+        assert_eq!(errors[0].error_code, "PROCESSING_HALTED");
+    }
+
+    #[test]
     fn parses_collections_rollback_entries_that_keep_their_ids() {
-        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_update.htm
-        // "Example Response Body (Some Items Failed and allOrNone is true)",
-        // verbatim. The delete and upsert pages show the same shape: the
-        // rolled-back record keeps its id, so only `success` says whether
-        // the write stuck.
-        let body = json!([{
-            "id": "001RM000003oCprYAE",
-            "success": false,
-            "errors": [{
-                "statusCode": "ALL_OR_NONE_OPERATION_ROLLED_BACK",
-                "message": "Record rolled back because not all records were valid and the request was using AllOrNone header",
-                "fields": []
-            }]
-        }, {
-            "success": false,
-            "errors": [{
-                "statusCode": "MALFORMED_ID",
-                "message": "Contact ID: id value of incorrect type: 001xx000003DGb2999",
-                "fields": ["Id"]
-            }]
-        }])
-        .to_string();
+        let body = collections_rollback_example().to_string();
         let results: Vec<SObjectCollectionResult> =
             parse_response_bytes(200, body.as_bytes()).unwrap();
         assert_eq!(results[0].id.as_deref(), Some("001RM000003oCprYAE"));
@@ -2935,6 +3103,341 @@ mod tests {
             bursts: None,
         };
         assert_eq!(info.remaining(), 0);
+    }
+
+    // Every envelope serializes under the wire names it deserializes from,
+    // so a parsed response can be persisted and read back.
+
+    fn assert_serialize<T: Serialize>() {}
+
+    #[test]
+    fn every_response_envelope_is_serialize() {
+        assert_serialize::<QueryResult<Value>>();
+        assert_serialize::<SearchResult<Value>>();
+        assert_serialize::<SObjectCreateResult>();
+        assert_serialize::<Limit>();
+        assert_serialize::<DescribeGlobal>();
+        assert_serialize::<SObjectMetadata>();
+        assert_serialize::<BulkIngestJob>();
+        assert_serialize::<BulkJobStateChange>();
+        assert_serialize::<BulkQueryJob>();
+        assert_serialize::<BulkJobList>();
+        assert_serialize::<BulkJobSummary>();
+        assert_serialize::<BulkResultPages>();
+        assert_serialize::<BulkResultPage>();
+        assert_serialize::<EventLogFileRecord>();
+        assert_serialize::<ApiVersion>();
+        assert_serialize::<BatchResponse>();
+        assert_serialize::<BatchSubresult>();
+        assert_serialize::<CompositeTreeResponse>();
+        assert_serialize::<CompositeTreeResult>();
+        assert_serialize::<CompositeError>();
+        assert_serialize::<CompositeResponse>();
+        assert_serialize::<CompositeSubresponse>();
+        assert_serialize::<SObjectCollectionResult>();
+        assert_serialize::<ExecuteAnonymousResult>();
+    }
+
+    #[test]
+    fn describe_global_serializes_under_its_wire_names_and_reads_back() {
+        let fixture = describe_global_example();
+        let parsed: DescribeGlobal = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["maxBatchSize"], 200);
+        let object = &written["sobjects"][0];
+        for key in [
+            "customSetting",
+            "deprecatedAndHidden",
+            "feedEnabled",
+            "keyPrefix",
+            "labelPlural",
+            "mruEnabled",
+        ] {
+            assert!(object.get(key).is_some(), "{key} missing from {object}");
+        }
+        assert!(written.get("max_batch_size").is_none());
+        assert_eq!(written, fixture);
+
+        let back: DescribeGlobal = serde_json::from_value(written).unwrap();
+        assert_eq!(back.max_batch_size, 200);
+        assert_eq!(back.sobjects[0].key_prefix.as_deref(), Some("001"));
+        assert_eq!(back.sobjects[0].urls, parsed.sobjects[0].urls);
+    }
+
+    #[test]
+    fn query_result_serializes_its_pagination_members_and_reads_back() {
+        let mut fixture = paginated_query_example();
+        fixture["records"] = json!([{"Id": "001xx", "Name": "Acme"}]);
+        let parsed: QueryResult<Value> = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["totalSize"], 1500);
+        assert_eq!(
+            written["nextRecordsUrl"],
+            "/services/data/v66.0/query/01g...-2000"
+        );
+        assert_eq!(written, fixture);
+
+        let back: QueryResult<Value> = serde_json::from_value(written).unwrap();
+        assert_eq!(back.total_size, 1500);
+        assert!(!back.done);
+        assert_eq!(back.next_records_url, parsed.next_records_url);
+        assert_eq!(back.records[0]["Name"], "Acme");
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_search.htm
+    /// The `searchRecords` entry follows that page's "Example response body".
+    /// The `metadata` member is struct-derived (the struct has the field);
+    /// its value here is not a documented example.
+    #[test]
+    fn search_result_serializes_the_current_object_form() {
+        let fixture = json!({
+            "searchRecords": [{
+                "attributes": {
+                    "type": "Account",
+                    "url": "/services/data/v66.0/sobjects/Account/001xx"
+                },
+                "Id": "001xx"
+            }],
+            "metadata": {"entityMetadata": []}
+        });
+        let parsed: SearchResult<Value> = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written, fixture);
+        let back: SearchResult<Value> = serde_json::from_value(written).unwrap();
+        assert_eq!(back.search_records[0]["attributes"]["type"], "Account");
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_versions.htm
+    /// "Example JSON response body": one entry of the array.
+    #[test]
+    fn api_version_serializes_and_reads_back() {
+        let fixture = json!({
+            "label": "Summer '14",
+            "url": "/services/data/v31.0",
+            "version": "31.0"
+        });
+        let parsed: ApiVersion = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written, fixture);
+        let back: ApiVersion = serde_json::from_value(written).unwrap();
+        assert_eq!(back.version_number(), Some((31, 0)));
+    }
+
+    #[test]
+    fn collection_results_omit_an_absent_id_and_created_flag() {
+        let fixture = collections_rollback_example();
+        let parsed: Vec<SObjectCollectionResult> = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            written[0]["errors"][0]["statusCode"],
+            "ALL_OR_NONE_OPERATION_ROLLED_BACK"
+        );
+        assert_eq!(written[0]["id"], "001RM000003oCprYAE");
+        assert!(written[0].get("created").is_none());
+        assert!(written[1].get("id").is_none());
+        assert!(written[1].get("created").is_none());
+        assert_eq!(written, fixture);
+
+        let back: Vec<SObjectCollectionResult> = serde_json::from_value(written).unwrap();
+        assert_eq!(back[0].id.as_deref(), Some("001RM000003oCprYAE"));
+        assert!(back[1].id.is_none());
+        assert_eq!(back[1].errors[0].fields, vec!["Id".to_string()]);
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-upsert.html
+    /// The first body is an entry of its "Example Response Body" (every item
+    /// succeeded). The second has the shape of the single-record reply on
+    /// https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+    /// (API 46.0 and later), with the first entry's ID substituted.
+    #[test]
+    fn created_flag_is_written_when_present() {
+        let parsed: SObjectCollectionResult = serde_json::from_value(
+            json!({"id": "001xx0000004GxDAAU", "success": true, "errors": [], "created": true}),
+        )
+        .unwrap();
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["created"], true);
+
+        let parsed: SObjectCreateResult = serde_json::from_value(
+            json!({"id": "001xx0000004GxDAAU", "success": true, "errors": [], "created": false}),
+        )
+        .unwrap();
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["created"], false);
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/responses_composite_sobject_tree.htm
+    /// "JSON example upon success" (its first result) and "JSON example upon
+    /// failure".
+    #[test]
+    fn composite_tree_results_write_only_the_member_they_carry() {
+        let success: CompositeTreeResponse = serde_json::from_value(json!({
+            "hasErrors": false,
+            "results": [{"referenceId": "ref1", "id": "001D000000K0fXOIAZ"}]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&success).unwrap();
+        assert_eq!(written["hasErrors"], false);
+        assert_eq!(written["results"][0]["referenceId"], "ref1");
+        assert_eq!(written["results"][0]["id"], "001D000000K0fXOIAZ");
+        assert!(written["results"][0].get("errors").is_none());
+
+        let failure: CompositeTreeResponse = serde_json::from_value(json!({
+            "hasErrors": true,
+            "results": [{
+                "referenceId": "ref2",
+                "errors": [{
+                    "statusCode": "INVALID_EMAIL_ADDRESS",
+                    "message": "Email: invalid email address: 123",
+                    "fields": ["Email"]
+                }]
+            }]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&failure).unwrap();
+        assert!(written["results"][0].get("id").is_none());
+        let back: CompositeTreeResponse = serde_json::from_value(written).unwrap();
+        assert!(back.has_errors);
+        assert_eq!(
+            back.results[0].errors.as_ref().unwrap()[0].status_code,
+            "INVALID_EMAIL_ADDRESS"
+        );
+    }
+
+    #[test]
+    fn composite_response_serializes_its_wire_names_and_reads_back() {
+        let parsed: CompositeResponse =
+            serde_json::from_value(composite_response_example()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        let first = &written["compositeResponse"][0];
+        assert_eq!(first["httpStatusCode"], 201);
+        assert_eq!(first["referenceId"], "NewAccount");
+        assert_eq!(first["body"]["id"], "001R00000033JNuIAM");
+        assert!(first["httpHeaders"].is_object());
+        assert!(first.get("http_status_code").is_none());
+
+        let back: CompositeResponse = serde_json::from_value(written).unwrap();
+        assert_eq!(back.composite_response.len(), 5);
+        for (before, after) in parsed
+            .composite_response
+            .iter()
+            .zip(&back.composite_response)
+        {
+            assert_eq!(after.reference_id, before.reference_id);
+            assert_eq!(after.http_status_code, before.http_status_code);
+            assert_eq!(after.body, before.body);
+            assert_eq!(after.http_headers, before.http_headers);
+        }
+        let cached = &back.composite_response[4];
+        assert!(cached.is_success());
+        assert_eq!(
+            cached
+                .http_headers
+                .get("ETag")
+                .and_then(|v| v.to_str().ok()),
+            Some("\"f2293620\"")
+        );
+    }
+
+    #[test]
+    fn bulk_ingest_job_serializes_its_wire_names_and_reads_back() {
+        let fixture = bulk_ingest_open_job_example();
+        let parsed: BulkIngestJob = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        for (key, value) in fixture.as_object().unwrap() {
+            assert_eq!(&written[key], value, "{key}");
+        }
+        assert_eq!(written["columnDelimiter"], "COMMA");
+        assert!(written.get("created_by_id").is_none());
+
+        let back: BulkIngestJob = serde_json::from_value(written).unwrap();
+        assert_eq!(back.id, parsed.id);
+        assert_eq!(back.operation, BulkOperation::Insert);
+        assert_eq!(back.state, BulkJobState::Open);
+        assert_eq!(back.column_delimiter, BulkColumnDelimiter::Comma);
+        assert_eq!(back.api_version, 67.0);
+        assert_eq!(back.content_url, parsed.content_url);
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/platform/api-asynch/guide/query-get-all-jobs.html
+    /// A Bulk API 1.0 job in a listing types `apiVersion` as a string
+    /// (https://developer.salesforce.com/docs/platform/api-asynch/guide/asynch-api-reference-jobinfo.html),
+    /// which a summary reads as a number and writes as one.
+    #[test]
+    fn bulk_job_summary_writes_api_version_as_a_number_it_reads_back() {
+        let list: BulkJobList = serde_json::from_value(json!({
+            "done": true,
+            "records": [{
+                "id": "750xx",
+                "operation": "query",
+                "object": "Account",
+                "createdById": "005xx",
+                "createdDate": "2024-01-01T00:00:00.000+0000",
+                "systemModstamp": "2024-01-01T00:00:00.000+0000",
+                "state": "Closed",
+                "concurrencyMode": "Parallel",
+                "contentType": "ZIP_CSV",
+                "apiVersion": "66.0",
+                "jobType": "Classic"
+            }]
+        }))
+        .unwrap();
+
+        let written = serde_json::to_value(&list).unwrap();
+        let record = &written["records"][0];
+        assert_eq!(record["apiVersion"], 66.0);
+        assert_eq!(record["jobType"], "Classic");
+        assert_eq!(record["concurrencyMode"], "Parallel");
+
+        let back: BulkJobList = serde_json::from_value(written).unwrap();
+        assert_eq!(back.records[0].api_version, 66.0);
+        assert_eq!(back.records[0].job_type, Some(BulkJobType::Classic));
+        assert!(back.done);
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_limits.htm
+    /// The `PermissionSets` entry of its "Example response body".
+    #[test]
+    fn nested_limits_serialize_their_sub_limits_at_the_top_level() {
+        let fixture = json!({
+            "Max": 1500,
+            "Remaining": 1499,
+            "CreateCustom": {"Max": 1000, "Remaining": 999}
+        });
+        let parsed: Limit = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written, fixture);
+        let back: Limit = serde_json::from_value(written).unwrap();
+        assert_eq!(back.nested["CreateCustom"].remaining, 999);
+    }
+
+    /// Wire-shape provenance: see the comment above `ExecuteAnonymousResult`.
+    #[test]
+    fn execute_anonymous_result_serializes_its_wire_names() {
+        let fixture = json!({
+            "compiled": true,
+            "compileProblem": null,
+            "success": true,
+            "line": -1,
+            "column": -1,
+            "exceptionMessage": null,
+            "exceptionStackTrace": null
+        });
+        let parsed: ExecuteAnonymousResult = serde_json::from_value(fixture.clone()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written, fixture);
+        let back: ExecuteAnonymousResult = serde_json::from_value(written).unwrap();
+        assert_eq!(back.line, -1);
+        assert!(back.exception_message.is_none());
     }
 }
 

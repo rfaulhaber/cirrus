@@ -67,7 +67,7 @@ async fn composite_sobjects_create_then_delete() {
     let del_results = sf
         .composite()
         .sobjects()
-        .delete(&ids.iter().map(String::as_str).collect::<Vec<_>>(), false)
+        .delete(&ids, false)
         .await
         .expect("composite delete should succeed");
     assert_eq!(del_results.len(), 3, "one result per id");

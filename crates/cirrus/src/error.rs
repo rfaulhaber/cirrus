@@ -90,6 +90,10 @@ pub enum CirrusError {
     /// some per-operation pages print); if the body could not be parsed
     /// as either, the raw body is in `raw`.
     ///
+    /// The one exception is a 300 whose body is a JSON array, which is
+    /// [`MultipleMatches`](Self::MultipleMatches): that array lists
+    /// records, not errors.
+    ///
     /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
     /// later field is an additive change.
     #[error("Salesforce API error (status {status}): {}", display_errors(.errors, .raw))]
@@ -120,6 +124,62 @@ pub enum CirrusError {
         /// replays — can wait as long as the server asked. `None` when
         /// the header was absent or unreadable.
         retry_after: Option<Duration>,
+    },
+
+    /// A 300 response whose body is a JSON array: the records the request
+    /// matched.
+    ///
+    /// The documented case is an upsert by external ID whose value is not
+    /// unique: "If the external ID value isn't unique, an HTTP status code
+    /// 300 is returned, plus a list of the records that matched the query"
+    /// ([Insert or Update (Upsert) a Record Using an External ID][upsert]).
+    /// Such an upsert neither creates nor updates anything, and `records`
+    /// is the list it answers with, so a caller can pick the record it
+    /// meant and retry by ID. Salesforce does not document the shape of
+    /// the entries, which is why they are [`serde_json::Value`]s. The
+    /// entries are as Salesforce sent them, except that a string value
+    /// equal to or containing the session token has that text replaced
+    /// with `[redacted]`; nothing else is altered, and object keys are
+    /// not scanned.
+    ///
+    /// Every 300 with a JSON-array body, from any endpoint, parses into
+    /// this variant; a 300 with any other body stays [`Api`](Self::Api).
+    ///
+    /// The list is bounded only by the client's 256 KiB cap on non-2xx
+    /// bodies, not by the 2 KiB cap on [`Api`](Self::Api)'s `raw`.
+    /// `Display` reports only how many records matched, because the
+    /// entries are record data, while `Debug` prints the records in full.
+    /// Log the error with `{}` where record data must not reach the log.
+    ///
+    /// The variant is `#[non_exhaustive]`: destructure it with `..` so a
+    /// later field is an additive change. Naming only `records` does not
+    /// compile outside this crate:
+    ///
+    /// ```compile_fail
+    /// use cirrus::CirrusError;
+    ///
+    /// fn count(err: &CirrusError) -> usize {
+    ///     match err {
+    ///         CirrusError::MultipleMatches { records } => records.len(),
+    ///         _ => 0,
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [upsert]: https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+    //
+    // Wire-shape provenance: the Upsert page linked above prints no example
+    // body for the 300. That the list is a JSON array is the reading of "a
+    // list"; the page does not document the entries' members.
+    #[error(
+        "HTTP 300 Multiple Choices: {} matching record{}",
+        .records.len(),
+        if .records.len() == 1 { "" } else { "s" }
+    )]
+    #[non_exhaustive]
+    MultipleMatches {
+        /// The matching records as Salesforce sent them.
+        records: Vec<serde_json::Value>,
     },
 
     /// An auth flow (token acquisition, refresh, OAuth exchange) failed.
@@ -235,6 +295,12 @@ impl CirrusError {
                 retry_after,
             },
             Self::InvalidResponse(message) => Self::InvalidResponse(redact_body(&message, token)),
+            Self::MultipleMatches { records } => Self::MultipleMatches {
+                records: records
+                    .into_iter()
+                    .map(|record| redact_json(record, token))
+                    .collect(),
+            },
             other => other,
         }
     }
@@ -260,17 +326,45 @@ impl CirrusError {
     }
 }
 
+/// Replaces every occurrence of the live token with [`REDACTED`].
+fn mask_token(text: &str, token: &str) -> String {
+    if token.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(token, REDACTED)
+    }
+}
+
 /// Replaces the live token, plus any `Bearer <credential>` run, with
 /// [`REDACTED`]. The second pass matters because an echoed request may
 /// carry a differently-encoded or already-rotated token that the exact
 /// match misses.
 fn redact_body(body: &str, token: &str) -> String {
-    let stripped = if token.is_empty() {
-        body.to_string()
-    } else {
-        body.replace(token, REDACTED)
-    };
-    redact_bearer_credentials(&stripped)
+    redact_bearer_credentials(&mask_token(body, token))
+}
+
+/// Applies [`mask_token`] to every string leaf of `value`. Object keys
+/// and non-string leaves pass through unchanged. The `Bearer <credential>`
+/// pass of [`redact_body`] is left out because `value` is record data,
+/// where "Bearer Capital Inc" is a name and not a credential.
+fn redact_json(value: serde_json::Value, token: &str) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(mask_token(&text, token)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json(item, token))
+                .collect(),
+        ),
+        Value::Object(members) => Value::Object(
+            members
+                .into_iter()
+                .map(|(key, member)| (key, redact_json(member, token)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn redact_bearer_credentials(body: &str) -> String {
@@ -349,6 +443,29 @@ mod tests {
         assert!(msg.contains("400"));
         assert!(msg.contains("REQUIRED_FIELD_MISSING"));
         assert!(msg.contains("Name"));
+    }
+
+    #[test]
+    fn multiple_matches_display_reports_the_count_and_no_record_data() {
+        let err = CirrusError::MultipleMatches {
+            records: vec![
+                serde_json::json!({"Name": "Acme Confidential"}),
+                serde_json::json!({"Name": "Globex Confidential"}),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("2 matching records"), "{msg}");
+        assert!(!msg.contains("Confidential"), "{msg}");
+    }
+
+    #[test]
+    fn multiple_matches_display_reads_correctly_for_one_record() {
+        let err = CirrusError::MultipleMatches {
+            records: vec![serde_json::json!({"Name": "Acme"})],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("1 matching record"), "{msg}");
+        assert!(!msg.contains("records"), "{msg}");
     }
 
     #[test]
@@ -437,6 +554,79 @@ mod tests {
         assert!(message.contains("[redacted]"));
         assert!(message.contains("/services/data/v66.0/limits"));
         assert!(!err.to_string().contains(token));
+    }
+
+    #[test]
+    fn redact_secrets_strips_a_token_nested_in_multiple_matches_records() {
+        // The 300 list is kept whole and its entries are arbitrary JSON,
+        // so an interposed hop that answers 300 with an echoed request
+        // can put the token in any string leaf, at any depth.
+        let token = "00D5f000000ABCD!AQcAQK_nested_session_id";
+        let err = CirrusError::MultipleMatches {
+            records: vec![
+                serde_json::json!({
+                    "Id": "001xx000003DGb2AAG",
+                    "Echo": {
+                        "Authorization": format!("Bearer {token}"),
+                        "Trace": ["hop-1", format!("session {token} rejected")],
+                        "Attempts": 3,
+                        "Final": false,
+                        "Retry": null,
+                    },
+                }),
+                serde_json::json!(token),
+            ],
+        }
+        .redact_secrets(token);
+
+        let CirrusError::MultipleMatches { records } = &err else {
+            panic!("expected a MultipleMatches error");
+        };
+        assert!(!format!("{err:?}").contains(token), "{err:?}");
+        assert_eq!(
+            records,
+            &vec![
+                serde_json::json!({
+                    "Id": "001xx000003DGb2AAG",
+                    "Echo": {
+                        "Authorization": "Bearer [redacted]",
+                        "Trace": ["hop-1", "session [redacted] rejected"],
+                        "Attempts": 3,
+                        "Final": false,
+                        "Retry": null,
+                    },
+                }),
+                serde_json::json!("[redacted]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn redact_secrets_masks_only_the_token_in_multiple_matches_records() {
+        // The entries are record data, so the `Bearer <word>` heuristic
+        // that scrubs intermediary pages must not rewrite a company name
+        // or a word that merely ends in "bearer".
+        let token = "00D5f000000ABCD!AQcAQK_masked_session_id";
+        let err = CirrusError::MultipleMatches {
+            records: vec![
+                serde_json::json!({"Name": "Bearer Capital Inc"}),
+                serde_json::json!({"Name": "Torchbearer Ltd"}),
+                serde_json::json!({"Note": format!("rejected {token} twice: {token}")}),
+            ],
+        }
+        .redact_secrets(token);
+
+        let CirrusError::MultipleMatches { records } = &err else {
+            panic!("expected a MultipleMatches error");
+        };
+        assert_eq!(
+            records,
+            &vec![
+                serde_json::json!({"Name": "Bearer Capital Inc"}),
+                serde_json::json!({"Name": "Torchbearer Ltd"}),
+                serde_json::json!({"Note": "rejected [redacted] twice: [redacted]"}),
+            ]
+        );
     }
 
     #[test]

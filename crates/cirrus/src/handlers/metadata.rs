@@ -27,20 +27,19 @@
 //! name the test block `runTestResult` with a `numTestsRun` count,
 //! while the hand-written JSON examples on the check-status and cancel
 //! pages show `runTestResults` and `numRun`. No live run in this
-//! repository has settled which the wire carries, so
-//! [`DeployResultInnerDetails`] and [`RunTestResults`] accept both
-//! spellings; the Rust field names follow the examples.
+//! repository has settled which the wire carries, so [`DeployDetails`]
+//! and [`RunTestsResult`] accept both spellings; the Rust field names
+//! follow the examples.
 //!
 //! The `deployResult` object is not uniform across the four pages:
 //! `meta_rest_deploy` shows an inner `id`, `success` and `done`, while
 //! `meta_rest_deploy_checkstatus` and `meta_rest_deploy_cancel` show
 //! neither an inner `id` nor those flags, although the parameters table
-//! lists both. Every field on [`DeployResultDetails`] is therefore
-//! optional or defaulted. The two flags are `Option<bool>`, and
-//! [`DeployResultDetails::is_done`] and
-//! [`DeployResultDetails::is_success`] fall back to `status` when they
-//! are absent; the deploy id is read from [`DeployRequest::id`], which
-//! all pages show.
+//! lists both. Every field on [`DeployResult`] is therefore optional or
+//! defaulted. The two flags are `Option<bool>`, and
+//! [`DeployResult::is_done`] and [`DeployResult::is_success`] fall back
+//! to `status` when they are absent; the deploy id is read from
+//! [`DeployRequest::id`], which all pages show.
 
 use crate::Cirrus;
 use crate::error::CirrusResult;
@@ -108,7 +107,7 @@ impl MetadataHandler<'_> {
     ///
     /// Calls `GET /services/data/{api_version}/metadata/deployRequest/{id}`.
     /// Pass `include_details = true` to populate
-    /// [`DeployResultDetails::details`] with per-component results and
+    /// [`DeployResult::details`] with per-component results and
     /// Apex test outcomes — at the cost of a larger response body.
     pub async fn check_deploy_status(
         &self,
@@ -307,7 +306,7 @@ pub enum TestLevel {
 /// [`validated_deploy_request_id`](Self::validated_deploy_request_id)
 /// with the original validation's id and a fresh `id` for the new
 /// deployment.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployRequest {
     /// Unique id for *this* deployment. Pass it to
@@ -339,19 +338,24 @@ pub struct DeployRequest {
     /// response to a quick-deploy POST (which only echoes options +
     /// new id); populated otherwise.
     #[serde(default)]
-    pub deploy_result: Option<DeployResultDetails>,
+    pub deploy_result: Option<DeployResult>,
 }
 
-/// In-progress or terminal state of a deployment.
+/// The `deployResult` object of a deploy response: the in-progress or
+/// terminal state of a deployment.
 ///
 /// Populated inside [`DeployRequest::deploy_result`]. Status fields
 /// (`number_*`) are only meaningful once the deployment has begun;
 /// per-component results live in
 /// [`details`](Self::details) and are only populated when the request
 /// was made with `include_details: true`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Salesforce documents the object as the "deployResult Parameters"
+/// table of the Metadata REST deploy page; its members mirror the
+/// Metadata API's `DeployResult`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeployResultDetails {
+pub struct DeployResult {
     /// Mirrors [`DeployRequest::id`] when present.
     ///
     /// The kickoff response repeats the deploy id here; the status-check
@@ -456,10 +460,22 @@ pub struct DeployResultDetails {
     /// Per-component results. Only populated when `check_deploy_status`
     /// was called with `include_details: true`.
     #[serde(default)]
-    pub details: Option<DeployResultInnerDetails>,
+    pub details: Option<DeployDetails>,
 }
 
-impl DeployResultDetails {
+/// Deprecated alias of [`DeployResult`].
+///
+/// ```
+/// # #![allow(deprecated)]
+/// fn accepts(_: &cirrus::DeployResultDetails) {}
+/// fn passes(value: &cirrus::DeployResult) {
+///     accepts(value)
+/// }
+/// ```
+#[deprecated(since = "0.8.0", note = "renamed to `DeployResult`")]
+pub type DeployResultDetails = DeployResult;
+
+impl DeployResult {
     /// Whether Salesforce has finished processing the deployment.
     ///
     /// Returns [`done`](Self::done) when the response carried it, and
@@ -485,17 +501,17 @@ impl DeployResultDetails {
     }
 }
 
-/// Per-component success/failure and test results inside a
-/// [`DeployResultDetails`].
+/// The `details` member of a [`DeployResult`]: per-component
+/// success/failure and test results, documented as `DeployDetails`.
 ///
 /// The component list is split into `component_failures` and
 /// `component_successes`; the deployment's Apex test run appears under
 /// `run_test_results`. The REST pages disagree on that key: the JSON
 /// examples spell it `runTestResults`, the `DeployDetails` table they
 /// refer to spells it `runTestResult`, and both are accepted.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeployResultInnerDetails {
+pub struct DeployDetails {
     #[serde(default)]
     pub component_failures: Vec<DeployMessage>,
 
@@ -510,12 +526,24 @@ pub struct DeployResultInnerDetails {
     pub retrieve_result: Option<serde_json::Value>,
 
     #[serde(default, alias = "runTestResult")]
-    pub run_test_results: Option<RunTestResults>,
+    pub run_test_results: Option<RunTestsResult>,
 }
+
+/// Deprecated alias of [`DeployDetails`].
+///
+/// ```
+/// # #![allow(deprecated)]
+/// fn accepts(_: &cirrus::DeployResultInnerDetails) {}
+/// fn passes(value: &cirrus::DeployDetails) {
+///     accepts(value)
+/// }
+/// ```
+#[deprecated(since = "0.8.0", note = "renamed to `DeployDetails`")]
+pub type DeployResultInnerDetails = DeployDetails;
 
 /// Per-component message in a deployment's `componentFailures` or
 /// `componentSuccesses` list.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployMessage {
     #[serde(default)]
@@ -565,7 +593,8 @@ pub struct DeployMessage {
     pub column_number: Option<i32>,
 }
 
-/// Apex test results bundled into [`DeployResultInnerDetails`].
+/// The `runTestResults` member of [`DeployDetails`]: the Apex test
+/// results of a deployment, documented as `RunTestsResult`.
 ///
 /// The per-test and coverage entries are left as `serde_json::Value`:
 /// the REST pages publish no JSON for them, so their key casing is not
@@ -582,9 +611,9 @@ pub struct DeployMessage {
 // `failures`. Both count names are accepted and the Rust name follows
 // the examples; no live run in this repository has settled which one
 // the wire carries.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RunTestResults {
+pub struct RunTestsResult {
     /// Number of tests run. Read from the examples' `numRun` or the
     /// RunTestsResult table's `numTestsRun`.
     #[serde(default, alias = "numTestsRun")]
@@ -627,6 +656,18 @@ pub struct RunTestResults {
     pub flow_coverage_warnings: Vec<serde_json::Value>,
 }
 
+/// Deprecated alias of [`RunTestsResult`].
+///
+/// ```
+/// # #![allow(deprecated)]
+/// fn accepts(_: &cirrus::RunTestResults) {}
+/// fn passes(value: &cirrus::RunTestsResult) {
+///     accepts(value)
+/// }
+/// ```
+#[deprecated(since = "0.8.0", note = "renamed to `RunTestsResult`")]
+pub type RunTestResults = RunTestsResult;
+
 /// Lifecycle state of a deployment.
 ///
 /// `FinalizingDeploy` / `FinalizingDeployFailed` were added in API
@@ -637,7 +678,7 @@ pub struct RunTestResults {
 /// releases, and a literal promoted from [`Unknown`](Self::Unknown) to
 /// a named variant has to stay an additive change. Match with a `_`
 /// arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DeployStatus {
     Pending,
@@ -694,6 +735,61 @@ mod tests {
     fn fixture(uri: String) -> Cirrus {
         let auth = Arc::new(StaticTokenAuth::new("tok", uri));
         Cirrus::builder().auth(auth).build().unwrap()
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy_checkstatus.htm
+    /// The example response body for `?includeDetails=true`.
+    fn check_status_with_details_example() -> serde_json::Value {
+        json!({
+            "id": "0Afxx00000000lWCAQ",
+            "url": "https://host/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ?includeDetails=true",
+            "deployResult": {
+                "checkOnly": false,
+                "ignoreWarnings": false,
+                "rollbackOnError": false,
+                "status": "InProgress",
+                "numberComponentsDeployed": 10,
+                "numberComponentsTotal": 1032,
+                "numberComponentErrors": 0,
+                "numberTestsCompleted": 45,
+                "numberTestsTotal": 135,
+                "numberTestErrors": 0,
+                "details": {
+                    "componentFailures": [],
+                    "componentSuccesses": [],
+                    "retrieveResult": null,
+                    "runTestResults": {
+                        "numRun": 0,
+                        "successes": [],
+                        "failures": []
+                    }
+                },
+                "createdDate": "2017-10-10T08:22Z",
+                "startDate": "2017-10-10T08:22Z",
+                "lastModifiedDate": "2017-10-10T08:44Z",
+                "completedDate": "2017-10-10T08:44Z",
+                "errorStatusCode": null,
+                "errorMessage": null,
+                "stateDetail": "Processing Type: Apex Component",
+                "createdBy": "005xx0000001Sv1m",
+                "createdByName": "stephanie stevens",
+                "canceledBy": null,
+                "canceledByName": null,
+                "isRunTestsEnabled": false
+            },
+            "deployOptions": {
+                "allowMissingFiles": false,
+                "autoUpdatePackage": false,
+                "checkOnly": true,
+                "ignoreWarnings": false,
+                "performRetrieve": false,
+                "purgeOnDelete": false,
+                "rollbackOnError": false,
+                "runTests": null,
+                "singlePackage": true,
+                "testLevel": "RunAllTestsInOrg"
+            }
+        })
     }
 
     #[test]
@@ -806,58 +902,13 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ"))
+            .and(path(
+                "/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ",
+            ))
             .and(query_param("includeDetails", "true"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "0Afxx00000000lWCAQ",
-                "url": "https://host/services/data/v66.0/metadata/deployRequest/0Afxx00000000lWCAQ?includeDetails=true",
-                "deployResult": {
-                    "checkOnly": false,
-                    "ignoreWarnings": false,
-                    "rollbackOnError": false,
-                    "status": "InProgress",
-                    "numberComponentsDeployed": 10,
-                    "numberComponentsTotal": 1032,
-                    "numberComponentErrors": 0,
-                    "numberTestsCompleted": 45,
-                    "numberTestsTotal": 135,
-                    "numberTestErrors": 0,
-                    "details": {
-                        "componentFailures": [],
-                        "componentSuccesses": [],
-                        "retrieveResult": null,
-                        "runTestResults": {
-                            "numRun": 0,
-                            "successes": [],
-                            "failures": []
-                        }
-                    },
-                    "createdDate": "2017-10-10T08:22Z",
-                    "startDate": "2017-10-10T08:22Z",
-                    "lastModifiedDate": "2017-10-10T08:44Z",
-                    "completedDate": "2017-10-10T08:44Z",
-                    "errorStatusCode": null,
-                    "errorMessage": null,
-                    "stateDetail": "Processing Type: Apex Component",
-                    "createdBy": "005xx0000001Sv1m",
-                    "createdByName": "stephanie stevens",
-                    "canceledBy": null,
-                    "canceledByName": null,
-                    "isRunTestsEnabled": false
-                },
-                "deployOptions": {
-                    "allowMissingFiles": false,
-                    "autoUpdatePackage": false,
-                    "checkOnly": true,
-                    "ignoreWarnings": false,
-                    "performRetrieve": false,
-                    "purgeOnDelete": false,
-                    "rollbackOnError": false,
-                    "runTests": null,
-                    "singlePackage": true,
-                    "testLevel": "RunAllTestsInOrg"
-                }
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(check_status_with_details_example()),
+            )
             .mount(&server)
             .await;
 
@@ -969,22 +1020,21 @@ mod tests {
             ("FinalizingDeployFailed", true, false),
             ("BrandNewPhase", false, false),
         ] {
-            let r: DeployResultDetails =
-                serde_json::from_value(json!({ "status": status })).unwrap();
+            let r: DeployResult = serde_json::from_value(json!({ "status": status })).unwrap();
             assert_eq!(r.done, None, "{status}");
             assert_eq!(r.success, None, "{status}");
             assert_eq!(r.is_done(), done, "{status}");
             assert_eq!(r.is_success(), success, "{status}");
         }
         // Neither flag nor status: nothing says the deploy finished.
-        let r: DeployResultDetails = serde_json::from_value(json!({})).unwrap();
+        let r: DeployResult = serde_json::from_value(json!({})).unwrap();
         assert!(!r.is_done());
         assert!(!r.is_success());
     }
 
     #[test]
     fn present_done_and_success_flags_win_over_status() {
-        let r: DeployResultDetails = serde_json::from_value(json!({
+        let r: DeployResult = serde_json::from_value(json!({
             "status": "SucceededPartial",
             "done": true,
             "success": true
@@ -995,7 +1045,7 @@ mod tests {
         assert_eq!(r.success, Some(true));
         assert!(r.is_success());
 
-        let r: DeployResultDetails = serde_json::from_value(json!({
+        let r: DeployResult = serde_json::from_value(json!({
             "status": "Succeeded",
             "done": false,
             "success": false
@@ -1012,12 +1062,96 @@ mod tests {
     /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy.htm
     #[test]
     fn absent_rollback_on_error_is_none_not_false() {
-        let r: DeployResultDetails =
-            serde_json::from_value(json!({ "status": "Pending" })).unwrap();
+        let r: DeployResult = serde_json::from_value(json!({ "status": "Pending" })).unwrap();
         assert_eq!(r.rollback_on_error, None);
-        let r: DeployResultDetails =
-            serde_json::from_value(json!({ "rollbackOnError": true })).unwrap();
+        let r: DeployResult = serde_json::from_value(json!({ "rollbackOnError": true })).unwrap();
         assert_eq!(r.rollback_on_error, Some(true));
+    }
+
+    #[test]
+    fn deploy_request_serializes_its_wire_names_and_reads_back() {
+        let parsed: DeployRequest =
+            serde_json::from_value(check_status_with_details_example()).unwrap();
+
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["id"], "0Afxx00000000lWCAQ");
+        let result = &written["deployResult"];
+        assert_eq!(result["status"], "InProgress");
+        for key in [
+            "numberComponentsTotal",
+            "stateDetail",
+            "createdByName",
+            "checkOnly",
+            "rollbackOnError",
+            "runTestsEnabled",
+        ] {
+            assert!(result.get(key).is_some(), "{key} missing from {result}");
+        }
+        assert!(result.get("number_components_total").is_none());
+        assert_eq!(result["details"]["runTestResults"]["numRun"], 0);
+        assert_eq!(written["deployOptions"]["testLevel"], "RunAllTestsInOrg");
+
+        let back: DeployRequest = serde_json::from_value(written).unwrap();
+        assert_eq!(back.id, parsed.id);
+        let back_result = back.deploy_result.unwrap();
+        assert_eq!(back_result.status, Some(DeployStatus::InProgress));
+        assert_eq!(back_result.number_components_total, 1032);
+        assert_eq!(back_result.run_tests_enabled, Some(false));
+        assert_eq!(
+            back_result.state_detail.as_deref(),
+            Some("Processing Type: Apex Component")
+        );
+        let tests = back_result.details.unwrap().run_test_results.unwrap();
+        assert_eq!(tests.num_run, 0);
+    }
+
+    #[test]
+    fn test_results_are_written_under_the_example_spelling() {
+        // The fixture spells the block `runTestResult` / `numTestsRun`;
+        // the output uses the names the Rust fields follow, which the
+        // same struct reads back.
+        let details: DeployDetails = serde_json::from_value(deploy_details_example()).unwrap();
+
+        let written = serde_json::to_value(&details).unwrap();
+        let tests = &written["runTestResults"];
+        assert_eq!(tests["numRun"], 12);
+        assert_eq!(tests["apexLogId"], "07Lxx0000000001");
+        assert_eq!(tests["codeCoverage"][0]["numLocationsNotCovered"], 4);
+        assert_eq!(tests["successes"][0]["methodName"], "createsAccount");
+        assert!(written.get("runTestResult").is_none());
+
+        let back: DeployDetails = serde_json::from_value(written).unwrap();
+        let tests = back.run_test_results.unwrap();
+        assert_eq!(tests.num_run, 12);
+        assert_eq!(tests.failures.len(), 1);
+    }
+
+    /// The deprecated aliases denote the same types as the documented
+    /// names.
+    ///
+    /// The fixture is the `deployResult` member of the
+    /// `meta_rest_deploy_checkstatus` example, cut down to the members
+    /// that reach each aliased type.
+    ///
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy_checkstatus.htm
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_aliases_denote_the_documented_type_names() {
+        let fixture = json!({
+            "status": "InProgress",
+            "details": {
+                "componentFailures": [],
+                "componentSuccesses": [],
+                "runTestResults": { "numRun": 0, "successes": [], "failures": [] }
+            }
+        });
+        let result: DeployResultDetails = serde_json::from_value::<DeployResult>(fixture).unwrap();
+        let _: &DeployResult = &result;
+        let details: DeployResultInnerDetails = result.details.unwrap();
+        let _: &DeployDetails = &details;
+        let tests: RunTestResults = details.run_test_results.unwrap();
+        let _: &RunTestsResult = &tests;
+        assert_eq!(tests.num_run, 0);
     }
 
     /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
@@ -1026,9 +1160,8 @@ mod tests {
     /// RunTestsResult table counts "numTestsRun" and lists `apexLogId`,
     /// `codeCoverage`, `codeCoverageWarnings`, `flowCoverage` and
     /// `flowCoverageWarnings` alongside `successes` and `failures`.
-    #[test]
-    fn details_accept_the_deploy_details_names_and_keep_coverage() {
-        let details: DeployResultInnerDetails = serde_json::from_value(json!({
+    fn deploy_details_example() -> serde_json::Value {
+        json!({
             "componentFailures": [],
             "componentSuccesses": [],
             "runTestResult": {
@@ -1055,8 +1188,12 @@ mod tests {
                 "flowCoverage": [],
                 "flowCoverageWarnings": []
             }
-        }))
-        .unwrap();
+        })
+    }
+
+    #[test]
+    fn details_accept_the_deploy_details_names_and_keep_coverage() {
+        let details: DeployDetails = serde_json::from_value(deploy_details_example()).unwrap();
         let tests = details
             .run_test_results
             .expect("the DeployDetails spelling is accepted");
