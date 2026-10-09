@@ -8,38 +8,52 @@
 //! `subject_token` (from the IdP) is exchanged at the Salesforce token
 //! endpoint for a fresh Salesforce token.
 //!
+//! A [`TokenExchangeFlow`] holds the connected app's configuration and is
+//! built once; each end user's token then goes through
+//! [`TokenExchangeFlow::exchange`], so a back end that exchanges one IdP
+//! token per request shares one HTTP client and connection pool across
+//! them. The flow is `Clone`.
+//!
 //! ## Wire shape
 //!
 //! POST `/services/oauth2/token` with form body:
 //!
-//! - `grant_type` — always
-//!   `urn:ietf:params:oauth:grant-type:token-exchange` (the RFC 8693
-//!   URN; Salesforce's token-exchange docs define no other value).
-//! - `subject_token` — the IdP-issued token.
+//! - `grant_type` — `urn:ietf:params:oauth:grant-type:token-exchange`
+//!   (the RFC 8693 URN) for most apps, or
+//!   `urn:ietf:params:oauth:grant-type:hybrid-token-exchange` for hybrid
+//!   mobile apps; see [`TokenExchangeGrantType`].
+//! - `subject_token` — the IdP-issued token, at most
+//!   [`MAX_SUBJECT_TOKEN_CHARS`] characters.
 //! - `subject_token_type` — one of the five well-known URNs in
 //!   [`SubjectTokenType`].
 //! - `client_id` — connected app consumer key.
-//! - `client_secret` — required for confidential clients (the connected
-//!   app's `Require Secret for Token Exchange Flow` setting), omitted
-//!   for public clients.
-//! - `scope` — optional space-separated scopes.
+//! - `client_secret` — required when the connected app's "Require Secret
+//!   for Token Exchange Flow" setting (`isSecretRequiredForTokenExchange`
+//!   on an external client app) is on; Salesforce advises against
+//!   sending it from a public client.
+//! - `scope` — optional space-separated scopes, a subset of the app's.
 //! - `token_handler` — optional Apex token-exchange-handler name. The
-//!   docs strongly recommend setting this; otherwise Salesforce uses the
+//!   docs strongly recommend setting it; otherwise Salesforce uses the
 //!   org's default handler.
+//!
+//! The request takes the RFC 8693 grant and subject-token URNs and adds
+//! Salesforce's `token_handler` parameter. The response is Salesforce's
+//! ordinary token response rather than RFC 8693's: the documented sample
+//! carries `access_token`, `signature`, `scope`, `id_token`,
+//! `instance_url`, `id`, `token_type` and `issued_at`, no
+//! `issued_token_type`, and can add the refresh tokens, ID tokens and
+//! hybrid tokens the request asked for.
 //!
 //! ## My Domain URL is required
 //!
-//! The builder requires `login_url`: Salesforce's token-exchange examples
-//! address the org directly as `MyDomainName.my.salesforce.com` (or the
-//! Experience Cloud `MyDomainName.my.site.com`), and there is no sensible
-//! default for an org-scoped host.
+//! The builder requires `login_url`: the request goes to the token
+//! endpoint on the org's My Domain login URL or Experience Cloud site
+//! URL, and there is no sensible default for an org-scoped host.
 //!
-//! No `subject_token` length limit and no restriction on the token
-//! endpoint host are enforced here: any `login_url` you configure is used
-//! as given. The request and response shapes follow RFC 8693, and the
-//! connected-app side of the flow (`isTokenExchangeEnabled`,
-//! `isSecretRequiredForTokenExchange`, and the `OauthTokenExchangeHandler`
-//! type) is documented in the Metadata API guide.
+//! (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_token_exchange_configure.htm&type=5>,
+//! release 264. The connected-app side, `isTokenExchangeEnabled`,
+//! `isSecretRequiredForTokenExchange` and the `OauthTokenExchangeHandler`
+//! type, is in the Metadata API guide.)
 //!
 //! ## What you get back
 //!
@@ -50,7 +64,8 @@
 //! from it for ongoing API access, giving the builder the same
 //! `login_url`, consumer key and secret this flow used; whether the
 //! refresh grant needs the secret is a connected-app setting of its own,
-//! see the [`refresh`](crate::refresh) module docs.
+//! see the [`refresh`](crate::refresh) module docs. A token the exchange
+//! issued is revoked with [`TokenExchangeFlow::revoke`].
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
@@ -58,9 +73,40 @@ use crate::token_endpoint::{
 };
 use std::time::Duration;
 
-/// RFC 8693 grant-type URN — the only `grant_type` Salesforce's token
-/// exchange flow accepts.
+/// RFC 8693 grant-type URN, the `grant_type` for most apps.
 pub const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
+/// Salesforce's grant-type URN for hybrid mobile apps.
+pub const GRANT_TYPE_HYBRID_TOKEN_EXCHANGE: &str =
+    "urn:ietf:params:oauth:grant-type:hybrid-token-exchange";
+
+/// Longest `subject_token` Salesforce accepts, in characters.
+/// [`TokenExchangeFlow::exchange`] refuses a longer one before sending it.
+pub const MAX_SUBJECT_TOKEN_CHARS: usize = 10_000;
+
+/// The `grant_type` a [`TokenExchangeFlow`] sends. Salesforce documents
+/// two: the RFC 8693 URN for most use cases, and a hybrid variant for
+/// hybrid mobile apps, whose response can carry the hybrid tokens such an
+/// app needs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TokenExchangeGrantType {
+    /// `urn:ietf:params:oauth:grant-type:token-exchange`, the default.
+    #[default]
+    TokenExchange,
+    /// `urn:ietf:params:oauth:grant-type:hybrid-token-exchange`.
+    HybridTokenExchange,
+}
+
+impl TokenExchangeGrantType {
+    /// Returns the URN as it goes into the form body.
+    pub fn as_urn(self) -> &'static str {
+        match self {
+            Self::TokenExchange => GRANT_TYPE_TOKEN_EXCHANGE,
+            Self::HybridTokenExchange => GRANT_TYPE_HYBRID_TOKEN_EXCHANGE,
+        }
+    }
+}
 
 /// RFC 8693 `subject_token_type` URNs supported by Salesforce.
 ///
@@ -99,33 +145,25 @@ impl SubjectTokenType {
     }
 }
 
-/// One-shot RFC 8693 token-exchange request.
+/// RFC 8693 token exchange for one connected app, reusable across end
+/// users.
 ///
-/// Construct via [`TokenExchangeFlow::builder`].
-//
-// Wire-shape provenance: the reference Salesforce pages for this flow —
-// including whether `https://login.salesforce.com` is rejected outright
-// and whether `subject_token` has a documented length ceiling — live on
-// help.salesforce.com and were not reachable, so neither is asserted nor
-// enforced. The reachable pages that do govern the flow are the Apex
-// `token_exchange_handler` guide and the Metadata API's
-// `meta_oauthtokenexchangehandler`, neither of which states a length
-// limit or a permitted host.
+/// Construct via [`TokenExchangeFlow::builder`], then call
+/// [`exchange`](Self::exchange) once per IdP-issued token. Cloning is
+/// cheap: the HTTP client inside is shared.
+#[derive(Clone)]
 pub struct TokenExchangeFlow {
     consumer_key: String,
     consumer_secret: Option<String>,
     login_url: String,
-    subject_token: String,
-    subject_token_type: SubjectTokenType,
+    grant_type: TokenExchangeGrantType,
     scopes: Vec<String>,
     token_handler: Option<String>,
     http: reqwest::Client,
 }
 
-// `subject_token` is the IdP-issued credential being exchanged — a
-// short-lived but live secret. `consumer_key` is a credential
-// identifier; `consumer_secret` the confidential-client secret. Redact
-// all three.
+// `consumer_key` is a credential identifier and `consumer_secret` the
+// confidential-client secret. Redact both.
 impl std::fmt::Debug for TokenExchangeFlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenExchangeFlow")
@@ -135,8 +173,7 @@ impl std::fmt::Debug for TokenExchangeFlow {
                 &self.consumer_secret.as_ref().map(|_| "[redacted]"),
             )
             .field("login_url", &self.login_url)
-            .field("subject_token", &"[redacted]")
-            .field("subject_token_type", &self.subject_token_type)
+            .field("grant_type", &self.grant_type)
             .field("scopes", &self.scopes)
             .field("token_handler", &self.token_handler)
             .finish_non_exhaustive()
@@ -158,17 +195,39 @@ impl TokenExchangeFlow {
         revoke_token(&self.http, &self.login_url, token).await
     }
 
-    /// Performs the token exchange and returns the resulting Salesforce
-    /// session. This consumes `self` because each invocation uses a
-    /// specific `subject_token` that may already have been consumed at the
-    /// IdP — re-running with the same builder would risk a double-spend
-    /// of the IdP's token.
-    pub async fn exchange(self) -> AuthResult<TokenExchangeSession> {
+    /// Exchanges one IdP-issued token for a Salesforce session.
+    ///
+    /// `subject_token` is sent verbatim and must be at most
+    /// [`MAX_SUBJECT_TOKEN_CHARS`] characters; a longer one is refused
+    /// with [`AuthError::InvalidArgument`] before any request, since the
+    /// org would answer only with an opaque `invalid_grant`. A token the
+    /// org rejects for any other reason surfaces as [`AuthError::OAuth`]
+    /// from the endpoint.
+    ///
+    /// The request is not re-sent once it has left the client: an
+    /// exchange may issue tokens on every call, so an ambiguous failure
+    /// such as a lost response or a 5xx is reported rather than retried,
+    /// and only a connect failure is. Present a given IdP token once; its
+    /// issuer may treat it as single-use.
+    pub async fn exchange(
+        &self,
+        subject_token: &str,
+        subject_token_type: SubjectTokenType,
+    ) -> AuthResult<TokenExchangeSession> {
+        let length = subject_token.chars().count();
+        if length > MAX_SUBJECT_TOKEN_CHARS {
+            return Err(AuthError::InvalidArgument {
+                name: "subject_token",
+                reason: format!(
+                    "is {length} characters; Salesforce accepts at most {MAX_SUBJECT_TOKEN_CHARS}"
+                ),
+            });
+        }
         let scope_joined;
         let mut body: Vec<(&str, &str)> = vec![
-            ("grant_type", GRANT_TYPE_TOKEN_EXCHANGE),
-            ("subject_token", self.subject_token.as_str()),
-            ("subject_token_type", self.subject_token_type.as_urn()),
+            ("grant_type", self.grant_type.as_urn()),
+            ("subject_token", subject_token),
+            ("subject_token_type", subject_token_type.as_urn()),
             ("client_id", self.consumer_key.as_str()),
         ];
         if let Some(secret) = self.consumer_secret.as_deref() {
@@ -265,8 +324,7 @@ pub struct TokenExchangeFlowBuilder {
     consumer_key: Option<String>,
     consumer_secret: Option<String>,
     login_url: Option<String>,
-    subject_token: Option<String>,
-    subject_token_type: Option<SubjectTokenType>,
+    grant_type: TokenExchangeGrantType,
     scopes: Vec<String>,
     token_handler: Option<String>,
     http: HttpClientConfig,
@@ -278,8 +336,7 @@ impl std::fmt::Debug for TokenExchangeFlowBuilder {
             .field("consumer_key", &self.consumer_key.is_some())
             .field("consumer_secret", &self.consumer_secret.is_some())
             .field("login_url", &self.login_url)
-            .field("subject_token", &self.subject_token.is_some())
-            .field("subject_token_type", &self.subject_token_type)
+            .field("grant_type", &self.grant_type)
             .field("scopes", &self.scopes)
             .field("token_handler", &self.token_handler)
             .finish_non_exhaustive()
@@ -311,18 +368,11 @@ impl TokenExchangeFlowBuilder {
         self
     }
 
-    /// The IdP-issued token to exchange. Required. Sent verbatim in the
-    /// form body; no client-side length or format validation is applied,
-    /// so a token the org rejects surfaces as an
-    /// [`AuthError::OAuth`] from the endpoint.
-    pub fn subject_token(mut self, token: impl Into<String>) -> Self {
-        self.subject_token = Some(token.into());
-        self
-    }
-
-    /// The type of the IdP token. Required.
-    pub fn subject_token_type(mut self, ty: SubjectTokenType) -> Self {
-        self.subject_token_type = Some(ty);
+    /// The `grant_type` to send. Defaults to
+    /// [`TokenExchangeGrantType::TokenExchange`]; a hybrid mobile app sets
+    /// [`HybridTokenExchange`](TokenExchangeGrantType::HybridTokenExchange).
+    pub fn grant_type(mut self, grant_type: TokenExchangeGrantType) -> Self {
+        self.grant_type = grant_type;
         self
     }
 
@@ -394,12 +444,6 @@ impl TokenExchangeFlowBuilder {
         let consumer_key = self
             .consumer_key
             .ok_or(AuthError::MissingField("consumer_key"))?;
-        let subject_token = self
-            .subject_token
-            .ok_or(AuthError::MissingField("subject_token"))?;
-        let subject_token_type = self
-            .subject_token_type
-            .ok_or(AuthError::MissingField("subject_token_type"))?;
         let login_url = normalize_url(&self.login_url.ok_or(AuthError::MissingField("login_url"))?);
         require_secure_login_url(&login_url)?;
         let http = self.http.into_client()?;
@@ -407,8 +451,7 @@ impl TokenExchangeFlowBuilder {
             consumer_key,
             consumer_secret: self.consumer_secret,
             login_url,
-            subject_token,
-            subject_token_type,
+            grant_type: self.grant_type,
             scopes: self.scopes,
             token_handler: self.token_handler,
             http,
@@ -424,21 +467,23 @@ mod tests {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-    /// Salesforce's documented token response shape for the grants that
-    /// share this endpoint.
+    /// Salesforce's documented token-exchange response.
     ///
-    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/intro_understanding_web_server_oauth_flow.htm
-    /// (doc_version 222.0) — field values copied from the guide's sample
-    /// JSON body, including the trailing slash it puts on `instance_url`.
+    /// SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_token_exchange_configure.htm&type=5
+    /// (release 264), step 12 "App Receives Response" — field values
+    /// copied from the page's sample, which masks the access token. The
+    /// sample carries no `refresh_token` and no RFC 8693
+    /// `issued_token_type`.
     fn documented_token_response() -> serde_json::Value {
         serde_json::json!({
-            "id": "https://login.salesforce.com/id/00Dx0000000BV7z/005x00000012Q9P",
-            "issued_at": "1278448101416",
-            "refresh_token": "5Aep861KIwKdekr...refresh",
-            "instance_url": "https://yourInstance.salesforce.com/",
-            "signature": "CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=",
-            "access_token": "00Dx0000000BV7z!AR8AQP0jITN80ESEsj5EbaZTFG0RNBaT1cyWk7TrqoDjoNIWQ2ME_sTZzBjfmOE6zMHq6y8PIW4eWze9JksNEkWUl.Cju7m4",
+            "access_token": "*******************",
+            "signature": "ts6wm/svX3jXlCGR4uu+SbA04M6qhD1SAgVTEwZ59P4=",
+            "scope": "openid api",
+            "id_token": "XXXXXX",
+            "instance_url": "https://MyDomainName.my.salesforce.com",
+            "id": "https://MyDomainName.my.salesforce.com/id/00Dxxxxxxxxxxxx/005xxxxxxxxxxxx",
             "token_type": "Bearer",
+            "issued_at": "1667600739962",
         })
     }
 
@@ -446,8 +491,6 @@ mod tests {
         TokenExchangeFlow::builder()
             .consumer_key("consumer-key-123")
             .login_url("https://my-org.my.salesforce.com")
-            .subject_token("idp-issued-token-xyz")
-            .subject_token_type(SubjectTokenType::AccessToken)
     }
 
     #[test]
@@ -479,10 +522,30 @@ mod tests {
     }
 
     #[test]
-    fn grant_type_urn_matches_spec() {
+    fn grant_type_urns_match_the_setup_page() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_token_exchange_configure.htm&type=5
+        // (release 264): "For most use cases, use
+        // urn:ietf:params:oauth:grant-type:token-exchange. For hybrid
+        // mobile apps, use urn:ietf:params:oauth:grant-type:hybrid-token-exchange."
         assert_eq!(
             GRANT_TYPE_TOKEN_EXCHANGE,
             "urn:ietf:params:oauth:grant-type:token-exchange"
+        );
+        assert_eq!(
+            GRANT_TYPE_HYBRID_TOKEN_EXCHANGE,
+            "urn:ietf:params:oauth:grant-type:hybrid-token-exchange"
+        );
+        assert_eq!(
+            TokenExchangeGrantType::TokenExchange.as_urn(),
+            GRANT_TYPE_TOKEN_EXCHANGE
+        );
+        assert_eq!(
+            TokenExchangeGrantType::HybridTokenExchange.as_urn(),
+            GRANT_TYPE_HYBRID_TOKEN_EXCHANGE
+        );
+        assert_eq!(
+            TokenExchangeGrantType::default(),
+            TokenExchangeGrantType::TokenExchange
         );
     }
 
@@ -490,8 +553,6 @@ mod tests {
     fn builder_requires_consumer_key() {
         let err = TokenExchangeFlow::builder()
             .login_url("https://x")
-            .subject_token("t")
-            .subject_token_type(SubjectTokenType::Jwt)
             .build()
             .unwrap_err();
         assert!(matches!(err, AuthError::MissingField("consumer_key")));
@@ -501,33 +562,9 @@ mod tests {
     fn builder_requires_login_url() {
         let err = TokenExchangeFlow::builder()
             .consumer_key("k")
-            .subject_token("t")
-            .subject_token_type(SubjectTokenType::Jwt)
             .build()
             .unwrap_err();
         assert!(matches!(err, AuthError::MissingField("login_url")));
-    }
-
-    #[test]
-    fn builder_requires_subject_token() {
-        let err = TokenExchangeFlow::builder()
-            .consumer_key("k")
-            .login_url("https://x")
-            .subject_token_type(SubjectTokenType::Jwt)
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, AuthError::MissingField("subject_token")));
-    }
-
-    #[test]
-    fn builder_requires_subject_token_type() {
-        let err = TokenExchangeFlow::builder()
-            .consumer_key("k")
-            .login_url("https://x")
-            .subject_token("t")
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, AuthError::MissingField("subject_token_type")));
     }
 
     #[test]
@@ -586,27 +623,141 @@ mod tests {
             .login_url(server.uri())
             .build()
             .unwrap()
-            .exchange()
+            .exchange("idp-issued-token-xyz", SubjectTokenType::AccessToken)
             .await
             .unwrap();
-        assert!(session.access_token.starts_with("00Dx0000000BV7z!"));
-        // The documented body carries a trailing slash on instance_url;
-        // the session exposes the normalized form.
-        assert_eq!(session.instance_url, "https://yourInstance.salesforce.com");
-        assert_eq!(session.issued_at.as_deref(), Some("1278448101416"));
+        assert_eq!(session.access_token, "*******************");
+        assert_eq!(
+            session.instance_url,
+            "https://MyDomainName.my.salesforce.com"
+        );
+        assert_eq!(session.issued_at.as_deref(), Some("1667600739962"));
+        assert_eq!(session.scope.as_deref(), Some("openid api"));
+        assert_eq!(session.id_token.as_deref(), Some("XXXXXX"));
         // Identity fields propagate through so federated-identity callers
         // can correlate the exchanged session with the original IdP user.
         assert_eq!(
             session.id.as_deref(),
-            Some("https://login.salesforce.com/id/00Dx0000000BV7z/005x00000012Q9P")
+            Some("https://MyDomainName.my.salesforce.com/id/00Dxxxxxxxxxxxx/005xxxxxxxxxxxx")
         );
         assert_eq!(
             session.signature.as_deref(),
-            Some("CMJ4l+CCaPQiKjoOEwEig9H4wqhpuLSk4J2urAe+fVg=")
+            Some("ts6wm/svX3jXlCGR4uu+SbA04M6qhD1SAgVTEwZ59P4=")
         );
-        // The documented sample is a non-site login: no site fields.
+        // The documented sample carries no refresh token and is a non-site
+        // login.
+        assert_eq!(session.refresh_token, None);
         assert_eq!(session.sfdc_site_url, None);
         assert_eq!(session.sfdc_site_id, None);
+    }
+
+    #[tokio::test]
+    async fn one_flow_exchanges_many_subject_tokens() {
+        // The app configuration is per flow and the IdP token per call, so
+        // a portal back end builds the flow, and its HTTP client, once.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let flow = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+
+        flow.exchange("first-idp-token", SubjectTokenType::AccessToken)
+            .await
+            .unwrap();
+        flow.clone()
+            .exchange("second-idp-token", SubjectTokenType::Jwt)
+            .await
+            .unwrap();
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert!(
+            bodies[0].contains("subject_token=first-idp-token"),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("subject_token=second-idp-token")
+                && bodies[1].contains("token-type%3Ajwt"),
+            "{bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hybrid_grant_type_is_sent_when_configured() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_token_exchange_configure.htm&type=5
+        // (release 264): "For hybrid mobile apps, use
+        // urn:ietf:params:oauth:grant-type:hybrid-token-exchange."
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(body_string_contains(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ahybrid-token-exchange",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        builder_with_required_fields()
+            .login_url(server.uri())
+            .grant_type(TokenExchangeGrantType::HybridTokenExchange)
+            .build()
+            .unwrap()
+            .exchange("idp-issued-token-xyz", SubjectTokenType::AccessToken)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_subject_token_is_refused_before_any_request() {
+        // SOURCE: the same page, `subject_token`: "The maximum length is
+        // 10,000 characters." A token at the limit is sent; one over it is
+        // refused without a request, since the org would only answer with
+        // an opaque invalid_grant.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
+            .mount(&server)
+            .await;
+        let flow = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+
+        let err = flow
+            .exchange(
+                &"é".repeat(MAX_SUBJECT_TOKEN_CHARS + 1),
+                SubjectTokenType::Jwt,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::InvalidArgument {
+                    name: "subject_token",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        flow.exchange(&"é".repeat(MAX_SUBJECT_TOKEN_CHARS), SubjectTokenType::Jwt)
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -632,7 +783,7 @@ mod tests {
             .login_url(server.uri())
             .build()
             .unwrap()
-            .exchange()
+            .exchange("idp-issued-token-xyz", SubjectTokenType::AccessToken)
             .await
             .unwrap();
 
@@ -654,8 +805,12 @@ mod tests {
             .and(body_string_contains("scope=api+refresh_token"))
             .and(body_string_contains("token_handler=MyHandler"))
             .respond_with(ResponseTemplate::new(200).set_body_json({
+                // Step 11 of the setup page: the response carries "any
+                // other tokens or parameters that you've requested,
+                // including refresh tokens".
                 let mut body = documented_token_response();
-                body["id_token"] = serde_json::Value::String("eyJ...".into());
+                body["refresh_token"] =
+                    serde_json::Value::String("5Aep861KIwKdekr...refresh".into());
                 body["scope"] = serde_json::Value::String("api refresh_token".into());
                 body
             }))
@@ -670,15 +825,12 @@ mod tests {
             .token_handler("MyHandler")
             .build()
             .unwrap()
-            .exchange()
+            .exchange("idp-issued-token-xyz", SubjectTokenType::AccessToken)
             .await
             .unwrap();
-        assert_eq!(session.id_token.as_deref(), Some("eyJ..."));
-        assert!(
-            session
-                .refresh_token
-                .as_deref()
-                .is_some_and(|t| t.starts_with("5Aep861"))
+        assert_eq!(
+            session.refresh_token.as_deref(),
+            Some("5Aep861KIwKdekr...refresh")
         );
         assert_eq!(session.scope.as_deref(), Some("api refresh_token"));
     }
@@ -702,7 +854,7 @@ mod tests {
             .login_url(server.uri())
             .build()
             .unwrap()
-            .exchange()
+            .exchange("idp-issued-token-xyz", SubjectTokenType::AccessToken)
             .await
             .unwrap();
 
@@ -729,7 +881,7 @@ mod tests {
             .login_url(server.uri())
             .build()
             .unwrap()
-            .exchange()
+            .exchange("idp-issued-token-xyz", SubjectTokenType::AccessToken)
             .await
             .unwrap_err();
         match err {

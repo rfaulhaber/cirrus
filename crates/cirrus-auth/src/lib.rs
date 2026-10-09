@@ -110,7 +110,8 @@ pub use token_endpoint::{
     token_client_builder,
 };
 pub use token_exchange::{
-    SubjectTokenType, TokenExchangeFlow, TokenExchangeFlowBuilder, TokenExchangeSession,
+    SubjectTokenType, TokenExchangeFlow, TokenExchangeFlowBuilder, TokenExchangeGrantType,
+    TokenExchangeSession,
 };
 pub use web_server::{
     AuthorizeOptions, CompletedSession, PendingExchange, WebServerFlow, WebServerFlowBuilder,
