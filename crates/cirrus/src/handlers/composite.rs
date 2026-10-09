@@ -444,9 +444,10 @@ impl CompositeSObjectsHandler<'_> {
     /// Deletes up to 200 records by ID via
     /// `DELETE /composite/sobjects?ids=...&allOrNone=...`.
     ///
-    /// `ids` is comma-joined into a single query parameter. `all_or_none`
-    /// makes the operation transactional: when `true`, any single
-    /// failure rolls back the whole batch.
+    /// `ids` is comma-joined into a single query parameter and accepts
+    /// `&[&str]`, `&[String]` or a `&Vec<String>`. `all_or_none` makes the
+    /// operation transactional: when `true`, any single failure rolls back
+    /// the whole batch.
     ///
     /// A DELETE is replayed after a transient failure (a 5xx from an
     /// intermediary, a lost response), so when the first attempt had
@@ -456,10 +457,14 @@ impl CompositeSObjectsHandler<'_> {
     /// replays with [`crate::RetryPolicy`].
     pub async fn delete(
         &self,
-        ids: &[&str],
+        ids: &[impl AsRef<str>],
         all_or_none: bool,
     ) -> CirrusResult<Vec<SObjectCollectionResult>> {
-        let joined = ids.join(",");
+        let joined = ids
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join(",");
         let all = if all_or_none { "true" } else { "false" };
         let url = self.client.versioned_url(&["composite", "sobjects"])?;
         self.client
@@ -479,6 +484,9 @@ impl CompositeSObjectsHandler<'_> {
     /// as `Value::Null` in the corresponding position of the returned
     /// slice — preserving 1:1 alignment with the input `ids`.
     ///
+    /// `ids` and `fields` each accept `&[&str]`, `&[String]` or a
+    /// `&Vec<String>`.
+    ///
     /// Salesforce documents the ~800-ID ceiling as the point where the
     /// URI passes its 16,384-byte limit and the request fails with HTTP
     /// 414. Beyond that, switch to
@@ -487,8 +495,8 @@ impl CompositeSObjectsHandler<'_> {
     pub async fn retrieve(
         &self,
         sobject: &str,
-        ids: &[&str],
-        fields: &[&str],
+        ids: &[impl AsRef<str>],
+        fields: &[impl AsRef<str>],
     ) -> CirrusResult<Vec<Value>> {
         self.retrieve_as(sobject, ids, fields).await
     }
@@ -496,12 +504,13 @@ impl CompositeSObjectsHandler<'_> {
     /// Typed variant of [`retrieve`](Self::retrieve). Records that don't
     /// exist will fail to deserialize as `R` from `null` unless `R` itself
     /// is `Option<T>` — use `Vec<Option<T>>` if missing records are
-    /// possible.
+    /// possible. `ids` and `fields` accept the same list types as
+    /// [`retrieve`](Self::retrieve).
     pub async fn retrieve_as<R: DeserializeOwned>(
         &self,
         sobject: &str,
-        ids: &[&str],
-        fields: &[&str],
+        ids: &[impl AsRef<str>],
+        fields: &[impl AsRef<str>],
     ) -> CirrusResult<Vec<R>> {
         let mut url =
             url::Url::parse(
@@ -532,7 +541,8 @@ impl CompositeSObjectsHandler<'_> {
     ///
     /// Functionally equivalent to [`retrieve`](Self::retrieve) but ferries
     /// the IDs and field list in a JSON body instead of the query string.
-    /// Use this when:
+    /// `ids` and `fields` each accept `&[&str]`, `&[String]` or a
+    /// `&Vec<String>`. Use this when:
     ///
     /// - The number of IDs exceeds the GET form's URL-length cap
     ///   (~800 — Salesforce documents 414 URI Too Long beyond that).
@@ -554,22 +564,27 @@ impl CompositeSObjectsHandler<'_> {
     pub async fn retrieve_with_body(
         &self,
         sobject: &str,
-        ids: &[&str],
-        fields: &[&str],
+        ids: &[impl AsRef<str>],
+        fields: &[impl AsRef<str>],
     ) -> CirrusResult<Vec<Value>> {
         self.retrieve_with_body_as(sobject, ids, fields).await
     }
 
-    /// Typed variant of [`retrieve_with_body`](Self::retrieve_with_body).
+    /// Typed variant of [`retrieve_with_body`](Self::retrieve_with_body);
+    /// `ids` and `fields` accept the same list types.
     pub async fn retrieve_with_body_as<R: DeserializeOwned>(
         &self,
         sobject: &str,
-        ids: &[&str],
-        fields: &[&str],
+        ids: &[impl AsRef<str>],
+        fields: &[impl AsRef<str>],
     ) -> CirrusResult<Vec<R>> {
         let url = self
             .client
             .versioned_url(&["composite", "sobjects", sobject])?;
+        // Mapped through `as_ref` so the body is an array of strings
+        // whatever type carries the lists.
+        let ids: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+        let fields: Vec<&str> = fields.iter().map(AsRef::as_ref).collect();
         let body = serde_json::json!({
             "ids": ids,
             "fields": fields,
@@ -639,10 +654,12 @@ pub struct BatchSubrequest {
 /// alone, so an element carrying one of those would otherwise start a
 /// parameter of its own. Encoding per element keeps the separators
 /// literal while the values stay inert.
-fn encode_comma_separated(values: &[&str]) -> String {
+fn encode_comma_separated(values: &[impl AsRef<str>]) -> String {
     values
         .iter()
-        .map(|value| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>())
+        .map(|value| {
+            url::form_urlencoded::byte_serialize(value.as_ref().as_bytes()).collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1471,6 +1488,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sobjects_delete_accepts_owned_id_lists() {
+        // The ids a caller holds from an earlier collection call are
+        // `String`s; the request is the same whichever list type carries
+        // them.
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/services/data/v66.0/composite/sobjects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": "001xx", "success": true, "errors": []},
+                {"id": "001yy", "success": true, "errors": []}
+            ])))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let handler = sf.composite().sobjects();
+        let ids: Vec<String> = vec!["001xx".into(), "001yy".into()];
+        handler.delete(&["001xx", "001yy"], false).await.unwrap();
+        handler.delete(&ids, false).await.unwrap();
+        handler.delete(&ids[..], false).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].url.query(),
+            Some("ids=001xx%2C001yy&allOrNone=false")
+        );
+        assert_eq!(requests[1].url, requests[0].url);
+        assert_eq!(requests[2].url, requests[0].url);
+    }
+
+    #[tokio::test]
     async fn sobjects_retrieve_returns_record_array_aligned_with_ids() {
         let server = MockServer::start().await;
 
@@ -1626,6 +1675,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sobjects_retrieve_accepts_owned_id_and_field_lists() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([null, null])))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let handler = sf.composite().sobjects();
+        let ids: Vec<String> = vec!["001xx".into(), "001yy".into()];
+        let fields: Vec<String> = vec!["Id".into(), "Name".into()];
+        handler
+            .retrieve("Account", &["001xx", "001yy"], &["Id", "Name"])
+            .await
+            .unwrap();
+        handler.retrieve("Account", &ids, &fields).await.unwrap();
+        handler
+            .retrieve("Account", &ids[..], &["Id", "Name"])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].url.query(),
+            Some("ids=001xx,001yy&fields=Id,Name")
+        );
+        assert_eq!(requests[1].url, requests[0].url);
+        assert_eq!(requests[2].url, requests[0].url);
+    }
+
+    #[tokio::test]
     async fn sobjects_retrieve_typed_into_optional_records() {
         // Demonstrates the documented Vec<Option<T>> idiom for handling
         // null entries when missing records are possible.
@@ -1683,6 +1765,72 @@ mod tests {
             .unwrap();
         assert_eq!(records[0]["Id"], "001xx");
         assert!(records[1].is_null());
+    }
+
+    #[tokio::test]
+    async fn sobjects_retrieve_with_body_accepts_owned_id_and_field_lists() {
+        // The body is a JSON array of strings whatever type carries the
+        // lists.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .and(body_json(json!({
+                "ids": ["001xx", "001yy"],
+                "fields": ["Id", "Name"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([null, null])))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let handler = sf.composite().sobjects();
+        let ids: Vec<String> = vec!["001xx".into(), "001yy".into()];
+        let fields: Vec<String> = vec!["Id".into(), "Name".into()];
+        handler
+            .retrieve_with_body("Account", &["001xx", "001yy"], &["Id", "Name"])
+            .await
+            .unwrap();
+        handler
+            .retrieve_with_body("Account", &ids, &fields)
+            .await
+            .unwrap();
+        let _: Vec<Value> = handler
+            .retrieve_with_body_as("Account", &ids[..], &["Id", "Name"])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sobjects_typed_variants_take_the_result_type_as_their_only_turbofish_parameter() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([null])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/sobjects/Account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([null])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let handler = sf.composite().sobjects();
+        let ids: Vec<String> = vec!["001xx".into()];
+        let fields: Vec<String> = vec!["Id".into()];
+        let records = handler
+            .retrieve_as::<Value>("Account", &ids, &fields)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let records = handler
+            .retrieve_with_body_as::<Value>("Account", &ids, &fields)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
     }
 
     #[tokio::test]

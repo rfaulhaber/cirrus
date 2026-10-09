@@ -308,21 +308,31 @@ impl<'a> ToolingSObjectHandler<'a> {
     ///
     /// Calls
     /// `GET /tooling/sobjects/{name}/{id}?fields=Field1,Field2,...`.
-    pub async fn retrieve_with_fields(&self, id: &str, fields: &[&str]) -> CirrusResult<Value> {
+    /// `fields` accepts `&[&str]`, `&[String]` or a `&Vec<String>`.
+    pub async fn retrieve_with_fields(
+        &self,
+        id: &str,
+        fields: &[impl AsRef<str>],
+    ) -> CirrusResult<Value> {
         self.retrieve_with_fields_as(id, fields).await
     }
 
     /// Typed variant of
-    /// [`retrieve_with_fields`](Self::retrieve_with_fields).
+    /// [`retrieve_with_fields`](Self::retrieve_with_fields); `fields`
+    /// accepts the same list types.
     pub async fn retrieve_with_fields_as<R: DeserializeOwned>(
         &self,
         id: &str,
-        fields: &[&str],
+        fields: &[impl AsRef<str>],
     ) -> CirrusResult<R> {
         let url = self
             .client
             .versioned_url(&["tooling", "sobjects", self.name, id])?;
-        let joined = fields.join(",");
+        let joined = fields
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join(",");
         let query = [("fields", joined.as_str())];
         self.client
             .send_at(reqwest::Method::GET, &url, Some(&query), None::<&()>)
@@ -553,6 +563,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["Name"], "MyClass");
+    }
+
+    #[tokio::test]
+    async fn sobject_retrieve_with_fields_accepts_owned_field_lists() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/tooling/sobjects/ApexClass/01p000000000001",
+            ))
+            .and(query_param("fields", "Id,Name,Body"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Id": "01p000000000001",
+                "Name": "MyClass",
+                "Body": "public class MyClass {}"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let class = sf.tooling().sobject("ApexClass");
+        let fields: Vec<String> = vec!["Id".into(), "Name".into(), "Body".into()];
+        class
+            .retrieve_with_fields("01p000000000001", &["Id", "Name", "Body"])
+            .await
+            .unwrap();
+        let v = class
+            .retrieve_with_fields_as::<serde_json::Value>("01p000000000001", &fields)
+            .await
+            .unwrap();
+        assert_eq!(v["Name"], "MyClass");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[1].url, requests[0].url);
     }
 
     #[tokio::test]

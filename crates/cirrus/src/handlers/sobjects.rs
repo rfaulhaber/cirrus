@@ -231,20 +231,30 @@ impl<'a> SObjectHandler<'a> {
 
     /// Retrieves selected fields of a record by ID.
     ///
-    /// Calls `GET /sobjects/{name}/{id}?fields=Field1,Field2,...`.
-    pub async fn retrieve_with_fields(&self, id: &str, fields: &[&str]) -> CirrusResult<Value> {
+    /// Calls `GET /sobjects/{name}/{id}?fields=Field1,Field2,...`. `fields`
+    /// accepts `&[&str]`, `&[String]` or a `&Vec<String>`.
+    pub async fn retrieve_with_fields(
+        &self,
+        id: &str,
+        fields: &[impl AsRef<str>],
+    ) -> CirrusResult<Value> {
         self.retrieve_with_fields_as(id, fields).await
     }
 
     /// Typed variant of
-    /// [`retrieve_with_fields`](Self::retrieve_with_fields).
+    /// [`retrieve_with_fields`](Self::retrieve_with_fields); `fields`
+    /// accepts the same list types.
     pub async fn retrieve_with_fields_as<R: DeserializeOwned>(
         &self,
         id: &str,
-        fields: &[&str],
+        fields: &[impl AsRef<str>],
     ) -> CirrusResult<R> {
         let url = self.client.versioned_url(&["sobjects", self.name, id])?;
-        let joined = fields.join(",");
+        let joined = fields
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join(",");
         let query = [("fields", joined.as_str())];
         self.client
             .send_at(reqwest::Method::GET, &url, Some(&query), None::<&()>)
@@ -817,6 +827,40 @@ mod tests {
             .unwrap();
         assert_eq!(v["Name"], "Acme");
         assert_eq!(v["Industry"], "Tech");
+    }
+
+    #[tokio::test]
+    async fn retrieve_with_fields_accepts_owned_field_lists() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Account/001xx0000000001",
+            ))
+            .and(query_param("fields", "Name,Industry"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Name": "Acme",
+                "Industry": "Tech"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let account = sf.sobject("Account");
+        let fields: Vec<String> = vec!["Name".into(), "Industry".into()];
+        account
+            .retrieve_with_fields("001xx0000000001", &["Name", "Industry"])
+            .await
+            .unwrap();
+        let v = account
+            .retrieve_with_fields_as::<serde_json::Value>("001xx0000000001", &fields)
+            .await
+            .unwrap();
+        assert_eq!(v["Industry"], "Tech");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[1].url, requests[0].url);
     }
 
     #[tokio::test]
