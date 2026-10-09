@@ -29,8 +29,10 @@
 //! [`CirrusError::Api`] with an empty `errors` list and the body in
 //! `raw`, decoded lossily and cut at 2 KiB, with no headers. When the
 //! body matters — a list of validation failures, say —
-//! [`ApexHandler::send_raw`] returns the whole response for any status,
-//! and the status says whether the call succeeded.
+//! [`ApexHandler::send_raw`] returns the whole response for any status
+//! (a non-2xx body up to the 256 KiB the client buffers for one, with
+//! bearer-token material replaced by `[redacted]`), and the status says
+//! whether the call succeeded.
 //!
 //! [`RestResponse`]: https://developer.salesforce.com/docs/atlas.en-us.apexref.meta/apexref/apex_methods_system_restresponse.htm
 //! [`CirrusError::Api`]: crate::CirrusError::Api
@@ -259,7 +261,9 @@ impl ApexHandler<'_> {
     /// method here. Every status the loop lets through comes back as
     /// `Ok`: a 400 the class set is `Ok` with
     /// [`RawResponse::status`] of 400 and the body the class wrote,
-    /// uncut. The exception is Salesforce's own `INVALID_SESSION_ID`
+    /// uncut up to the 256 KiB the client buffers for a non-2xx body
+    /// (bearer-token material in it is replaced with `[redacted]`).
+    /// The exception is Salesforce's own `INVALID_SESSION_ID`
     /// 401, which is refreshed and retried, and surfaces as
     /// [`CirrusError::Api`] only when the retry gets the same answer.
     ///
@@ -765,10 +769,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_raw_scrubs_the_session_token_from_an_error_body() {
+        // A gateway or WAF page echoes the request it refused, bearer
+        // header included; the typed paths replace the token in such a
+        // body before it can reach a log, and the raw path does the
+        // same for a non-2xx body. A 2xx body is the endpoint's data
+        // and is left alone.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/apexrest/Gate"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("<html>blocked: Authorization: Bearer tok at /Gate</html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let response = sf
+            .apex()
+            .send_raw(reqwest::Method::GET, "Gate", None, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 403);
+        let body = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(!body.contains("tok"), "{body}");
+        assert!(body.contains("[redacted]"), "{body}");
+        assert!(body.contains("at /Gate"), "{body}");
+    }
+
+    #[tokio::test]
     async fn send_raw_is_not_replayed_after_a_5xx() {
-        // A 500 is the Apex class's unhandled exception, not a transient
-        // failure, so the one request is the whole call and its answer
-        // is returned as it came.
+        // A 5xx from Apex REST is the class's unhandled exception or
+        // the org's own failure, never a hop worth re-running, so the
+        // one request is the whole call and its answer is returned as
+        // it came.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/services/apexrest/Flaky"))

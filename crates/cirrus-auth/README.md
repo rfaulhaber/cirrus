@@ -177,8 +177,10 @@ connection pool without losing them. The client uses no proxy: `HTTP_PROXY`,
 `token_client_builder().proxy(..)`. Login URLs must be `https`; exact
 `localhost` and the loopback literals are excepted for local test servers,
 which the no-proxy default is what keeps on the machine, and `*.localhost`
-names are not. The same rule, `cirrus_auth::transport::is_secure_transport`,
-governs instance URLs in `cirrus` and `cirrus-metadata`.
+names are not. The same rule, `cirrus_auth::transport::is_secure_transport`
+(and `is_secure_transport_for`, which withdraws the loopback exemption for a
+client that routes through a proxy), governs instance URLs in `cirrus` and
+`cirrus-metadata`.
 
 A token-endpoint response body is read through
 `cirrus_auth::transport::collect_body`, which stops at 64 KiB of decoded

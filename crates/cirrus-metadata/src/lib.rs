@@ -605,14 +605,10 @@ pub(crate) fn check_transport_security(
     let parsed = url::Url::parse(url).map_err(|e| {
         MetadataError::InvalidArgument(format!("instance URL `{url}` is not a valid URL: {e}"))
     })?;
-    if parsed.scheme() == "https" {
+    if cirrus_auth::transport::is_secure_transport_for(&parsed, proxied) {
         return Ok(());
     }
-    let loopback = cirrus_auth::transport::is_loopback_host(&parsed);
-    if loopback && !proxied {
-        return Ok(());
-    }
-    let why = if loopback {
+    let why = if cirrus_auth::transport::is_loopback_host(&parsed) {
         "a loopback instance is reached through the configured proxy, so the Salesforce session \
          id inside every SOAP envelope would travel to the proxy in the clear"
     } else {

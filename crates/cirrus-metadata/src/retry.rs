@@ -473,7 +473,10 @@ mod tests {
         // An unparseable URL is latched by the builder and returned
         // from send(); replaying it can only fail the same way.
         let p = RetryPolicy::default();
-        let err: MetadataError = reqwest::Client::new()
+        let err: MetadataError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post("not a url/services/Soap/m/66.0")
             .send()
             .await

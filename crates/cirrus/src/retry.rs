@@ -480,7 +480,10 @@ mod tests {
         // before any request bytes are written — a real connect-phase
         // reqwest::Error without touching the network.
         let p = RetryPolicy::default();
-        let err: CirrusError = reqwest::Client::new()
+        let err: CirrusError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post("http://127.0.0.1:1/")
             .send()
             .await
@@ -522,7 +525,10 @@ mod tests {
         // An unparseable URL is latched by the builder and returned
         // from send(); replaying it can only fail the same way.
         let p = RetryPolicy::default();
-        let err: CirrusError = reqwest::Client::new()
+        let err: CirrusError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get("not a url/services/data/v66.0/limits")
             .send()
             .await
@@ -600,7 +606,10 @@ mod tests {
     #[tokio::test]
     async fn never_replay_keeps_connect_retries_but_drops_ambiguous_ones() {
         let p = RetryPolicy::default();
-        let connect_err: CirrusError = reqwest::Client::new()
+        let connect_err: CirrusError = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get("http://127.0.0.1:1/")
             .send()
             .await
@@ -625,6 +634,7 @@ mod tests {
             .mount(&server)
             .await;
         let stalled: CirrusError = reqwest::Client::builder()
+            .no_proxy()
             .read_timeout(Duration::from_millis(50))
             .build()
             .unwrap()

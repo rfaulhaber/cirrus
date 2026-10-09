@@ -1590,9 +1590,14 @@ pub struct RawResponse {
     pub status: u16,
     /// The response headers, as received.
     pub headers: HeaderMap,
-    /// The body, as received: not redacted, not capped below the
-    /// client's response size limits, and decoded only of its transfer
-    /// encoding.
+    /// The body. A 2xx body is as the server sent it. A non-2xx body
+    /// has the session token, and any `Bearer` credential run, replaced
+    /// with `[redacted]`, as [`CirrusError::Api`]'s `raw` has: such a
+    /// body is often an intermediary's page that echoes the request.
+    /// Either is decoded of its content encoding (the client the builder
+    /// creates asks for gzip and inflates it, so `Content-Encoding` and
+    /// `Content-Length` are then absent from [`headers`](Self::headers))
+    /// and buffered only within the client's response size limits.
     pub body: Bytes,
 }
 

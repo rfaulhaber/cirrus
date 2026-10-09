@@ -777,12 +777,16 @@ impl Cirrus {
     /// is not (a file, text, a body an Apex REST class wrote). Nothing
     /// is parsed: every status the loop lets through, a 4xx or 5xx
     /// included, comes back as `Ok` with that status on
-    /// [`RawResponse::status`], and the body is as sent, not redacted
-    /// and not cut to the 2 KiB that [`CirrusError::Api`] keeps. The
-    /// one status the loop keeps for itself is a 401 carrying
-    /// `INVALID_SESSION_ID`, which is refreshed and retried like any
-    /// other call and, when the retry gets the same answer, is
-    /// `Err(CirrusError::Api)`. The response size limits still apply.
+    /// [`RawResponse::status`]. A 2xx body is as sent. A non-2xx body
+    /// has bearer-token material replaced with `[redacted]`, as
+    /// [`CirrusError::Api`]'s `raw` has, and is otherwise as sent rather
+    /// than cut to the 2 KiB that `raw` keeps. The one status the loop
+    /// keeps for itself is a 401 carrying `INVALID_SESSION_ID`, which is
+    /// refreshed and retried like any other call and, when the retry
+    /// gets the same answer, is `Err(CirrusError::Api)`. The response
+    /// size limits apply: a 2xx body up to
+    /// [`CirrusBuilder::max_response_size`], any other up to 256 KiB,
+    /// past which the call is [`CirrusError::ResponseTooLarge`].
     ///
     /// `body` is sent with its own `Content-Type`, which replaces any
     /// in `headers`. `query`, `headers` and path resolution are as on
@@ -797,20 +801,21 @@ impl Cirrus {
     /// # async fn example() -> Result<(), cirrus::CirrusError> {
     /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
     /// # let sf = Cirrus::builder().auth(auth).build()?;
-    /// // A resource with no typed handler whose body is text.
+    /// // A Connect REST file download, which has no typed handler and
+    /// // answers with the file's bytes.
     /// let response = sf
     ///     .send_raw(
     ///         cirrus::reqwest::Method::GET,
-    ///         "sobjects/ContentVersion/068xx000000Abcd/VersionData",
+    ///         "connect/files/069xx000000Abcd/content",
     ///         None,
-    ///         &[("Accept", "text/plain")],
+    ///         &[],
     ///         None,
     ///         Replay::ByMethod,
     ///     )
     ///     .await?;
     /// if response.is_success() {
-    ///     let text = String::from_utf8_lossy(&response.body);
-    ///     # let _ = text;
+    ///     let file: &[u8] = &response.body;
+    ///     # let _ = file;
     /// }
     /// # Ok(())
     /// # }
@@ -855,20 +860,28 @@ impl Cirrus {
                 }
                 Ok(request)
             },
-            |status, headers, bytes| {
+            |status, headers, bytes, token| {
                 // Only Salesforce's own expired-session answer is an
                 // error here: the loop needs it as one to refresh.
                 // Every other status is the endpoint's answer.
-                if !(200..300).contains(&status) {
+                if status == 401 {
                     let err = response::parse_error_response(status, &bytes);
                     if err.is_invalid_session() {
                         return Err(err);
                     }
                 }
+                // A non-2xx body is an intermediary's page as often as
+                // the endpoint's, and those echo the request; the error
+                // path scrubs the token from such a body, so this does.
+                let body = if (200..300).contains(&status) {
+                    bytes
+                } else {
+                    crate::error::redact_raw_body(bytes, token)
+                };
                 Ok(RawResponse {
                     status,
                     headers,
-                    body: bytes,
+                    body,
                 })
             },
         )
@@ -1146,7 +1159,9 @@ impl Cirrus {
     /// here before any request and attached to every attempt, so a
     /// malformed pair is [`CirrusError::InvalidHeader`] rather than the
     /// builder failure reqwest would defer to `send`. `parse` maps the
-    /// terminal response into the caller's result shape.
+    /// terminal response into the caller's result shape, and receives
+    /// the bearer token the attempt carried so a path that keeps body
+    /// text on success can scrub it as the error path does.
     /// `Sforce-Limit-Info` capture happens here, on every response, so
     /// no send path can forget it.
     ///
@@ -1165,7 +1180,7 @@ impl Cirrus {
     ) -> CirrusResult<T>
     where
         MakeReq: Fn(&str) -> CirrusResult<reqwest::RequestBuilder>,
-        Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
+        Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes, &str) -> CirrusResult<T>,
     {
         self.check_transport_security(url)?;
         let headers = validate_headers(headers)?;
@@ -1231,7 +1246,7 @@ impl Cirrus {
                         let retry_after = retry::parse_retry_after(&headers);
                         match collect_body(response, cap).await {
                             Ok(bytes) => {
-                                break parse(status, headers, bytes)
+                                break parse(status, headers, bytes, &token)
                                     .map_err(|e| e.with_retry_after(retry_after));
                             }
                             Err(CollectBodyError::TooLarge { limit }) => {
@@ -1412,7 +1427,7 @@ impl Cirrus {
                 }
                 Ok(request)
             },
-            |status, _headers, bytes| parse(status, &bytes),
+            |status, _headers, bytes, _token| parse(status, &bytes),
         )
         .await
     }
@@ -1453,7 +1468,7 @@ impl Cirrus {
                     .header(reqwest::header::CONTENT_TYPE, content_type)
                     .body(body.clone()))
             },
-            |status, _headers, bytes| response::parse_response_bytes(status, &bytes),
+            |status, _headers, bytes, _token| response::parse_response_bytes(status, &bytes),
         )
         .await
     }
@@ -1525,7 +1540,7 @@ impl Cirrus {
                     .bearer_auth(token)
                     .multipart(form))
             },
-            |status, _headers, bytes| response::parse_response_bytes(status, &bytes),
+            |status, _headers, bytes, _token| response::parse_response_bytes(status, &bytes),
         )
         .await
     }
@@ -1563,7 +1578,7 @@ impl Cirrus {
                 }
                 Ok(request)
             },
-            |status, headers, bytes| {
+            |status, headers, bytes, _token| {
                 if (200..300).contains(&status) {
                     Ok((headers, bytes))
                 } else {
@@ -1601,7 +1616,7 @@ impl Cirrus {
                     .bearer_auth(token)
                     .header(reqwest::header::IF_MODIFIED_SINCE, since))
             },
-            |status, _headers, bytes| {
+            |status, _headers, bytes, _token| {
                 // 304 is "your cache is still good", not a failure —
                 // and it carries no body to deserialize.
                 if status == 304 {
@@ -1935,24 +1950,24 @@ fn check_transport_security(
     if allow_insecure {
         return Ok(());
     }
-    let parsed = url::Url::parse(url)?;
-    if parsed.scheme() == "https" {
+    let mut parsed = url::Url::parse(url)?;
+    if cirrus_auth::transport::is_secure_transport_for(&parsed, proxied) {
         return Ok(());
     }
-    let loopback = cirrus_auth::transport::is_loopback_host(&parsed);
-    if loopback && !proxied {
-        return Ok(());
-    }
-    let why = if loopback {
+    let why = if cirrus_auth::transport::is_loopback_host(&parsed) {
         "a loopback target is reached through the configured proxy, so the Salesforce session \
          token would travel to the proxy in the clear"
     } else {
         "the Salesforce session token must not travel in the clear"
     };
+    // The query string is caller data (a SOQL statement, an Apex
+    // script); the message names the target without it, as the
+    // transport errors do.
+    parsed.set_query(None);
     Err(CirrusError::InvalidInput {
         field,
         message: format!(
-            "`{url}` is not an https target, and {why}; \
+            "`{parsed}` is not an https target, and {why}; \
              opt out with CirrusBuilder::allow_insecure_transport if the plaintext hop is deliberate",
         ),
     })
@@ -2143,6 +2158,38 @@ mod tests {
             sf.resolve_url("limits"),
             "http://my-org.my.salesforce.com/services/data/v66.0/limits"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_plaintext_target_does_not_echo_the_query_string() {
+        // The query carries caller data (a SOQL statement, an Apex
+        // script), which the transport errors strip from the URL they
+        // print; the refusal must not print it either.
+        let sf = fixture("https://my-org.my.salesforce.com");
+        let err = sf
+            .get_with_query::<serde_json::Value, _>(
+                "http://elsewhere.example.com/query",
+                &[("q", "SELECT Secret__c FROM Account")],
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("elsewhere.example.com"), "{text}");
+        assert!(!text.contains("Secret__c"), "{text}");
+
+        let err = sf
+            .send_raw(
+                reqwest::Method::GET,
+                "http://elsewhere.example.com/query",
+                Some(&[("q", "SELECT Secret__c FROM Account")]),
+                &[],
+                None,
+                Replay::ByMethod,
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("Secret__c"), "{text}");
     }
 
     #[tokio::test]
