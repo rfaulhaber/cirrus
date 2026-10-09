@@ -444,9 +444,10 @@ impl<T> SObjectCollection<T> {
 /// `T` must serialize as a JSON object (a struct, a map, a
 /// [`serde_json::Value::Object`]). Anything else fails when the request
 /// body is serialized, before any request goes out, as a
-/// [`CirrusError::Http`] whose [`source`](std::error::Error::source) is
-/// the serialization error. `T` must not carry an `attributes` member of
-/// its own, which would be written a second time.
+/// [`CirrusError::Http`] wrapping reqwest's request-builder error, whose
+/// own [`source`](std::error::Error::source) is the serialization error.
+/// `T` must not carry an `attributes` member of its own, which would be
+/// written a second time.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionRecord<T> {
     /// The `attributes` map Salesforce requires on every record.
@@ -509,6 +510,9 @@ fn check_collection_size(count: usize) -> CirrusResult<()> {
 /// - [`create`](Self::create) — `POST` (up to 200 records)
 /// - [`update`](Self::update) — `PATCH` on the bare collection (up to 200)
 /// - [`upsert`](Self::upsert) — `PATCH` on `/{sobject}/{externalIdField}` (up to 200)
+/// - [`create_records`](Self::create_records) — `POST`, as [`create`](Self::create), for a slice of rows of one sObject type wrapped in an [`SObjectCollection`] (up to 200)
+/// - [`update_records`](Self::update_records) — `PATCH` on the bare collection, as [`update`](Self::update), for a slice of rows (up to 200)
+/// - [`upsert_records`](Self::upsert_records) — `PATCH` on `/{sobject}/{externalIdField}`, as [`upsert`](Self::upsert), for a slice of rows (up to 200)
 /// - [`delete`](Self::delete) — `DELETE` with `?ids=...` (up to 200)
 /// - [`retrieve`](Self::retrieve) — `GET` on `/{sobject}` with `?ids=...&fields=...` (up to ~800, URL-length-bound)
 /// - [`retrieve_with_body`](Self::retrieve_with_body) — `POST` on `/{sobject}` with `{ids, fields}` body (up to 2000)
@@ -572,15 +576,16 @@ impl CompositeSObjectsHandler<'_> {
     ///
     /// `body` is the sObject Collections envelope, not a bare list of
     /// records: `{"allOrNone": false, "records": [...]}`, where `records`
-    /// is required. Salesforce documents these rules for the records:
-    /// "Each object in the request body must contain an attributes map.
-    /// The map must contain a value for `type`." The list "can contain up
-    /// to 200 objects", and "can contain objects only of the type
-    /// indicated in the request URI", which is `sobject` here. A request
-    /// that isn't well formed gets `400 Bad Request`
-    /// ([`CirrusError::Api`]). [`SObjectCollection`] builds the envelope
-    /// and [`upsert_records`](Self::upsert_records) wraps a slice of rows
-    /// in it, checking the 200-record cap before the request goes out.
+    /// is required. The [Upsert Records Using sObject Collections][upsert]
+    /// page documents these rules for the records: "Each object in the
+    /// request body must contain an attributes map. The map must contain
+    /// a value for `type`." The list "can contain up to 200 objects", and
+    /// "can contain objects only of the type indicated in the request
+    /// URI", which is `sobject` here. A request that isn't well formed
+    /// gets `400 Bad Request` ([`CirrusError::Api`]).
+    /// [`SObjectCollection`] builds the envelope and
+    /// [`upsert_records`](Self::upsert_records) wraps a slice of rows in
+    /// it, checking the 200-record cap before the request goes out.
     ///
     /// Each record must carry the external ID field's value as a top-level
     /// property, and must not set `id`. [`SObjectCollectionResult::created`]
@@ -588,6 +593,8 @@ impl CompositeSObjectsHandler<'_> {
     /// `Some(false)` for one it updated; Salesforce omits the flag on some
     /// successful entries, so treat `None` as unknown rather than as an
     /// update.
+    ///
+    /// [upsert]: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-upsert.html
     pub async fn upsert<B>(
         &self,
         sobject: &str,
@@ -772,13 +779,15 @@ impl CompositeSObjectsHandler<'_> {
     ///
     /// Functionally equivalent to [`retrieve`](Self::retrieve) but ferries
     /// the IDs and field list in a JSON body instead of the query string.
-    /// `ids` and `fields` each accept `&[&str]`, `&[String]` or a
-    /// `&Vec<String>`. Use this when:
+    /// Use this when:
     ///
     /// - The number of IDs exceeds the GET form's URL-length cap
     ///   (~800 — Salesforce documents 414 URI Too Long beyond that).
     /// - The total length of `fields` (e.g. many long custom field
     ///   names) pushes a smaller batch over the URL cap.
+    ///
+    /// `ids` and `fields` each accept `&[&str]`, `&[String]` or a
+    /// `&Vec<String>`.
     ///
     /// Records that don't exist or aren't visible appear as `null` in the
     /// returned array — same per-position alignment as
@@ -2231,6 +2240,9 @@ mod tests {
 
     #[tokio::test]
     async fn sobjects_create_posts_a_mixed_type_collection() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-create.html
+        // The request follows its Account + Contact "Example Request Body";
+        // the field values and the response ids are invented.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/data/v66.0/composite/sobjects"))
@@ -2287,6 +2299,12 @@ mod tests {
 
     #[tokio::test]
     async fn sobjects_create_records_and_update_records_use_their_endpoints() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-create.html
+        // and .../resources-composite-sobjects-collections-update.html
+        // The envelope and the response entries follow their example
+        // bodies; the field values and ids are invented, and the update row
+        // omits the `id` the endpoint requires because only the routing is
+        // under test.
         let server = MockServer::start().await;
         let rows = [json!({"Name": "Acme"})];
         let expected = |all_or_none: bool| {
@@ -2364,6 +2382,10 @@ mod tests {
 
     #[tokio::test]
     async fn sobjects_records_helpers_accept_exactly_the_collection_cap() {
+        // Wire-shape provenance: the request follows
+        // https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-upsert.html
+        // with invented values. The empty `[]` answered for 200 rows is not a
+        // documented shape; only the request is under test.
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path(

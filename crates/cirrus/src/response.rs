@@ -1205,16 +1205,19 @@ pub struct CompositeError {
 /// Salesforce rolls the whole composite back, so none of it was
 /// committed, whatever the other subresponses show. A subresponse for an
 /// sObject Collections call can still answer 200 with rows that read
-/// `success: true`. Salesforce's `allOrNone` page, on a response of that
-/// shape, says: "Even though the response body for sObject Collections
-/// request shows `"success" : true` for the creation of the first
-/// Account, the fact that the Composite request is rolled back means
-/// that the Account creation is rolled back."
+/// `success: true`. Salesforce's [`allOrNone` Parameters in Composite and
+/// Collections Requests][allornone] page, on a response of that shape,
+/// says: "Even though the response body for sObject Collections request
+/// shows `"success" : true` for the creation of the first Account, the
+/// fact that the Composite request is rolled back means that the Account
+/// creation is rolled back."
 ///
 /// With an outer `allOrNone: true`, then, any
 /// [`is_error`](CompositeSubresponse::is_error) subresponse means nothing
 /// in the composite was committed. Decide that from the whole response,
 /// not entry by entry.
+///
+/// [allornone]: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-allornone.html
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeResponse {
     /// One entry per sub-request, ordered by submission unless
@@ -1378,9 +1381,10 @@ pub struct ExecuteAnonymousResult {
 /// On 2xx, the body is deserialized into `R` (use `serde_json::Value` for an
 /// untyped response); a body that doesn't fit `R` becomes a
 /// [`CirrusError::InvalidResponse`] carrying a short excerpt of what
-/// arrived. On 4xx/5xx, the body is parsed as a Salesforce error array; if
-/// that fails the raw body is preserved in [`CirrusError::Api::raw`] for
-/// debugging.
+/// arrived. Any other status goes to [`parse_error_response`]: a 300 whose
+/// body is a JSON array becomes [`CirrusError::MultipleMatches`], and any
+/// other body is parsed as a Salesforce error array, falling back to the
+/// raw body in [`CirrusError::Api::raw`] for debugging.
 pub(crate) fn parse_response_bytes<R: DeserializeOwned>(
     status: u16,
     bytes: &[u8],
@@ -3168,6 +3172,10 @@ mod tests {
         assert_eq!(back.records[0]["Name"], "Acme");
     }
 
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_search.htm
+    /// The `searchRecords` entry follows that page's "Example response body".
+    /// The `metadata` member is struct-derived (the struct has the field);
+    /// its value here is not a documented example.
     #[test]
     fn search_result_serializes_the_current_object_form() {
         let fixture = json!({
@@ -3227,6 +3235,11 @@ mod tests {
         assert_eq!(back[1].errors[0].fields, vec!["Id".to_string()]);
     }
 
+    /// SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-upsert.html
+    /// The first body is an entry of its "Example Response Body" (every item
+    /// succeeded). The second has the shape of the single-record reply on
+    /// https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html
+    /// (API 46.0 and later), with the first entry's ID substituted.
     #[test]
     fn created_flag_is_written_when_present() {
         let parsed: SObjectCollectionResult = serde_json::from_value(
@@ -3244,9 +3257,11 @@ mod tests {
         assert_eq!(written["created"], false);
     }
 
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/responses_composite_sobject_tree.htm
+    /// "JSON example upon success" (its first result) and "JSON example upon
+    /// failure".
     #[test]
     fn composite_tree_results_write_only_the_member_they_carry() {
-        // From the documented success and failure examples.
         let success: CompositeTreeResponse = serde_json::from_value(json!({
             "hasErrors": false,
             "results": [{"referenceId": "ref1", "id": "001D000000K0fXOIAZ"}]
@@ -3373,6 +3388,8 @@ mod tests {
         assert!(back.done);
     }
 
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_limits.htm
+    /// The `PermissionSets` entry of its "Example response body".
     #[test]
     fn nested_limits_serialize_their_sub_limits_at_the_top_level() {
         let fixture = json!({
@@ -3388,6 +3405,7 @@ mod tests {
         assert_eq!(back.nested["CreateCustom"].remaining, 999);
     }
 
+    /// Wire-shape provenance: see the comment above `ExecuteAnonymousResult`.
     #[test]
     fn execute_anonymous_result_serializes_its_wire_names() {
         let fixture = json!({

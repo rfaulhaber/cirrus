@@ -2062,7 +2062,7 @@ mod tests {
     /// RetrieveResult: `fileProperties` ("information about the
     /// properties of each component in the .zip file"), `messages`, and
     /// `zipFile` ("base64Binary ... client applications must decode the
-    /// base64 data to binary"). The base64 text is "PKfakezipbytes".
+    /// base64 data to binary"). The base64 text decodes to "PKfakezipbytes".
     const RETRIEVE_RESULT_XML: &str = "<result>\
         <id>09S00000retrId</id>\
         <done>true</done>\

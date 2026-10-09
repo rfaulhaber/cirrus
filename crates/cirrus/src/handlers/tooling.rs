@@ -47,6 +47,10 @@
 //! and invoking it through a runner, or use the [`MetadataContainer`] /
 //! [`ContainerAsyncRequest`] flow.
 //!
+//! [`apex_log_body`](ToolingHandler::apex_log_body) fetches the debug log
+//! of an `ApexLog` record, such as one an anonymous run produces, as raw
+//! text, which a JSON verb cannot read.
+//!
 //! [`ApexClass`]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_apexclass.htm
 //! [`MetadataContainer`]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_metadatacontainer.htm
 //! [`ContainerAsyncRequest`]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_containerasyncrequest.htm

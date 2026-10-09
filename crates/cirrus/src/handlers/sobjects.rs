@@ -248,7 +248,8 @@ impl<'a> SObjectHandler<'a> {
     ///
     /// The `If-Match` and `If-None-Match` ETag headers are documented for
     /// Account records only and are not wrapped; send them with
-    /// [`Cirrus::send_with_headers`].
+    /// [`Cirrus::send_with_headers`], where a 304 arrives as
+    /// `Err(CirrusError::Api { status: 304, .. })`, not as `None`.
     ///
     /// [Conditional Request Headers]: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
     pub async fn retrieve_if_modified_since(
@@ -392,14 +393,15 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
+        const HEADER: &str = "If-Unmodified-Since";
         let url = self.client.versioned_url(&["sobjects", self.name, id])?;
-        let date = http_date("If-Unmodified-Since", since)?;
+        let date = http_date(HEADER, since)?;
         self.client
             .send_with_headers::<(), B>(
                 reqwest::Method::PATCH,
                 &url,
                 None,
-                &[("If-Unmodified-Since", date.as_str())],
+                &[(HEADER, date.as_str())],
                 Some(body),
             )
             .await
@@ -708,11 +710,11 @@ impl<'a> SObjectHandler<'a> {
     /// come back exactly as received.
     ///
     /// The usual pairs are `ContentVersion` / `VersionData`, `Document` /
-    /// `Body` and `Attachment` / `Body`; the page lists `Attachment`,
-    /// `ContentNote`, `ContentVersion`, `Document`, `Folder` and `Note` as
-    /// the standard objects with blob fields. The resource can't be used
-    /// as a subrequest of a Composite request, so each blob is its own
-    /// call.
+    /// `Body` and `Attachment` / `Body`; the page names standard objects
+    /// with blob fields "such as" `Attachment`, `ContentNote`,
+    /// `ContentVersion`, `Document`, `Folder` and `Note`. The resource
+    /// can't be used as a subrequest of a Composite request, so each blob
+    /// is its own call.
     ///
     /// The request runs inside the same loop as
     /// [`create_with_blob`](Self::create_with_blob) and
@@ -720,9 +722,9 @@ impl<'a> SObjectHandler<'a> {
     /// 401 session refresh and `Sforce-Limit-Info` capture all apply. The
     /// whole body is buffered in memory and bounded by
     /// [`CirrusBuilder::max_response_size`](crate::CirrusBuilder::max_response_size)
-    /// (1 GiB by default); a larger blob fails with
-    /// [`CirrusError::ResponseTooLarge`] unless the limit is raised or
-    /// lifted.
+    /// (default [`DEFAULT_MAX_RESPONSE_SIZE`](crate::DEFAULT_MAX_RESPONSE_SIZE));
+    /// a larger blob fails with [`CirrusError::ResponseTooLarge`] unless
+    /// the limit is raised or lifted.
     ///
     /// A missing record or blob field is a 404 [`CirrusError::Api`].
     ///
@@ -1819,7 +1821,8 @@ mod tests {
             // record. The header contract is the parameter table on
             // https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-retrieve-get.html
             // ("The request returns records that have been modified after
-            // that date and time"), and the body is the unconditional one.
+            // that date and time"), and the body is the field-filtered
+            // example above (`?fields=AccountNumber,BillingPostalCode`).
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path(
@@ -1879,8 +1882,10 @@ mod tests {
         async fn update_if_unmodified_since_sends_the_header_and_body() {
             // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-retrieve-patch.html
             // The sObject Rows PATCH resource lists `If-Unmodified-Since`
-            // as an optional header, and the update itself answers 204
-            // with no body.
+            // as an optional header.
+            //
+            // Wire-shape provenance: that page prints no status code; the
+            // 204 with no body mirrors `update_sends_patch_and_handles_204`.
             let server = MockServer::start().await;
             Mock::given(method("PATCH"))
                 .and(path(

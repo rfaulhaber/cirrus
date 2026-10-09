@@ -27,20 +27,19 @@
 //! name the test block `runTestResult` with a `numTestsRun` count,
 //! while the hand-written JSON examples on the check-status and cancel
 //! pages show `runTestResults` and `numRun`. No live run in this
-//! repository has settled which the wire carries, so
-//! [`DeployDetails`] and [`RunTestsResult`] accept both
-//! spellings; the Rust field names follow the examples.
+//! repository has settled which the wire carries, so [`DeployDetails`]
+//! and [`RunTestsResult`] accept both spellings; the Rust field names
+//! follow the examples.
 //!
 //! The `deployResult` object is not uniform across the four pages:
 //! `meta_rest_deploy` shows an inner `id`, `success` and `done`, while
 //! `meta_rest_deploy_checkstatus` and `meta_rest_deploy_cancel` show
 //! neither an inner `id` nor those flags, although the parameters table
-//! lists both. Every field on [`DeployResult`] is therefore
-//! optional or defaulted. The two flags are `Option<bool>`, and
-//! [`DeployResult::is_done`] and
-//! [`DeployResult::is_success`] fall back to `status` when they
-//! are absent; the deploy id is read from [`DeployRequest::id`], which
-//! all pages show.
+//! lists both. Every field on [`DeployResult`] is therefore optional or
+//! defaulted. The two flags are `Option<bool>`, and
+//! [`DeployResult::is_done`] and [`DeployResult::is_success`] fall back
+//! to `status` when they are absent; the deploy id is read from
+//! [`DeployRequest::id`], which all pages show.
 
 use crate::Cirrus;
 use crate::error::CirrusResult;
