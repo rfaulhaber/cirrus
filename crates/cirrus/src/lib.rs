@@ -534,23 +534,79 @@ impl Cirrus {
             .await
     }
 
-    /// Sends a request carrying extra request headers, deserializing
-    /// the response into `R`.
+    /// Sends a bodiless request carrying extra request headers,
+    /// deserializing the response into `R`.
     ///
     /// Salesforce defines a family of request headers that change how a
     /// call behaves — `Sforce-Auto-Assign`,
     /// `Sforce-Duplicate-Rule-Header`, `Sforce-Call-Options`,
-    /// `Sforce-Query-Options`, `Sforce-Mru` — and this attaches one
+    /// `Sforce-Query-Options`, `Sforce-Mru` — and this attaches them
     /// while keeping the retry policy, the 401 auto-refresh and the
     /// `Sforce-Limit-Info` capture that the typed verb methods provide.
+    /// [`Self::send_json_with_headers`] is the same call with a JSON
+    /// body.
     ///
-    /// `query` and `body` are optional; path resolution follows
-    /// [`Cirrus`]'s three-mode semantics.
+    /// `query` is optional; path resolution follows [`Cirrus`]'s
+    /// three-mode semantics. A header name or value that is not valid
+    /// HTTP is refused with [`CirrusError::InvalidHeader`] before any
+    /// request.
     ///
     /// Replay follows the method: under the default [`RetryPolicy`] a
     /// GET, PUT or DELETE is re-sent after a 5xx or a lost response and
     /// a POST or PATCH is not. [`Self::send_with_replay`] takes an
     /// explicit [`Replay`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::Value;
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // Ask for smaller pages, and let the org resolve the `acme`
+    /// // package's field names without their namespace prefix.
+    /// let page: Value = sf
+    ///     .send_with_headers(
+    ///         cirrus::reqwest::Method::GET,
+    ///         "query",
+    ///         Some(&[("q", "SELECT Id, Rating__c FROM Account")]),
+    ///         &[
+    ///             ("Sforce-Query-Options", "batchSize=500"),
+    ///             ("Sforce-Call-Options", "defaultNamespace=acme"),
+    ///         ],
+    ///     )
+    ///     .await?;
+    /// # let _ = page;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_with_headers<R>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+    {
+        let url = self.resolve_url(path);
+        self.send_resolved::<R, _, ()>(method, &url, query, headers, None, Replay::ByMethod)
+            .await
+    }
+
+    /// Sends a JSON body with extra request headers, deserializing the
+    /// response into `R`.
+    ///
+    /// [`Self::send_with_headers`] without the body; everything said
+    /// there about the headers, the request loop and replay holds here.
+    /// `body` is any [`Serialize`] value and is sent as
+    /// `application/json` unless `headers` names a `Content-Type` of
+    /// its own; a body that fails to serialize is
+    /// [`CirrusError::Serialization`] with no request made.
     ///
     /// # Example
     ///
@@ -564,37 +620,37 @@ impl Cirrus {
     /// # let sf = Cirrus::builder().auth(auth).build()?;
     /// // Create a Lead without running the org's assignment rules.
     /// let created: Value = sf
-    ///     .send_with_headers(
+    ///     .send_json_with_headers(
     ///         cirrus::reqwest::Method::POST,
     ///         "sobjects/Lead",
     ///         None,
     ///         &[("Sforce-Auto-Assign", "FALSE")],
-    ///         Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+    ///         &json!({"LastName": "Chen", "Company": "Initech"}),
     ///     )
     ///     .await?;
     /// # let _ = created;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_with_headers<R, B>(
+    pub async fn send_json_with_headers<R, B>(
         &self,
         method: reqwest::Method,
         path: &str,
         query: Option<&[(&str, &str)]>,
         headers: &[(&str, &str)],
-        body: Option<&B>,
+        body: &B,
     ) -> CirrusResult<R>
     where
         R: DeserializeOwned,
         B: Serialize + ?Sized,
     {
         let url = self.resolve_url(path);
-        self.send_resolved(method, &url, query, headers, body, Replay::ByMethod)
+        self.send_resolved(method, &url, query, headers, Some(body), Replay::ByMethod)
             .await
     }
 
-    /// Sends a request with an explicit [`Replay`] choice, deserializing
-    /// the response into `R`.
+    /// Sends a bodiless request with an explicit [`Replay`] choice,
+    /// deserializing the response into `R`.
     ///
     /// Same request loop as [`Self::send_with_headers`] — retry policy,
     /// 401 auto-refresh and `Sforce-Limit-Info` capture included — but
@@ -602,10 +658,11 @@ impl Cirrus {
     /// request whose outcome is unknown. Reach for it when the HTTP
     /// method says something different from what the endpoint does: a
     /// `GET` that writes takes [`Replay::Never`]; a read that has to be
-    /// a `POST` takes [`Replay::Always`].
+    /// a `POST` takes [`Replay::Always`]. [`Self::send_json_with_replay`]
+    /// is the same call with a JSON body.
     ///
-    /// `query` and `body` are optional; path resolution follows
-    /// [`Cirrus`]'s three-mode semantics.
+    /// `query` is optional; path resolution follows [`Cirrus`]'s
+    /// three-mode semantics.
     ///
     /// # Example
     ///
@@ -625,7 +682,6 @@ impl Cirrus {
     ///         "/services/apexrest/Health",
     ///         None,
     ///         &[],
-    ///         None::<&()>,
     ///         Replay::ByMethod,
     ///     )
     ///     .await?;
@@ -633,13 +689,61 @@ impl Cirrus {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_with_replay<R, B>(
+    pub async fn send_with_replay<R>(
         &self,
         method: reqwest::Method,
         path: &str,
         query: Option<&[(&str, &str)]>,
         headers: &[(&str, &str)],
-        body: Option<&B>,
+        replay: Replay,
+    ) -> CirrusResult<R>
+    where
+        R: DeserializeOwned,
+    {
+        let url = self.resolve_url(path);
+        self.send_resolved::<R, _, ()>(method, &url, query, headers, None, replay)
+            .await
+    }
+
+    /// Sends a JSON body with an explicit [`Replay`] choice,
+    /// deserializing the response into `R`.
+    ///
+    /// [`Self::send_with_replay`] with a body; the body is sent as
+    /// [`Self::send_json_with_headers`] sends it.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, Replay, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::{Value, json};
+    ///
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // A custom Apex REST POST that only reads, which its author
+    /// // documents, so a lost response may be re-sent.
+    /// let report: Value = sf
+    ///     .send_json_with_replay(
+    ///         cirrus::reqwest::Method::POST,
+    ///         "/services/apexrest/Report",
+    ///         None,
+    ///         &[],
+    ///         &json!({"ids": ["001xx000003DGb2"]}),
+    ///         Replay::Always,
+    ///     )
+    ///     .await?;
+    /// # let _ = report;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_json_with_replay<R, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &[(&str, &str)],
+        body: &B,
         replay: Replay,
     ) -> CirrusResult<R>
     where
@@ -647,10 +751,9 @@ impl Cirrus {
         B: Serialize + ?Sized,
     {
         let url = self.resolve_url(path);
-        self.send_resolved(method, &url, query, headers, body, replay)
+        self.send_resolved(method, &url, query, headers, Some(body), replay)
             .await
     }
-
     /// GET with query parameters for a resource whose GET has side
     /// effects, so a lost response must never be replayed. Same wire
     /// behavior as [`Self::get_with_query`]; only the retry
@@ -2102,12 +2205,12 @@ mod tests {
 
             let sf = server_fixture(server.uri());
             let created: Value = sf
-                .send_with_headers(
+                .send_json_with_headers(
                     reqwest::Method::POST,
                     "sobjects/Lead",
                     None,
                     &[("Sforce-Auto-Assign", "FALSE")],
-                    Some(&json!({"LastName": "Chen", "Company": "Initech"})),
+                    &json!({"LastName": "Chen", "Company": "Initech"}),
                 )
                 .await
                 .unwrap();
@@ -2148,13 +2251,13 @@ mod tests {
                 })
                 .build()
                 .unwrap();
+            // No turbofish: a bodiless call has nothing to infer.
             let result: Value = sf
-                .send_with_headers::<_, ()>(
+                .send_with_headers(
                     reqwest::Method::GET,
                     "query",
                     Some(&[("q", "SELECT Id FROM Account")]),
                     &[("Sforce-Query-Options", "batchSize=200")],
-                    None,
                 )
                 .await
                 .unwrap();
@@ -2175,12 +2278,11 @@ mod tests {
                 ("Sforce Call Options", "client=a"),
             ] {
                 let err = sf
-                    .send_with_headers::<Value, ()>(
+                    .send_with_headers::<Value>(
                         reqwest::Method::GET,
                         "limits",
                         None,
                         &[(name, value)],
-                        None,
                     )
                     .await
                     .unwrap_err();
@@ -2913,12 +3015,11 @@ mod tests {
 
             let sf = fixture_with_policy(server.uri(), fast_retry_policy());
             let err = sf
-                .send_with_replay::<serde_json::Value, ()>(
+                .send_with_replay::<serde_json::Value>(
                     reqwest::Method::GET,
                     "limits",
                     None,
                     &[],
-                    None,
                     Replay::Never,
                 )
                 .await
@@ -2949,12 +3050,12 @@ mod tests {
 
             let sf = fixture_with_policy(server.uri(), fast_retry_policy());
             let v: serde_json::Value = sf
-                .send_with_replay(
+                .send_json_with_replay(
                     reqwest::Method::POST,
                     "composite/sobjects/Account",
                     None,
                     &[],
-                    Some(&serde_json::json!({"ids": ["001xx"], "fields": ["Id"]})),
+                    &serde_json::json!({"ids": ["001xx"], "fields": ["Id"]}),
                     Replay::Always,
                 )
                 .await

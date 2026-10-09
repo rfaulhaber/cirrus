@@ -112,12 +112,11 @@ impl ApexHandler<'_> {
     /// say what to pre-encode.
     pub async fn get<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
         self.client
-            .send_with_replay::<R, ()>(
+            .send_with_replay(
                 reqwest::Method::GET,
                 &apex_path(path)?,
                 None,
                 &[],
-                None,
                 Replay::Never,
             )
             .await
@@ -149,12 +148,12 @@ impl ApexHandler<'_> {
         B: Serialize + ?Sized,
     {
         self.client
-            .send_with_replay(
+            .send_json_with_replay(
                 reqwest::Method::POST,
                 &apex_path(path)?,
                 None,
                 &[],
-                Some(body),
+                body,
                 Replay::Never,
             )
             .await
@@ -170,12 +169,12 @@ impl ApexHandler<'_> {
         B: Serialize + ?Sized,
     {
         self.client
-            .send_with_replay(
+            .send_json_with_replay(
                 reqwest::Method::PUT,
                 &apex_path(path)?,
                 None,
                 &[],
-                Some(body),
+                body,
                 Replay::Never,
             )
             .await
@@ -191,12 +190,12 @@ impl ApexHandler<'_> {
         B: Serialize + ?Sized,
     {
         self.client
-            .send_with_replay(
+            .send_json_with_replay(
                 reqwest::Method::PATCH,
                 &apex_path(path)?,
                 None,
                 &[],
-                Some(body),
+                body,
                 Replay::Never,
             )
             .await
@@ -208,12 +207,11 @@ impl ApexHandler<'_> {
     /// say what to pre-encode.
     pub async fn delete<R: DeserializeOwned>(&self, path: &str) -> CirrusResult<R> {
         self.client
-            .send_with_replay::<R, ()>(
+            .send_with_replay(
                 reqwest::Method::DELETE,
                 &apex_path(path)?,
                 None,
                 &[],
-                None,
                 Replay::Never,
             )
             .await

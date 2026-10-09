@@ -201,17 +201,20 @@ an empty segment or a `.`/`..`; `cirrus::encode_path_segment(value)` encodes
 one segment for an instance-rooted or Apex REST path.
 
 Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
-`Sforce-Query-Options`, …) go through `send_with_headers`, which keeps retry,
-the 401 auto-refresh and the `Sforce-Limit-Info` capture:
+`Sforce-Query-Options`, …) go through `send_with_headers` for a bodiless
+request and `send_json_with_headers` for one with a JSON body; both keep
+retry, the 401 auto-refresh and the `Sforce-Limit-Info` capture, and refuse
+a header that is not valid HTTP with `CirrusError::InvalidHeader` before any
+request:
 
 ```rust,ignore
 let created: Value = sf
-    .send_with_headers(
+    .send_json_with_headers(
         Method::POST,
         "sobjects/Lead",
         None,
         &[("Sforce-Auto-Assign", "FALSE")],
-        Some(&lead),
+        &lead,
     )
     .await?;
 ```

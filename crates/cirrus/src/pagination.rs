@@ -878,12 +878,11 @@ mod tests {
 
         let sf = fixture(server.uri());
         let page: crate::QueryResult<Value> = sf
-            .send_with_headers::<_, ()>(
+            .send_with_headers(
                 reqwest::Method::GET,
                 "query",
                 Some(&[("q", "SELECT Id FROM Account")]),
                 &[("Sforce-Query-Options", "batchSize=200")],
-                None,
             )
             .await
             .unwrap();

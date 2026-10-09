@@ -357,7 +357,7 @@ impl<'a> SObjectHandler<'a> {
     ///
     /// The `If-Match` and `If-None-Match` ETag headers are documented for
     /// Account records only and are not wrapped; send them with
-    /// [`Cirrus::send_with_headers`].
+    /// [`Cirrus::send_json_with_headers`].
     ///
     /// [Conditional Request Headers]: https://developer.salesforce.com/docs/platform/api-rest/guide/intro-rest-conditional-requests.html
     ///
@@ -402,12 +402,12 @@ impl<'a> SObjectHandler<'a> {
         let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         let date = http_date(HEADER, since)?;
         self.client
-            .send_with_headers::<(), B>(
+            .send_json_with_headers::<(), B>(
                 reqwest::Method::PATCH,
                 &url,
                 None,
                 &[(HEADER, date.as_str())],
-                Some(body),
+                body,
             )
             .await
     }

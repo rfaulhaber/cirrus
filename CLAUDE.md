@@ -54,7 +54,7 @@ Tests: ~960 unit + ~35 doctest workspace-wide, all wiremock-backed, fast (<10s w
 
 ### Open-ended client (escape hatch)
 
-Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` (the header-carrying verb — it stays inside the retry / 401-refresh / limit-info loop, unlike the two below), `send_with_replay` (same loop, with an explicit `Replay` for endpoints whose HTTP method misstates their effect — Apex REST uses `Replay::Never` throughout), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
+Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` / `send_json_with_headers` (the header-carrying verbs, bodiless and with a JSON body — they stay inside the retry / 401-refresh / limit-info loop, unlike the two below), `send_with_replay` / `send_json_with_replay` (same loop, with an explicit `Replay` for endpoints whose HTTP method misstates their effect — Apex REST uses `Replay::Never` throughout), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
 
 - **Relative** (`limits`) → versioned: `{instance}/services/data/{version}/limits`
 - **Leading slash** (`/services/apexrest/foo`) → instance-rooted
