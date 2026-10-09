@@ -318,9 +318,54 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
+        self.create_with_headers(body, &[]).await
+    }
+
+    /// [`create`](Self::create) with request headers.
+    ///
+    /// The headers Salesforce documents for a record create —
+    /// `Sforce-Auto-Assign` (assignment rules for an Account, Case or
+    /// Lead), `Sforce-Duplicate-Rule-Header` (duplicate rules, API
+    /// 52.0+), `Sforce-Mru` (the Recent Items list, API 60.0+) and
+    /// `Sforce-Call-Options` (a default namespace) — go here as
+    /// `("name", "value")` pairs; a name or value that is not valid HTTP
+    /// is refused with [`CirrusError::InvalidHeader`] before any request.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use cirrus::{Cirrus, auth::StaticTokenAuth};
+    /// # use std::sync::Arc;
+    /// use serde_json::json;
+    /// # async fn example() -> Result<(), cirrus::CirrusError> {
+    /// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+    /// # let sf = Cirrus::builder().auth(auth).build()?;
+    /// // Create a Lead without running the org's assignment rules and
+    /// // without touching the integration user's Recent Items.
+    /// let created = sf
+    ///     .sobject("Lead")
+    ///     .create_with_headers(
+    ///         &json!({"LastName": "Chen", "Company": "Initech"}),
+    ///         &[("Sforce-Auto-Assign", "FALSE"), ("Sforce-Mru", "updateMru=false")],
+    ///     )
+    ///     .await?;
+    /// # let _ = created;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`CirrusError::InvalidHeader`]: crate::CirrusError::InvalidHeader
+    pub async fn create_with_headers<B>(
+        &self,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> CirrusResult<SObjectCreateResult>
+    where
+        B: Serialize + ?Sized,
+    {
         let url = self.client.versioned_url(&["sobjects", self.name])?;
         self.client
-            .send_at(reqwest::Method::POST, &url, None::<&()>, Some(body))
+            .send_json_with_headers(reqwest::Method::POST, &url, None, headers, body)
             .await
     }
 
@@ -333,9 +378,29 @@ impl<'a> SObjectHandler<'a> {
     where
         B: Serialize + ?Sized,
     {
+        self.update_with_headers(id, body, &[]).await
+    }
+
+    /// [`update`](Self::update) with request headers, the ones
+    /// [`create_with_headers`](Self::create_with_headers) describes:
+    /// the Assignment Rule, Duplicate Rule, MRU and Call Options
+    /// headers all apply to an update too.
+    ///
+    /// For `If-Unmodified-Since`, use
+    /// [`update_if_unmodified_since`](Self::update_if_unmodified_since),
+    /// which formats the date.
+    pub async fn update_with_headers<B>(
+        &self,
+        id: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> CirrusResult<()>
+    where
+        B: Serialize + ?Sized,
+    {
         let url = self.client.versioned_url(&["sobjects", self.name, id])?;
         self.client
-            .send_at::<(), (), B>(reqwest::Method::PATCH, &url, None, Some(body))
+            .send_json_with_headers(reqwest::Method::PATCH, &url, None, headers, body)
             .await
     }
 
@@ -1083,6 +1148,74 @@ mod tests {
         let sf = fixture(server.uri());
         sf.sobject("Account")
             .update("001xx0000000001", &json!({"Industry": "Biotech"}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_with_headers_sends_the_headers_with_the_body() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers-autoassign.html
+        // "Field name: Sforce-Auto-Assign ... FALSE. Active assignment
+        // rules are not applied for created or updated Accounts, Cases,
+        // or Leads." and
+        // https://developer.salesforce.com/docs/platform/api-rest/guide/headers-mru.html
+        // "Sforce-Mru: updateMru=true" (false: "Don't update MRU").
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/sobjects/Lead"))
+            .and(header("Sforce-Auto-Assign", "FALSE"))
+            .and(header("Sforce-Mru", "updateMru=false"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({"LastName": "Chen", "Company": "Initech"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "00Q000000000001AAA",
+                "success": true,
+                "errors": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let created = sf
+            .sobject("Lead")
+            .create_with_headers(
+                &json!({"LastName": "Chen", "Company": "Initech"}),
+                &[
+                    ("Sforce-Auto-Assign", "FALSE"),
+                    ("Sforce-Mru", "updateMru=false"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.id, "00Q000000000001AAA");
+    }
+
+    #[tokio::test]
+    async fn update_with_headers_sends_the_headers_with_the_patch() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers-duplicaterules.html
+        // "Sforce-Duplicate-Rule-Header: allowSave=true;
+        // includeRecordDetails=true; runAsCurrentUser=true" — "applied
+        // when records are created, updated, and upserted."
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/services/data/v66.0/sobjects/Lead/00Q000000000001AAA",
+            ))
+            .and(header("Sforce-Duplicate-Rule-Header", "allowSave=true"))
+            .and(body_json(json!({"Email": "chen@initech.example"})))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.sobject("Lead")
+            .update_with_headers(
+                "00Q000000000001AAA",
+                &json!({"Email": "chen@initech.example"}),
+                &[("Sforce-Duplicate-Rule-Header", "allowSave=true")],
+            )
             .await
             .unwrap();
     }

@@ -200,8 +200,13 @@ builds a versioned URL from separate segments, encoding each one and refusing
 an empty segment or a `.`/`..`; `cirrus::encode_path_segment(value)` encodes
 one segment for an instance-rooted or Apex REST path.
 
-Salesforce request headers (`Sforce-Auto-Assign`, `Sforce-Call-Options`,
-`Sforce-Query-Options`, …) go through `send_with_headers` for a bodiless
+The typed paths carry the common Salesforce request headers themselves:
+`QueryOptions::new().batch_size(n)` sends `Sforce-Query-Options` on
+`query_with_options`, `query_all_with_options`, `query_more_with_options` and
+the matching `_stream_with_options` streams (on every page), and
+`sobject(..).create_with_headers` / `update_with_headers` take the Assignment
+Rule, Duplicate Rule, MRU and Call Options headers as `("name", "value")`
+pairs. Any other header goes through `send_with_headers` for a bodiless
 request and `send_json_with_headers` for one with a JSON body; both keep
 retry, the 401 auto-refresh and the `Sforce-Limit-Info` capture, and refuse
 a header that is not valid HTTP with `CirrusError::InvalidHeader` before any

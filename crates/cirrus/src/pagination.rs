@@ -82,9 +82,11 @@
 //! ```
 //!
 //! [`Records::from_page`] starts a stream from a page fetched some other
-//! way — a first page sent with `Sforce-Query-Options` through
+//! way — a first page sent with `Sforce-Call-Options` through
 //! [`Cirrus::send_with_headers`], say — and [`Records::total_size`]
-//! reports the query's total once the first page is in.
+//! reports the query's total once the first page is in. The page size
+//! needs no detour: [`Cirrus::query_stream_with_options`] sends
+//! `Sforce-Query-Options` on every page.
 //!
 //! # What this *doesn't* cover
 //!
@@ -101,6 +103,7 @@
 
 use crate::Cirrus;
 use crate::error::CirrusResult;
+use crate::handlers::query::QueryOptions;
 use crate::response::QueryResult;
 use futures::future::BoxFuture;
 use futures::stream::Stream;
@@ -136,6 +139,8 @@ pub struct Records<R> {
     /// `totalSize` of the first page seen, which Salesforce repeats on
     /// every page of the same query.
     total_size: Option<i64>,
+    /// Sent with every follow-up page the stream fetches.
+    options: QueryOptions,
 }
 
 impl<R> std::fmt::Debug for Records<R> {
@@ -152,6 +157,7 @@ impl<R> std::fmt::Debug for Records<R> {
             .field("buffered_records", &buffered)
             .field("has_pending_locator", &self.pending_locator().is_some())
             .field("total_size", &self.total_size)
+            .field("options", &self.options)
             .finish_non_exhaustive()
     }
 }
@@ -180,8 +186,9 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
     /// page. Internal — call sites supply the appropriate initial-page
     /// future (a `query_as`, `query_all_as`, or
     /// `tooling().query_as` call, all of which return
-    /// `QueryResult<R>`).
-    pub(crate) fn new(client: Cirrus, initial: PageFuture<R>) -> Self {
+    /// `QueryResult<R>`) and the options every follow-up page is
+    /// fetched with.
+    pub(crate) fn new(client: Cirrus, initial: PageFuture<R>, options: QueryOptions) -> Self {
         Self {
             client,
             state: State::Fetching {
@@ -189,6 +196,7 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
                 locator: None,
             },
             total_size: None,
+            options,
         }
     }
 
@@ -205,22 +213,27 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
     ///
     /// [`CirrusError::InvalidInput`]: crate::CirrusError::InvalidInput
     pub fn from_locator(client: Cirrus, next_records_url: impl Into<String>) -> Self {
-        let state = fetch_more(&client, next_records_url.into());
+        let options = QueryOptions::default();
+        let state = fetch_more(&client, next_records_url.into(), &options);
         Self {
             client,
             state,
             total_size: None,
+            options,
         }
     }
 
     /// Starts a stream at a page already fetched, serving its records
     /// first and then walking its `nextRecordsUrl` like any other page.
     ///
-    /// This is how a first page sent with request headers (such as
-    /// `Sforce-Query-Options` for the batch size) becomes a stream:
-    /// fetch it with
+    /// This is how a first page sent with request headers the typed
+    /// query methods do not take (`Sforce-Call-Options`, say) becomes a
+    /// stream: fetch it with
     /// [`Cirrus::send_with_headers`](crate::Cirrus::send_with_headers)
-    /// and hand it over here.
+    /// and hand it over here. The follow-up pages are fetched without
+    /// those headers. For the page size, the
+    /// [`query_stream_with_options`](crate::Cirrus::query_stream_with_options)
+    /// family sends `Sforce-Query-Options` on every page.
     pub fn from_page(client: Cirrus, page: QueryResult<R>) -> Self {
         Self {
             client,
@@ -229,6 +242,7 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Records<R> {
                 next: page.next_records_url,
             },
             total_size: Some(page.total_size),
+            options: QueryOptions::default(),
         }
     }
 }
@@ -262,10 +276,13 @@ impl<R> Records<R> {
 fn fetch_more<R: DeserializeOwned + Send + Unpin + 'static>(
     client: &Cirrus,
     locator: String,
+    options: &QueryOptions,
 ) -> State<R> {
     let client = client.clone();
     let url = locator.clone();
-    let fut: PageFuture<R> = Box::pin(async move { client.query_more_as::<R>(&url).await });
+    let options = options.clone();
+    let fut: PageFuture<R> =
+        Box::pin(async move { client.query_more_with_options_as::<R>(&url, &options).await });
     State::Fetching {
         fut,
         locator: Some(locator),
@@ -313,7 +330,7 @@ impl<R: DeserializeOwned + Send + Unpin + 'static> Stream for Records<R> {
                     // Current page drained — start the next one (or
                     // finish, if the locator is None).
                     if let Some(next_url) = next.take() {
-                        this.state = fetch_more(&this.client, next_url);
+                        this.state = fetch_more(&this.client, next_url, &this.options);
                     } else {
                         this.state = State::Done { unfetched: None };
                         return Poll::Ready(None);
@@ -843,19 +860,63 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    /// A first page fetched by the caller — here with the
-    /// `Sforce-Query-Options` header the stream constructors cannot send
-    /// — becomes a stream that serves it and then walks its locator.
     #[tokio::test]
-    async fn from_page_serves_the_given_page_then_walks_its_locator() {
-        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers_queryoptions.htm
-        // "Sforce-Query-Options: batchSize=1000" bounds the page size of
-        // the request that opens the cursor.
+    async fn query_stream_with_options_sends_the_header_on_every_page() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers-queryoptions.html
+        // "Sforce-Query-Options: batchSize=1000". The page is documented
+        // for the Query resource; the follow-up carries the same header
+        // so a cursor that honors it keeps the page size.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/services/data/v66.0/query"))
             .and(query_param("q", "SELECT Id FROM Account"))
             .and(header("Sforce-Query-Options", "batchSize=200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 2,
+                "done": false,
+                "nextRecordsUrl": "/services/data/v66.0/query/01gAA-200",
+                "records": [{"attributes": {"type": "Account"}, "Id": "001a"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gAA-200"))
+            .and(header("Sforce-Query-Options", "batchSize=200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 2,
+                "done": true,
+                "records": [{"attributes": {"type": "Account"}, "Id": "001b"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let options = crate::QueryOptions::new().batch_size(200);
+        let ids: Vec<Value> = sf
+            .query_stream_with_options("SELECT Id FROM Account", &options)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0]["Id"], "001a");
+        assert_eq!(ids[1]["Id"], "001b");
+    }
+
+    /// A first page fetched by the caller — here with a request header
+    /// the typed query methods do not take — becomes a stream that
+    /// serves it and then walks its locator.
+    #[tokio::test]
+    async fn from_page_serves_the_given_page_then_walks_its_locator() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers-calloptions.html
+        // "Sforce-Call-Options: client=caseSensitiveToken;
+        // defaultNamespace=battle" — "can be used with ... Query".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .and(query_param("q", "SELECT Id FROM Account"))
+            .and(header("Sforce-Call-Options", "defaultNamespace=battle"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "totalSize": 2,
                 "done": false,
@@ -882,7 +943,7 @@ mod tests {
                 reqwest::Method::GET,
                 "query",
                 Some(&[("q", "SELECT Id FROM Account")]),
-                &[("Sforce-Query-Options", "batchSize=200")],
+                &[("Sforce-Call-Options", "defaultNamespace=battle")],
             )
             .await
             .unwrap();

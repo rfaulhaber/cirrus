@@ -195,7 +195,11 @@ impl<'a> ToolingHandler<'a> {
                 .get_with_query::<QueryResult<R>, _>("tooling/query", &query)
                 .await
         });
-        crate::pagination::Records::new(self.client.clone(), initial)
+        crate::pagination::Records::new(
+            self.client.clone(),
+            initial,
+            crate::handlers::query::QueryOptions::default(),
+        )
     }
 
     /// Runs a Tooling SOSL search.

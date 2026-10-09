@@ -86,6 +86,7 @@ pub use handlers::metadata::{
 };
 #[allow(deprecated)]
 pub use handlers::metadata::{DeployResultDetails, DeployResultInnerDetails, RunTestResults};
+pub use handlers::query::QueryOptions;
 pub use handlers::sobjects::{BlobUploadSpec, UpsertOptions};
 pub use pagination::Records;
 pub use response::LimitInfo;

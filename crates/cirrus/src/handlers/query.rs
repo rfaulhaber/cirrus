@@ -13,7 +13,8 @@
 //!   behavior.
 //!
 //! Each method returns [`QueryResult<Value>`] by default; the `_as::<T>()`
-//! variants deserialize records into a caller-supplied type.
+//! variants deserialize records into a caller-supplied type, and the
+//! `_with_options` variants take a [`QueryOptions`] for the page size.
 //!
 //! # Streaming variants
 //!
@@ -66,6 +67,68 @@ use crate::pagination::Records;
 use crate::response::QueryResult;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+/// The request header the options travel in.
+const QUERY_OPTIONS_HEADER: &str = "Sforce-Query-Options";
+
+/// Per-call options for the query resources, sent as the
+/// `Sforce-Query-Options` request header.
+///
+/// With nothing set, no header is sent and the org applies its
+/// defaults. The struct is `#[non_exhaustive]`: build it with
+/// [`new`](Self::new) and the setters so a later option is an additive
+/// change.
+///
+/// # Example
+///
+/// ```no_run
+/// # use cirrus::{Cirrus, QueryOptions, auth::StaticTokenAuth};
+/// # use std::sync::Arc;
+/// # async fn example() -> Result<(), cirrus::CirrusError> {
+/// # let auth = Arc::new(StaticTokenAuth::new("tok", "https://x.my.salesforce.com"));
+/// # let sf = Cirrus::builder().auth(auth).build()?;
+/// let options = QueryOptions::new().batch_size(500);
+/// let page = sf
+///     .query_with_options("SELECT Id FROM Account", &options)
+///     .await?;
+/// # let _ = page;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QueryOptions {
+    /// `batchSize`: how many records a page holds. Per the [Query
+    /// Options Header][header] page, "the default is 2,000; the minimum
+    /// is 200, and the maximum is 2,000", and "there is no guarantee
+    /// that the requested batch size is the actual batch size". Child
+    /// records of a relationship query count toward it. The value is
+    /// sent as given; the org decides what to do with one outside that
+    /// range.
+    ///
+    /// [header]: https://developer.salesforce.com/docs/platform/api-rest/guide/headers-queryoptions.html
+    pub batch_size: Option<u32>,
+}
+
+impl QueryOptions {
+    /// Options that send no header.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`batch_size`](Self::batch_size).
+    #[must_use]
+    pub fn batch_size(mut self, records: u32) -> Self {
+        self.batch_size = Some(records);
+        self
+    }
+
+    /// The `Sforce-Query-Options` field value, or `None` when nothing
+    /// is set and no header should go out.
+    fn header_value(&self) -> Option<String> {
+        self.batch_size.map(|size| format!("batchSize={size}"))
+    }
+}
 
 /// The locator shapes Salesforce documents for `nextRecordsUrl`: a
 /// `query` or `queryAll` response names `query/{locator}` (the QueryAll
@@ -129,8 +192,32 @@ impl Cirrus {
 
     /// Typed variant of [`query`](Self::query) — records deserialize as `R`.
     pub async fn query_as<R: DeserializeOwned>(&self, soql: &str) -> CirrusResult<QueryResult<R>> {
-        let query = [("q", soql)];
-        self.get_with_query("query", &query).await
+        self.query_with_options_as(soql, &QueryOptions::default())
+            .await
+    }
+
+    /// [`query`](Self::query) with a [`QueryOptions`], which sets the
+    /// page size through the `Sforce-Query-Options` header. The pages
+    /// after the first are fetched with [`query_more_with_options`]
+    /// (the same options) or [`query_more`] (the org's default size).
+    ///
+    /// [`query_more_with_options`]: Self::query_more_with_options
+    /// [`query_more`]: Self::query_more
+    pub async fn query_with_options(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<Value>> {
+        self.query_with_options_as(soql, options).await
+    }
+
+    /// Typed variant of [`query_with_options`](Self::query_with_options).
+    pub async fn query_with_options_as<R: DeserializeOwned>(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<R>> {
+        self.query_resource_as("query", soql, options).await
     }
 
     /// Like [`query`](Self::query), but also returns soft-deleted and
@@ -148,8 +235,45 @@ impl Cirrus {
         &self,
         soql: &str,
     ) -> CirrusResult<QueryResult<R>> {
+        self.query_all_with_options_as(soql, &QueryOptions::default())
+            .await
+    }
+
+    /// [`query_all`](Self::query_all) with a [`QueryOptions`].
+    pub async fn query_all_with_options(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<Value>> {
+        self.query_all_with_options_as(soql, options).await
+    }
+
+    /// Typed variant of
+    /// [`query_all_with_options`](Self::query_all_with_options).
+    pub async fn query_all_with_options_as<R: DeserializeOwned>(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<R>> {
+        self.query_resource_as("queryAll", soql, options).await
+    }
+
+    /// `GET {resource}?q={soql}` with the options header when one is
+    /// set; `query` and `queryAll` share the envelope and the header.
+    async fn query_resource_as<R: DeserializeOwned>(
+        &self,
+        resource: &str,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<R>> {
         let query = [("q", soql)];
-        self.get_with_query("queryAll", &query).await
+        let value = options.header_value();
+        let headers: Vec<(&str, &str)> = value
+            .iter()
+            .map(|value| (QUERY_OPTIONS_HEADER, value.as_str()))
+            .collect();
+        self.send_with_headers(reqwest::Method::GET, resource, Some(&query), &headers)
+            .await
     }
 
     /// Fetches the next batch of records using a
@@ -177,14 +301,46 @@ impl Cirrus {
         &self,
         next_records_url: &str,
     ) -> CirrusResult<QueryResult<R>> {
+        self.query_more_with_options_as(next_records_url, &QueryOptions::default())
+            .await
+    }
+
+    /// [`query_more`](Self::query_more) with a [`QueryOptions`], sent as
+    /// the `Sforce-Query-Options` header on the follow-up request.
+    ///
+    /// Salesforce documents the header for the Query resource, which
+    /// opens the cursor, and says nothing about the follow-up: pass the
+    /// same options here to ask for the same page size, with the same
+    /// "no guarantee" the header page gives for the first page.
+    pub async fn query_more_with_options(
+        &self,
+        next_records_url: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<Value>> {
+        self.query_more_with_options_as(next_records_url, options)
+            .await
+    }
+
+    /// Typed variant of
+    /// [`query_more_with_options`](Self::query_more_with_options).
+    pub async fn query_more_with_options_as<R: DeserializeOwned>(
+        &self,
+        next_records_url: &str,
+        options: &QueryOptions,
+    ) -> CirrusResult<QueryResult<R>> {
         let path = locator::confine(self.auth.instance_url(), next_records_url, NEXT_RECORDS_URL)
             .map_err(|message| CirrusError::InvalidInput {
             field: "next_records_url",
             message: format!("nextRecordsUrl locator {message}"),
         })?;
-        self.get(&path).await
+        let value = options.header_value();
+        let headers: Vec<(&str, &str)> = value
+            .iter()
+            .map(|value| (QUERY_OPTIONS_HEADER, value.as_str()))
+            .collect();
+        self.send_with_headers(reqwest::Method::GET, &path, None, &headers)
+            .await
     }
-
     /// Streams query records lazily, walking `nextRecordsUrl` locators
     /// across pages. Yields one record at a time; subsequent pages are
     /// fetched on demand as the consumer drains the buffer.
@@ -218,10 +374,32 @@ impl Cirrus {
         &self,
         soql: &str,
     ) -> Records<R> {
+        self.query_stream_with_options_as(soql, &QueryOptions::default())
+    }
+
+    /// [`query_stream`](Self::query_stream) with a [`QueryOptions`].
+    ///
+    /// The options go out on the first page's request and on every
+    /// follow-up the stream makes, as
+    /// [`query_more_with_options`](Self::query_more_with_options) sends
+    /// them.
+    pub fn query_stream_with_options(&self, soql: &str, options: &QueryOptions) -> Records<Value> {
+        self.query_stream_with_options_as(soql, options)
+    }
+
+    /// Typed variant of
+    /// [`query_stream_with_options`](Self::query_stream_with_options).
+    pub fn query_stream_with_options_as<R: DeserializeOwned + Send + Unpin + 'static>(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> Records<R> {
         let client = self.clone();
         let soql = soql.to_string();
-        let initial = Box::pin(async move { client.query_as::<R>(&soql).await });
-        Records::new(self.clone(), initial)
+        let first = options.clone();
+        let initial =
+            Box::pin(async move { client.query_with_options_as::<R>(&soql, &first).await });
+        Records::new(self.clone(), initial, options.clone())
     }
 
     /// Like [`query_stream`](Self::query_stream), but also includes
@@ -235,13 +413,36 @@ impl Cirrus {
         &self,
         soql: &str,
     ) -> Records<R> {
+        self.query_all_stream_with_options_as(soql, &QueryOptions::default())
+    }
+
+    /// [`query_all_stream`](Self::query_all_stream) with a
+    /// [`QueryOptions`], sent on every page as
+    /// [`query_stream_with_options`](Self::query_stream_with_options)
+    /// sends it.
+    pub fn query_all_stream_with_options(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> Records<Value> {
+        self.query_all_stream_with_options_as(soql, options)
+    }
+
+    /// Typed variant of
+    /// [`query_all_stream_with_options`](Self::query_all_stream_with_options).
+    pub fn query_all_stream_with_options_as<R: DeserializeOwned + Send + Unpin + 'static>(
+        &self,
+        soql: &str,
+        options: &QueryOptions,
+    ) -> Records<R> {
         let client = self.clone();
         let soql = soql.to_string();
-        let initial = Box::pin(async move { client.query_all_as::<R>(&soql).await });
-        Records::new(self.clone(), initial)
+        let first = options.clone();
+        let initial =
+            Box::pin(async move { client.query_all_with_options_as::<R>(&soql, &first).await });
+        Records::new(self.clone(), initial, options.clone())
     }
 }
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -298,6 +499,115 @@ mod tests {
         assert_eq!(qr.records.len(), 1);
         assert_eq!(qr.records[0]["Name"], "Acme");
         assert!(qr.next_records_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_with_options_sends_the_batch_size_header() {
+        // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/headers-queryoptions.html
+        // "Field name: Sforce-Query-Options ... batchSize ... Example:
+        // Sforce-Query-Options: batchSize=1000"
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .and(query_param("q", "SELECT Id FROM Account"))
+            .and(header("Sforce-Query-Options", "batchSize=1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 1,
+                "done": true,
+                "records": [{"attributes": {"type": "Account"}, "Id": "001xx"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let qr = sf
+            .query_with_options(
+                "SELECT Id FROM Account",
+                &crate::QueryOptions::new().batch_size(1000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(qr.records[0]["Id"], "001xx");
+    }
+
+    #[tokio::test]
+    async fn query_all_with_options_sends_the_batch_size_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/queryAll"))
+            .and(query_param("q", "SELECT Id FROM Account"))
+            .and(header("Sforce-Query-Options", "batchSize=200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 0,
+                "done": true,
+                "records": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.query_all_with_options(
+            "SELECT Id FROM Account",
+            &crate::QueryOptions::new().batch_size(200),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_more_with_options_sends_the_batch_size_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query/01gD0000002HU6KIAW-200"))
+            .and(header("Sforce-Query-Options", "batchSize=200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 400,
+                "done": true,
+                "records": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.query_more_with_options(
+            "/services/data/v66.0/query/01gD0000002HU6KIAW-200",
+            &crate::QueryOptions::new().batch_size(200),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_query_options_send_no_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalSize": 0,
+                "done": true,
+                "records": []
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.query_with_options("SELECT Id FROM Account", &crate::QueryOptions::new())
+            .await
+            .unwrap();
+        sf.query("SELECT Id FROM Account").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(
+                !request.headers.contains_key("sforce-query-options"),
+                "{:?}",
+                request.headers
+            );
+        }
     }
 
     #[tokio::test]
