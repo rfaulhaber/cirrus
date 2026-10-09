@@ -302,10 +302,10 @@ struct JsonRequest<'a, Q: ?Sized, B: ?Sized> {
 
 /// Outcome of the shared 401 auth-refresh decision run at the tail of
 /// every send path.
-enum AuthRetry {
+enum AuthRetry<'a> {
     /// The cached token was invalidated and a genuinely new one obtained;
-    /// the caller should loop and retry the request.
-    Retry,
+    /// the caller should loop and retry the request with that token.
+    Retry(Cow<'a, str>),
     /// Not a refreshable 401 — already retried once, the result wasn't an
     /// `INVALID_SESSION_ID` 401, or the auth session couldn't produce a
     /// different token (static auth, scope/permission issue). The caller
@@ -855,10 +855,16 @@ impl Cirrus {
     /// On a 401 carrying `INVALID_SESSION_ID` that hasn't already been
     /// retried this call, invalidate the cached token (compare-and-swap
     /// against `token`) and fetch a fresh one. Returns
-    /// [`AuthRetry::Retry`] when a genuinely different token was obtained
-    /// — the caller should set its own `auth_retried` latch and loop — or
-    /// [`AuthRetry::Done`] otherwise. `auth_retried` short-circuits the
-    /// whole check so the refresh happens at most once.
+    /// [`AuthRetry::Retry`] carrying that token when it is genuinely
+    /// different — the caller should set its own `auth_retried` latch and
+    /// loop, sending the carried token rather than asking the session
+    /// again — or [`AuthRetry::Done`] otherwise. `auth_retried`
+    /// short-circuits the whole check so the refresh happens at most once.
+    ///
+    /// Handing the token back matters for a session that mints on every
+    /// call (caching disabled, or a bespoke implementation): a second
+    /// `access_token()` would spend another grant, fire another rotation
+    /// callback, and send a token other than the one that was checked.
     ///
     /// Every send path reaches this through the shared [`Self::dispatch`]
     /// loop, so the refresh behavior lives in one place. This is the place
@@ -873,7 +879,7 @@ impl Cirrus {
         is_retryable_401: bool,
         token: &str,
         auth_retried: bool,
-    ) -> CirrusResult<AuthRetry> {
+    ) -> CirrusResult<AuthRetry<'_>> {
         if auth_retried || !is_retryable_401 {
             return Ok(AuthRetry::Done);
         }
@@ -890,7 +896,7 @@ impl Cirrus {
             );
             return Ok(AuthRetry::Done);
         }
-        Ok(AuthRetry::Retry)
+        Ok(AuthRetry::Retry(fresh))
     }
 
     /// Shared request loop behind every send path.
@@ -902,9 +908,9 @@ impl Cirrus {
     /// - **Outer loop** — the 401 auth-refresh retry, latched to at most
     ///   two passes via [`Self::auth_retry_decision`].
     ///
-    /// `attempt` resets to zero when the outer loop re-enters with a
-    /// fresh token: transient flakiness and credential staleness are
-    /// independent failure classes, so retries burned on throttling
+    /// `attempt` resets to zero when the outer loop re-enters with the
+    /// token the refresh obtained: transient flakiness and credential
+    /// staleness are independent failure classes, so retries burned on throttling
     /// before a 401 must not starve the post-refresh request. The reset
     /// also restarts the backoff schedule from `base_delay`. Total work
     /// stays bounded at `2 * (max_retries + 1)` requests because the
@@ -936,8 +942,14 @@ impl Cirrus {
         self.check_transport_security(url)?;
         let mut auth_retried = false;
         let mut attempt: u32 = 0;
+        // The token the 401 refresh obtained, carried into the next pass
+        // so the session is not asked a second time.
+        let mut refreshed: Option<Cow<'_, str>> = None;
         loop {
-            let token = self.auth.access_token().await?;
+            let token = match refreshed.take() {
+                Some(token) => token,
+                None => self.auth.access_token().await?,
+            };
 
             let result: CirrusResult<T> = loop {
                 let request = make_request(&token)?;
@@ -1035,7 +1047,8 @@ impl Cirrus {
                 .auth_retry_decision(is_retryable_401, &token, auth_retried)
                 .await?
             {
-                AuthRetry::Retry => {
+                AuthRetry::Retry(fresh) => {
+                    refreshed = Some(fresh);
                     auth_retried = true;
                     attempt = 0;
                     continue;
@@ -3140,6 +3153,44 @@ mod tests {
             }
         }
 
+        /// Test-only AuthSession with no cache: every `access_token()`
+        /// call mints a new token, as a session whose cache is disabled
+        /// or a bespoke implementation does. Counts the mints and records
+        /// every `invalidate()` call.
+        struct MintingAuth {
+            instance_url: String,
+            mints: AtomicUsize,
+            invalidations: Mutex<Vec<String>>,
+        }
+
+        impl MintingAuth {
+            fn new(instance_url: impl Into<String>) -> Self {
+                Self {
+                    instance_url: instance_url.into(),
+                    mints: AtomicUsize::new(0),
+                    invalidations: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl AuthSession for MintingAuth {
+            async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
+                let n = self.mints.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(Cow::Owned(format!("t{n}")))
+            }
+
+            fn instance_url(&self) -> &str {
+                &self.instance_url
+            }
+
+            async fn invalidate(&self, stale_token: &str) {
+                if let Ok(mut g) = self.invalidations.lock() {
+                    g.push(stale_token.to_string());
+                }
+            }
+        }
+
         fn fixture(_uri: String, auth: SharedAuth) -> Cirrus {
             // _uri unused here — the AuthSession's instance_url drives
             // URL resolution. Keep the param for symmetry with other
@@ -3185,6 +3236,45 @@ mod tests {
             let inv = auth.invalidations.lock().unwrap();
             assert_eq!(inv.len(), 1);
             assert_eq!(inv[0], "old");
+        }
+
+        #[tokio::test]
+        async fn retries_with_the_token_the_refresh_obtained() {
+            // The refresh after a 401 fetches a token to compare against
+            // the stale one; that token is the one the retry must carry.
+            // A session that mints on every call makes a second fetch
+            // visible as a request bearing a third token, which no mock
+            // answers, and as a third mint.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .and(header("authorization", "Bearer t1"))
+                .respond_with(ResponseTemplate::new(401).set_body_json(json!([{
+                    "errorCode": "INVALID_SESSION_ID",
+                    "message": "Session expired or invalid"
+                }])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .and(header("authorization", "Bearer t2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(MintingAuth::new(server.uri()));
+            let sf = fixture(server.uri(), auth.clone());
+
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+            assert_eq!(
+                auth.mints.load(Ordering::SeqCst),
+                2,
+                "one mint for the first attempt and one for the refresh"
+            );
+            assert_eq!(*auth.invalidations.lock().unwrap(), vec!["t1".to_string()]);
         }
 
         #[tokio::test]
