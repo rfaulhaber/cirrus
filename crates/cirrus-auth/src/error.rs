@@ -22,11 +22,13 @@ pub type AuthResult<T> = Result<T, AuthError>;
 /// Errors produced while acquiring or refreshing a Salesforce OAuth
 /// session.
 ///
-/// The `error_description` carried by [`AuthError::OAuth`] is
-/// server-supplied free text that can include partial token material, so
-/// it is redacted from both the `Display` and `Debug` representations of
-/// this type — only the machine-readable `error` code is shown. Callers
-/// that need the description can read it from the variant field directly.
+/// The `error_description` carried by [`AuthError::OAuth`] is shown by
+/// `Display` and `Debug`: Salesforce lists a dozen causes under
+/// `invalid_grant` alone, and the description is what tells them apart.
+/// It is server-supplied free text, so before it is stored every
+/// non-public value the failed request sent (a secret, a token, an
+/// assertion, a code) is replaced with `[redacted]` and the text is cut
+/// to a few hundred characters.
 ///
 /// Variants that wrap another error ([`HttpClient`](Self::HttpClient),
 /// [`Http`](Self::Http), [`Serialization`](Self::Serialization),
@@ -35,20 +37,29 @@ pub type AuthResult<T> = Result<T, AuthError>;
 /// their own `Display`, so a reporter that walks the chain prints each
 /// message once. Print the chain (anyhow's `{:#}`, for example) to see
 /// the underlying cause; `{}` alone names only the category.
-#[derive(Error)]
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
     /// A required builder field was not set.
     #[error("missing required builder field: {0}")]
     MissingField(&'static str),
 
+    /// A builder field or method argument holds a value the flow cannot
+    /// use: a login URL Salesforce documents as unsupported for the flow,
+    /// key material that is not a private key, two settings that exclude
+    /// each other, or a value over a documented limit. `name` is the
+    /// setter or parameter and `reason` says what is wrong with it. No
+    /// request was made.
+    #[error("invalid {name}: {reason}")]
+    InvalidArgument { name: &'static str, reason: String },
+
     /// OAuth token endpoint returned an error response (`error` /
     /// `error_description` shape from RFC 6749 §5.2).
     ///
-    /// Only the machine-readable `error` code is surfaced via `Display`;
-    /// `error_description` is redacted (see the type-level note) but
-    /// remains available by matching on the field.
-    #[error("OAuth error: {error}")]
+    /// `Display` prints `OAuth error: {error} ({error_description})`, or
+    /// only the code when the endpoint sent no description. The
+    /// description is scrubbed and capped as the type-level note says.
+    #[error("OAuth error: {error}{}", parenthesized(.error_description))]
     OAuth {
         error: String,
         error_description: Option<String>,
@@ -197,6 +208,10 @@ impl AuthError {
     pub(crate) fn clone_for_waiter(&self) -> Self {
         match self {
             Self::MissingField(field) => Self::MissingField(field),
+            Self::InvalidArgument { name, reason } => Self::InvalidArgument {
+                name,
+                reason: reason.clone(),
+            },
             Self::OAuth {
                 error,
                 error_description,
@@ -230,57 +245,12 @@ impl AuthError {
     }
 }
 
-// Hand-written so `OAuth.error_description` is redacted in `{:?}` output —
-// a derived `Debug` would print the raw description verbatim, defeating the
-// redaction applied at every other layer. The `error` code and all other
-// variants are non-sensitive and printed as usual.
-impl std::fmt::Debug for AuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingField(field) => f.debug_tuple("MissingField").field(field).finish(),
-            Self::OAuth {
-                error,
-                error_description,
-            } => f
-                .debug_struct("OAuth")
-                .field("error", error)
-                .field(
-                    "error_description",
-                    &error_description.as_ref().map(|_| "[redacted]"),
-                )
-                .finish(),
-            Self::StateMismatch => f.write_str("StateMismatch"),
-            Self::FlowMismatch => f.write_str("FlowMismatch"),
-            Self::InstanceUrlMismatch {
-                configured,
-                returned,
-            } => f
-                .debug_struct("InstanceUrlMismatch")
-                .field("configured", configured)
-                .field("returned", returned)
-                .finish(),
-            Self::UnexpectedResponse { status } => f
-                .debug_struct("UnexpectedResponse")
-                .field("status", status)
-                .finish(),
-            Self::ResponseTooLarge { status, limit } => f
-                .debug_struct("ResponseTooLarge")
-                .field("status", status)
-                .field("limit", limit)
-                .finish(),
-            Self::InsecureLoginUrl { url } => f
-                .debug_struct("InsecureLoginUrl")
-                .field("url", url)
-                .finish(),
-            Self::Signing(msg) => f.debug_tuple("Signing").field(msg).finish(),
-            Self::Randomness(msg) => f.debug_tuple("Randomness").field(msg).finish(),
-            Self::Other(msg) => f.debug_tuple("Other").field(msg).finish(),
-            Self::HttpClient(e) => f.debug_tuple("HttpClient").field(e).finish(),
-            Self::Http(e) => f.debug_tuple("Http").field(e).finish(),
-            Self::Serialization(e) => f.debug_tuple("Serialization").field(e).finish(),
-            Self::Url(e) => f.debug_tuple("Url").field(e).finish(),
-        }
-    }
+/// ` (description)` for the OAuth variant's `Display`, or nothing when the
+/// endpoint sent no description.
+fn parenthesized(description: &Option<String>) -> String {
+    description
+        .as_deref()
+        .map_or_else(String::new, |text| format!(" ({text})"))
 }
 
 #[cfg(test)]
@@ -289,37 +259,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oauth_error_redacts_description_in_display_and_debug() {
-        // A description carrying token-like material must not surface in
-        // either formatted representation, but must remain readable via
-        // the field.
+    fn oauth_error_shows_the_description_in_display_and_debug() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5
+        // (release 264): the JWT bearer example answers `invalid_grant`
+        // with "Audience validation failed", and the page lists thirteen
+        // causes under that one code which only the description tells
+        // apart.
         let err = AuthError::OAuth {
             error: "invalid_grant".to_string(),
-            error_description: Some("00Dxx!AQ.SECRET_TOKEN_FRAGMENT".to_string()),
+            error_description: Some("Audience validation failed".to_string()),
         };
-
-        let display = err.to_string();
-        assert!(display.contains("invalid_grant"));
-        assert!(
-            !display.contains("SECRET_TOKEN_FRAGMENT"),
-            "Display leaked error_description: {display}"
+        assert_eq!(
+            err.to_string(),
+            "OAuth error: invalid_grant (Audience validation failed)"
         );
-
         let debug = format!("{err:?}");
-        assert!(debug.contains("invalid_grant"));
-        assert!(debug.contains("[redacted]"));
-        assert!(
-            !debug.contains("SECRET_TOKEN_FRAGMENT"),
-            "Debug leaked error_description: {debug}"
-        );
+        assert!(debug.contains("Audience validation failed"), "{debug}");
+        assert!(!debug.contains("[redacted]"), "{debug}");
+    }
 
-        // The description is still programmatically accessible.
-        match err {
-            AuthError::OAuth {
-                error_description, ..
-            } => assert!(error_description.is_some()),
-            other => panic!("expected OAuth, got {other:?}"),
-        }
+    #[test]
+    fn oauth_error_without_a_description_prints_only_the_code() {
+        let err = AuthError::OAuth {
+            error: "invalid_client".to_string(),
+            error_description: None,
+        };
+        assert_eq!(err.to_string(), "OAuth error: invalid_client");
+        assert!(format!("{err:?}").contains("None"));
+    }
+
+    #[test]
+    fn invalid_argument_names_the_argument_and_the_reason() {
+        let err = AuthError::InvalidArgument {
+            name: "login_url",
+            reason: "must be the org's My Domain URL".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid login_url: must be the org's My Domain URL"
+        );
     }
 
     #[test]
@@ -383,18 +361,6 @@ mod tests {
         assert!(
             matches!(cloned, AuthError::Other(ref msg) if msg.starts_with("serialization error: "))
         );
-    }
-
-    #[test]
-    fn oauth_error_debug_shows_none_description_without_redaction_marker() {
-        let err = AuthError::OAuth {
-            error: "invalid_client".to_string(),
-            error_description: None,
-        };
-        let debug = format!("{err:?}");
-        assert!(debug.contains("invalid_client"));
-        assert!(debug.contains("None"));
-        assert!(!debug.contains("[redacted]"));
     }
 
     /// A `reqwest::Error` produced without any network: an invalid default

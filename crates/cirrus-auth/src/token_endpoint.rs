@@ -11,7 +11,7 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::transport::{CollectBodyError, collect_body};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 /// Margin subtracted from a cached token's lifetime when deciding whether
@@ -314,27 +314,66 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
     error: String,
     #[serde(default)]
     error_description: Option<String>,
 }
 
-// `error_description` is server-supplied free text and has historically
-// contained partial token material in some Salesforce error paths.
-// Redact the description so the OAuth error code is the only thing that
-// surfaces in `{:?}`.
-impl std::fmt::Debug for OAuthErrorResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OAuthErrorResponse")
-            .field("error", &self.error)
-            .field(
-                "error_description",
-                &self.error_description.as_ref().map(|_| "[redacted]"),
-            )
-            .finish()
+/// Longest `error_description` kept on an [`AuthError::OAuth`], in
+/// characters. Salesforce's descriptions are one sentence; anything much
+/// longer is an intermediary's page that happened to parse as the error
+/// shape, and the error is printed by loggers.
+const OAUTH_ERROR_DESCRIPTION_CAP: usize = 256;
+
+/// Form parameters whose values are not credentials and may stay readable
+/// when a description echoes them. Every other value the request carried
+/// (`client_id` included, since the crate treats the consumer key as a
+/// credential identifier everywhere else) is scrubbed.
+const PUBLIC_FORM_PARAMETERS: [&str; 6] = [
+    "grant_type",
+    "scope",
+    "redirect_uri",
+    "subject_token_type",
+    "token_handler",
+    "client_assertion_type",
+];
+
+const REDACTED: &str = "[redacted]";
+
+/// The [`AuthError::OAuth`] for a parsed error body: the description is
+/// scrubbed of the request's own form values and capped before it is
+/// stored, so no later `Display` or `Debug` can leak what the request
+/// sent.
+fn oauth_error(response: OAuthErrorResponse, form: &[(&str, &str)]) -> AuthError {
+    AuthError::OAuth {
+        error: response.error,
+        error_description: response
+            .error_description
+            .map(|description| scrub_description(description, form)),
     }
+}
+
+/// Replaces every non-public form value that appears verbatim in
+/// `description` with [`REDACTED`], then cuts the text to
+/// [`OAUTH_ERROR_DESCRIPTION_CAP`] characters. Scrubbing runs first so a
+/// value straddling the cut cannot survive it in part.
+fn scrub_description(description: String, form: &[(&str, &str)]) -> String {
+    let mut text = description;
+    for (name, value) in form {
+        if value.is_empty() || PUBLIC_FORM_PARAMETERS.contains(name) {
+            continue;
+        }
+        if text.contains(value) {
+            text = text.replace(value, REDACTED);
+        }
+    }
+    if let Some((cut, _)) = text.char_indices().nth(OAUTH_ERROR_DESCRIPTION_CAP) {
+        text.truncate(cut);
+        text.push_str("...");
+    }
+    text
 }
 
 /// Whether a grant may be presented again after an attempt whose outcome
@@ -400,21 +439,19 @@ fn status_is_retryable(status: u16) -> bool {
 /// a 429, a 5xx and an ambiguous transport failure are retried only for a
 /// [`GrantReplay::Safe`] grant, up to [`TOKEN_REQUEST_BACKOFF`]'s budget.
 /// On a terminal non-2xx, the body is parsed as the OAuth error shape if
-/// possible; otherwise only the status is surfaced as
+/// possible, with its description scrubbed of the form's own values (see
+/// [`scrub_description`]); otherwise only the status is surfaced as
 /// [`AuthError::UnexpectedResponse`]. Such a body is neither carried nor
 /// logged, since non-standard error pages can echo credentials. A body
 /// over [`TOKEN_RESPONSE_BODY_CAP`] decoded bytes is refused as
 /// [`AuthError::ResponseTooLarge`]; on a 429 or 5xx a replay-safe grant
 /// retries it first, exactly as it would the status alone.
-pub(super) async fn exchange<B>(
+pub(super) async fn exchange(
     http: &reqwest::Client,
     login_url: &str,
-    body: &B,
+    body: &[(&str, &str)],
     replay: GrantReplay,
-) -> AuthResult<TokenResponse>
-where
-    B: Serialize + ?Sized,
-{
+) -> AuthResult<TokenResponse> {
     let url = format!("{login_url}/services/oauth2/token");
     let mut attempt = 0usize;
     let (status, content_type, bytes) = loop {
@@ -501,10 +538,7 @@ where
 
     if !(200..300).contains(&status) {
         if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
-            return Err(AuthError::OAuth {
-                error: oauth_err.error,
-                error_description: oauth_err.error_description,
-            });
+            return Err(oauth_error(oauth_err, body));
         }
         // A body outside the OAuth error shape came from an intermediary
         // (an HTML error page, a proxy), and those tend to echo the form
@@ -865,6 +899,70 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AuthError::OAuth { ref error, .. } if error == "invalid_grant"));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    async fn oauth_error_description(
+        server_body: serde_json::Value,
+        form: &[(&str, &str)],
+    ) -> String {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(server_body))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(&http, &server.uri(), form, GrantReplay::Safe)
+            .await
+            .unwrap_err();
+        match err {
+            AuthError::OAuth {
+                error_description: Some(description),
+                ..
+            } => description,
+            other => panic!("expected an OAuth error with a description, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oauth_error_description_is_scrubbed_of_the_values_the_request_sent() {
+        // The description is free text, so a value echoed from the form
+        // (the secret here, or a token) must not reach a log line through
+        // the error's Display. Public parameters stay readable.
+        let description = oauth_error_description(
+            serde_json::json!({
+                "error": "invalid_client",
+                "error_description":
+                    "secret hunter2 is not the secret of consumer-key-123 for grant client_credentials",
+            }),
+            &[
+                ("grant_type", "client_credentials"),
+                ("client_id", "consumer-key-123"),
+                ("client_secret", "hunter2"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            description,
+            "secret [redacted] is not the secret of [redacted] for grant client_credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oauth_error_description_is_capped_on_a_character_boundary() {
+        let description = oauth_error_description(
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "é".repeat(2_000),
+            }),
+            &[("grant_type", "client_credentials")],
+        )
+        .await;
+        assert!(description.chars().count() <= 300, "{}", description.len());
+        assert!(description.starts_with("éééé"), "{description}");
+        assert!(description.ends_with("..."), "{description}");
     }
 
     #[test]
