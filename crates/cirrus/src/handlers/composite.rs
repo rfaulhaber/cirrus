@@ -441,13 +441,20 @@ impl<T> SObjectCollection<T> {
 /// `attributes.type` that names its sObject.
 ///
 /// `record` is flattened into the same JSON object as `attributes`, so
-/// `T` must serialize as a JSON object (a struct, a map, a
-/// [`serde_json::Value::Object`]). Anything else fails when the request
-/// body is serialized, before any request goes out, as a
+/// `T` should serialize as a JSON object (a struct, a map, a
+/// [`serde_json::Value::Object`]). A `T` that serializes as `null` or as
+/// the unit value contributes no members, which sends a record holding
+/// only its `attributes`. A string, number, boolean or array fails when
+/// the request body is serialized, before any request goes out, as a
 /// [`CirrusError::Http`] wrapping reqwest's request-builder error, whose
 /// own [`source`](std::error::Error::source) is the serialization error.
 /// `T` must not carry an `attributes` member of its own, which would be
 /// written a second time.
+///
+/// None of this is checked when the record is built. Callers who want a
+/// row refused up front, and a row's own `attributes` member dropped or
+/// checked against the target type, send their rows through
+/// [`CompositeSObjectsHandler::create_records`] and its siblings.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectionRecord<T> {
     /// The `attributes` map Salesforce requires on every record.
@@ -500,6 +507,80 @@ fn check_collection_size(count: usize) -> CirrusResult<()> {
         });
     }
     Ok(())
+}
+
+/// Checks `records` against the cap and the per-row rules of the
+/// `*_records` helpers and wraps them as `sobject` rows.
+///
+/// Each row is serialized to JSON up front, so a row that would flatten
+/// into a blank record is refused before any request instead of being sent,
+/// and a row's own `attributes` member is dropped in favour of the helper's
+/// (or refused when it names another type) instead of going out as a
+/// second `attributes` key.
+fn collection_body<T: Serialize>(
+    sobject: &str,
+    records: &[T],
+    all_or_none: bool,
+) -> CirrusResult<SObjectCollection<Value>> {
+    check_collection_size(records.len())?;
+    let rows = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| collection_row(sobject, index, record))
+        .collect::<CirrusResult<Vec<_>>>()?;
+    Ok(SObjectCollection::new(sobject, rows).all_or_none(all_or_none))
+}
+
+/// Serializes row `index` as a JSON object without an `attributes` member,
+/// which the caller replaces with one naming `sobject`.
+fn collection_row<T: Serialize>(sobject: &str, index: usize, record: &T) -> CirrusResult<Value> {
+    let invalid = |message: String| CirrusError::InvalidInput {
+        field: "records",
+        message,
+    };
+    let value = serde_json::to_value(record)?;
+    let Value::Object(mut fields) = value else {
+        return Err(invalid(format!(
+            "row {index} serializes as {}, not a JSON object",
+            json_kind(&value)
+        )));
+    };
+    if let Some(attributes) = fields.get("attributes") {
+        match attributes {
+            // An `Option` attributes field left as `None` carries no type
+            // and is treated like an absent member.
+            Value::Null => {}
+            Value::Object(members) => match members.get("type") {
+                None => {}
+                Some(Value::String(declared)) if declared == sobject => {}
+                Some(declared) => {
+                    return Err(invalid(format!(
+                        "row {index} carries attributes.type {declared} but the call targets {sobject:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(invalid(format!(
+                    "row {index} carries attributes that serialize as {}, not an object",
+                    json_kind(other)
+                )));
+            }
+        }
+        fields.remove("attributes");
+    }
+    Ok(Value::Object(fields))
+}
+
+/// How an error message names the JSON type of `value`.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Handler for `/composite/sobjects` — the SObject Collections endpoints.
@@ -618,22 +699,31 @@ impl CompositeSObjectsHandler<'_> {
     ///
     /// Each row must serialize as a JSON object of field values; the
     /// `attributes.type` is added from `sobject`. `all_or_none` makes the
-    /// call transactional. A longer slice is refused with
-    /// [`CirrusError::InvalidInput`] before any request, and a row that
-    /// doesn't serialize as an object fails before any request too (see
-    /// [`CollectionRecord`]). An empty slice is sent as an empty `records`
-    /// array: the Collections pages do not document Salesforce's response
-    /// to that, so there is no client-side guard. To create records of
-    /// several types in one call, build the body with
-    /// [`SObjectCollection::push`].
+    /// call transactional. Before any request goes out:
+    ///
+    /// - a longer slice is refused with [`CirrusError::InvalidInput`];
+    /// - a row that fails to serialize is [`CirrusError::Serialization`];
+    /// - a row that serializes as anything but a JSON object, `null`
+    ///   included, is [`CirrusError::InvalidInput`] naming the row's
+    ///   zero-based index;
+    /// - a row that carries an `attributes` member (as every query-result
+    ///   row does) has it replaced by the one naming `sobject` when it is
+    ///   `null` or an object whose `type` is absent or equals `sobject`; an
+    ///   `attributes.type` naming another sObject, a non-string `type`, or
+    ///   an `attributes` that is not an object is
+    ///   [`CirrusError::InvalidInput`] too.
+    ///
+    /// An empty slice is sent as an empty `records` array: the Collections
+    /// pages do not document Salesforce's response to that, so there is no
+    /// client-side guard. To create records of several types in one call,
+    /// build the body with [`SObjectCollection::push`].
     pub async fn create_records<T: Serialize>(
         &self,
         sobject: &str,
         records: &[T],
         all_or_none: bool,
     ) -> CirrusResult<Vec<SObjectCollectionResult>> {
-        check_collection_size(records.len())?;
-        self.create(&SObjectCollection::new(sobject, records.iter()).all_or_none(all_or_none))
+        self.create(&collection_body(sobject, records, all_or_none)?)
             .await
     }
 
@@ -642,16 +732,15 @@ impl CompositeSObjectsHandler<'_> {
     /// [`SObjectCollection`] for `sobject`.
     ///
     /// Each row must carry its `id` and serialize as a JSON object. The
-    /// cap, `all_or_none`, the errors and the handling of an empty slice
-    /// are those of [`create_records`](Self::create_records).
+    /// cap, `all_or_none`, the row checks, the errors and the handling of
+    /// an empty slice are those of [`create_records`](Self::create_records).
     pub async fn update_records<T: Serialize>(
         &self,
         sobject: &str,
         records: &[T],
         all_or_none: bool,
     ) -> CirrusResult<Vec<SObjectCollectionResult>> {
-        check_collection_size(records.len())?;
-        self.update(&SObjectCollection::new(sobject, records.iter()).all_or_none(all_or_none))
+        self.update(&collection_body(sobject, records, all_or_none)?)
             .await
     }
 
@@ -661,8 +750,8 @@ impl CompositeSObjectsHandler<'_> {
     ///
     /// Each row must carry the external ID field's value, must not set
     /// `id`, and must serialize as a JSON object. The cap, `all_or_none`,
-    /// the errors and the handling of an empty slice are those of
-    /// [`create_records`](Self::create_records).
+    /// the row checks, the errors and the handling of an empty slice are
+    /// those of [`create_records`](Self::create_records).
     pub async fn upsert_records<T: Serialize>(
         &self,
         sobject: &str,
@@ -670,11 +759,10 @@ impl CompositeSObjectsHandler<'_> {
         records: &[T],
         all_or_none: bool,
     ) -> CirrusResult<Vec<SObjectCollectionResult>> {
-        check_collection_size(records.len())?;
         self.upsert(
             sobject,
             external_id_field,
-            &SObjectCollection::new(sobject, records.iter()).all_or_none(all_or_none),
+            &collection_body(sobject, records, all_or_none)?,
         )
         .await
     }
@@ -2405,6 +2493,46 @@ mod tests {
             .unwrap();
     }
 
+    /// Asserts `err` is the `records` [`CirrusError::InvalidInput`] and its
+    /// message names every one of `needles`.
+    fn assert_invalid_records(err: crate::CirrusError, needles: &[&str]) {
+        match err {
+            crate::CirrusError::InvalidInput { field, message } => {
+                assert_eq!(field, "records");
+                for needle in needles {
+                    assert!(message.contains(needle), "{needle:?} not in {message}");
+                }
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_reject_a_row_that_serializes_as_null_before_any_request() {
+        // `Value::Null` and `None` flatten to no members, so sent as they
+        // are they would go out as a blank row holding only `attributes`.
+        let server = MockServer::start().await;
+        expect_no_requests(&server).await;
+
+        let sf = fixture(server.uri());
+        let collections = sf.composite().sobjects();
+        let err = collections
+            .create_records("Account", &[json!({"Name": "Acme"}), Value::Null], false)
+            .await
+            .unwrap_err();
+        assert_invalid_records(err, &["row 1", "null", "not a JSON object"]);
+        let err = collections
+            .upsert_records(
+                "Account",
+                "MyExtId__c",
+                &[None::<Value>, Some(json!({"Name": "Acme"}))],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_invalid_records(err, &["row 0", "null", "not a JSON object"]);
+    }
+
     #[tokio::test]
     async fn sobjects_records_helpers_reject_a_row_that_is_not_an_object_before_any_request() {
         let server = MockServer::start().await;
@@ -2417,11 +2545,286 @@ mod tests {
             .create_records("Account", &[json!("Acme")], false)
             .await
             .unwrap_err();
-        // The body is attached with reqwest's `json`, which records a
+        assert_invalid_records(err, &["row 0", "a string", "not a JSON object"]);
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_surface_a_row_serialization_failure_before_any_request() {
+        // A map with a non-string key has no JSON form.
+        let server = MockServer::start().await;
+        expect_no_requests(&server).await;
+        let row = BTreeMap::from([((1, 2), "Acme")]);
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .composite()
+            .sobjects()
+            .create_records("Account", &[row], false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::CirrusError::Serialization(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sobject_collection_with_a_non_object_record_fails_as_a_request_builder_error() {
+        // Used directly, `CollectionRecord` flattens its record into the
+        // body; the body is attached with reqwest's `json`, which records a
         // serialization failure on the request builder.
+        let server = MockServer::start().await;
+        expect_no_requests(&server).await;
+        let collection = SObjectCollection {
+            all_or_none: false,
+            records: vec![CollectionRecord::new("Account", json!("Acme"))],
+        };
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .composite()
+            .sobjects()
+            .create(&collection)
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, crate::CirrusError::Http(source) if source.is_builder()),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn collection_record_with_a_null_or_unit_record_contributes_no_members() {
+        let expected = json!({"attributes": {"type": "Account"}});
+        assert_eq!(
+            serde_json::to_value(CollectionRecord::new("Account", Value::Null)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(CollectionRecord::new("Account", ())).unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_replace_a_rows_own_attributes_with_the_target_type() {
+        // Wire-shape provenance: each row is the `recentItems` record shape
+        // of
+        // https://developer.salesforce.com/docs/platform/api-rest/guide/dome-sobject-basic-info.html
+        // (`attributes` holding `type` and `url`, then `Id` and `Name`), the
+        // shape every query-result row has; the second row's values and the
+        // mocked response are invented. The raw bytes are inspected because
+        // a parsed body would hide a duplicated `attributes` key.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/services/data/v66.0/composite/sobjects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": "001D000000INjVeIAL", "success": true, "errors": []},
+                {"id": "001D000000INjVfIAL", "success": true, "errors": []}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rows = [
+            json!({
+                "attributes": {
+                    "type": "Account",
+                    "url": "/services/data/v66.0/sobjects/Account/001D000000INjVeIAL"
+                },
+                "Id": "001D000000INjVeIAL",
+                "Name": "asdasdasd"
+            }),
+            json!({
+                "attributes": {
+                    "type": "Account",
+                    "url": "/services/data/v66.0/sobjects/Account/001D000000INjVfIAL"
+                },
+                "Id": "001D000000INjVfIAL",
+                "Name": "Acme"
+            }),
+        ];
+
+        let sf = fixture(server.uri());
+        sf.composite()
+            .sobjects()
+            .update_records("Account", &rows, false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let raw = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(raw.matches("\"attributes\"").count(), rows.len(), "{raw}");
+        assert!(!raw.contains("\"url\""), "{raw}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap(),
+            json!({
+                "allOrNone": false,
+                "records": [
+                    {"attributes": {"type": "Account"}, "Id": "001D000000INjVeIAL", "Name": "asdasdasd"},
+                    {"attributes": {"type": "Account"}, "Id": "001D000000INjVfIAL", "Name": "Acme"}
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_drop_a_row_attributes_member_that_names_no_type() {
+        // Wire-shape provenance: the row shape is invented; the docs do not
+        // show an `attributes` member without a `type`.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/sobjects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.composite()
+            .sobjects()
+            .create_records(
+                "Account",
+                &[json!({"attributes": {"url": "/x"}, "Name": "Acme"})],
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let raw = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(raw.matches("\"attributes\"").count(), 1, "{raw}");
+        assert!(!raw.contains("\"url\""), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_drop_a_null_row_attributes_member() {
+        // Wire-shape provenance: the row shape is invented; a struct whose
+        // `attributes: Option<_>` field is `None` serializes it as `null`.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/data/v66.0/composite/sobjects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        sf.composite()
+            .sobjects()
+            .create_records(
+                "Account",
+                &[json!({"attributes": null, "Name": "Acme"})],
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let raw = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert_eq!(raw.matches("\"attributes\"").count(), 1, "{raw}");
+        assert!(raw.contains("\"type\":\"Account\""), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_reject_a_row_typed_as_another_sobject_before_any_request() {
+        let server = MockServer::start().await;
+        expect_no_requests(&server).await;
+        let rows = [
+            json!({"MyExtId__c": "AAA"}),
+            json!({"MyExtId__c": "BBB"}),
+            json!({"attributes": {"type": "Contact"}, "MyExtId__c": "CCC"}),
+        ];
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .composite()
+            .sobjects()
+            .upsert_records("Account", "MyExtId__c", &rows, false)
+            .await
+            .unwrap_err();
+        assert_invalid_records(
+            err,
+            &[
+                "row 2",
+                "attributes.type \"Contact\"",
+                "targets \"Account\"",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_reject_a_row_whose_attributes_are_not_an_object() {
+        let server = MockServer::start().await;
+        expect_no_requests(&server).await;
+
+        let sf = fixture(server.uri());
+        let err = sf
+            .composite()
+            .sobjects()
+            .create_records("Account", &[json!({"attributes": "Account"})], false)
+            .await
+            .unwrap_err();
+        assert_invalid_records(err, &["row 0", "attributes", "a string", "not an object"]);
+    }
+
+    #[tokio::test]
+    async fn sobjects_records_helpers_send_an_empty_slice_as_an_empty_records_array() {
+        // Wire-shape provenance: the Collections pages do not document
+        // Salesforce's response to an empty `records` array, so the mocked
+        // `[]` is invented; only the request is under test.
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let rows: [Value; 0] = [];
+
+        let sf = fixture(server.uri());
+        let collections = sf.composite().sobjects();
+        collections
+            .create_records("Account", &rows, false)
+            .await
+            .unwrap();
+        collections
+            .update_records("Account", &rows, false)
+            .await
+            .unwrap();
+        collections
+            .upsert_records("Account", "MyExtId__c", &rows, false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent: Vec<(String, String, String)> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.method.to_string(),
+                    request.url.path().to_owned(),
+                    String::from_utf8(request.body.clone()).unwrap(),
+                )
+            })
+            .collect();
+        let empty = r#"{"allOrNone":false,"records":[]}"#.to_owned();
+        assert_eq!(
+            sent,
+            vec![
+                (
+                    "POST".to_owned(),
+                    "/services/data/v66.0/composite/sobjects".to_owned(),
+                    empty.clone()
+                ),
+                (
+                    "PATCH".to_owned(),
+                    "/services/data/v66.0/composite/sobjects".to_owned(),
+                    empty.clone()
+                ),
+                (
+                    "PATCH".to_owned(),
+                    "/services/data/v66.0/composite/sobjects/Account/MyExtId__c".to_owned(),
+                    empty
+                ),
+            ]
         );
     }
 }
