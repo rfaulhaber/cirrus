@@ -1198,6 +1198,23 @@ pub struct CompositeError {
 /// [`CompositeSubresponse::is_error`]. A conditional request's 304 is a
 /// success and a 300 is neither; see those methods. The transactional
 /// rollback flag is on the *request* side (`allOrNone`).
+///
+/// # Rollback under `allOrNone`
+///
+/// When the request sets `allOrNone: true` and any subrequest fails,
+/// Salesforce rolls the whole composite back, so none of it was
+/// committed, whatever the other subresponses show. A subresponse for an
+/// sObject Collections call can still answer 200 with rows that read
+/// `success: true`. Salesforce's `allOrNone` page, on a response of that
+/// shape, says: "Even though the response body for sObject Collections
+/// request shows `"success" : true` for the creation of the first
+/// Account, the fact that the Composite request is rolled back means
+/// that the Account creation is rolled back."
+///
+/// With an outer `allOrNone: true`, then, any
+/// [`is_error`](CompositeSubresponse::is_error) subresponse means nothing
+/// in the composite was committed. Decide that from the whole response,
+/// not entry by entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeResponse {
     /// One entry per sub-request, ordered by submission unless
@@ -1241,6 +1258,11 @@ impl CompositeSubresponse {
     /// the resulting 304 in a response it calls successful. A 300 Multiple
     /// Choices — several records matched an external ID — is neither a
     /// success nor an [`error`](Self::is_error); inspect `body`.
+    ///
+    /// This describes the subrequest alone. When the composite request set
+    /// `allOrNone: true`, a successful subresponse was still rolled back if
+    /// any other subresponse is an error; see
+    /// [`CompositeResponse`](CompositeResponse#rollback-under-allornone).
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.http_status_code) || self.http_status_code == 304
     }
@@ -1263,6 +1285,12 @@ impl CompositeSubresponse {
 /// rolled-back entries carry `success: false` with an
 /// `ALL_OR_NONE_OPERATION_ROLLED_BACK` error — and, on update, upsert and
 /// delete, still carry their `id`.
+///
+/// When these entries are the body of a subresponse in a composite
+/// request with `allOrNone: true`, a failure elsewhere in that composite
+/// rolls the whole call back, and a `success: true` entry here did not
+/// stick. See
+/// [`CompositeResponse`](CompositeResponse#rollback-under-allornone).
 ///
 /// `created` is reported only by the upsert endpoint, and not on every
 /// entry: `Some(true)` when the upsert inserted a record, `Some(false)`
@@ -1639,6 +1667,41 @@ mod tests {
                 "fields": ["Id"]
             }]
         }])
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-allornone.html
+    /// "Case 4: `outerFlag` = `true`, `innerFlag` = `false`", the response
+    /// body verbatim. The page's request names the sObject Collections
+    /// subrequest `newAccounts` while this response prints its
+    /// `referenceId` as `collection1`; the response is kept as printed.
+    fn composite_all_or_none_case_4_example() -> Value {
+        json!({
+            "compositeResponse": [{
+                "body": [{
+                    "id": "001R00000066cndIAA",
+                    "success": true,
+                    "errors": []
+                }, {
+                    "success": false,
+                    "errors": [{
+                        "statusCode": "DUPLICATES_DETECTED",
+                        "message": "Use one of these records?",
+                        "fields": []
+                    }]
+                }],
+                "httpHeaders": {},
+                "httpStatusCode": 200,
+                "referenceId": "collection1"
+            }, {
+                "body": [{
+                    "errorCode": "PROCESSING_HALTED",
+                    "message": "The transaction was rolled back since another operation in the same transaction failed."
+                }],
+                "httpHeaders": {},
+                "httpStatusCode": 400,
+                "referenceId": "newContact"
+            }]
+        })
     }
 
     /// A query response with more pages to fetch: `done` is `false` and
@@ -2722,6 +2785,30 @@ mod tests {
         assert!(!sub(300).is_success() && !sub(300).is_error());
         assert!(!sub(400).is_success() && sub(400).is_error());
         assert!(!sub(500).is_success() && sub(500).is_error());
+    }
+
+    #[test]
+    fn parses_the_all_or_none_case_4_response() {
+        let body = composite_all_or_none_case_4_example().to_string();
+        let resp: CompositeResponse = parse_response_bytes(200, body.as_bytes()).unwrap();
+        assert_eq!(resp.composite_response.len(), 2);
+
+        // The collections subrequest answers 200 and its first row says
+        // `success: true`, yet the outer `allOrNone: true` rolled it back
+        // along with the failed Contact create.
+        let collections = &resp.composite_response[0];
+        assert_eq!(collections.http_status_code, 200);
+        assert!(collections.is_success());
+        let rows: Vec<SObjectCollectionResult> =
+            serde_json::from_value(collections.body.clone()).unwrap();
+        assert!(rows[0].success);
+        assert_eq!(rows[1].errors[0].status_code, "DUPLICATES_DETECTED");
+
+        let halted = &resp.composite_response[1];
+        assert_eq!(halted.http_status_code, 400);
+        assert!(halted.is_error());
+        let errors: Vec<SalesforceError> = serde_json::from_value(halted.body.clone()).unwrap();
+        assert_eq!(errors[0].error_code, "PROCESSING_HALTED");
     }
 
     #[test]
