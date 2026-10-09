@@ -17,6 +17,7 @@
 //! prove it terminates cleanly against real responses.
 
 use crate::common::try_init_client;
+use cirrus::soql;
 use futures::StreamExt;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -93,7 +94,10 @@ async fn query_as_deserializes_into_typed_records() {
     let cleanup_id = created.id.clone();
 
     let result = async {
-        let soql = format!("SELECT Id, Name FROM Account WHERE Name = '{name}'");
+        let soql = format!(
+            "SELECT Id, Name FROM Account WHERE Name = {}",
+            soql::quote(&name)
+        );
         let result = sf
             .query_as::<AccountRow>(&soql)
             .await
@@ -159,8 +163,10 @@ async fn query_stream_matches_eager_query_results() {
     let result = async {
         // Bound the WHERE clause by our marker prefix; LIKE with %
         // suffix matches all four numbered records.
-        let soql =
-            format!("SELECT Id, Name FROM Account WHERE Name LIKE '{base_marker}-%' ORDER BY Name");
+        let soql = format!(
+            "SELECT Id, Name FROM Account WHERE Name LIKE '{}-%' ORDER BY Name",
+            soql::escape_like(&base_marker)
+        );
         let stream = sf.query_stream_as::<AccountRow>(&soql);
         let rows: Vec<_> = stream
             .collect::<Vec<_>>()
@@ -202,7 +208,10 @@ async fn query_all_includes_soft_deleted_records() {
 
     // Plain query should NOT see it (it's soft-deleted in the Recycle Bin).
     let plain = sf
-        .query(&format!("SELECT Id FROM Account WHERE Name = '{name}'"))
+        .query(&format!(
+            "SELECT Id FROM Account WHERE Name = {}",
+            soql::quote(&name)
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -213,7 +222,8 @@ async fn query_all_includes_soft_deleted_records() {
     // queryAll SHOULD see it.
     let all = sf
         .query_all(&format!(
-            "SELECT Id, IsDeleted FROM Account WHERE Name = '{name}'"
+            "SELECT Id, IsDeleted FROM Account WHERE Name = {}",
+            soql::quote(&name)
         ))
         .await
         .unwrap();

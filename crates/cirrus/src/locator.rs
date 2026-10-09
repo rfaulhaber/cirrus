@@ -87,6 +87,17 @@ pub(crate) fn is_api_version_segment(segment: &str) -> bool {
         .is_some_and(|(major, minor)| digits(major) && digits(minor))
 }
 
+/// The `(major, minor)` of a `vNN.N` API version segment, for comparing
+/// versions. `None` when `segment` is not a version segment or either
+/// number is too long for `u32`.
+pub(crate) fn api_version_number(segment: &str) -> Option<(u32, u32)> {
+    if !is_api_version_segment(segment) {
+        return None;
+    }
+    let (major, minor) = segment.get(1..)?.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 fn describe(shapes: &[&[Segment]]) -> String {
     let one = |shape: &&[Segment]| {
         shape
@@ -188,5 +199,16 @@ mod tests {
         assert!(!is_api_version_segment("v66."));
         assert!(!is_api_version_segment("v.0"));
         assert!(!is_api_version_segment("latest"));
+    }
+
+    #[test]
+    fn api_version_number_reads_the_pair_and_orders_as_a_version() {
+        assert_eq!(api_version_number("v66.0"), Some((66, 0)));
+        assert_eq!(api_version_number("v041.10"), Some((41, 10)));
+        assert_eq!(api_version_number("latest"), None);
+        assert_eq!(api_version_number("66.0"), None);
+        assert_eq!(api_version_number("v99999999999.0"), None);
+        assert!(api_version_number("v41.0") > api_version_number("v40.9"));
+        assert!(api_version_number("v9.0") < api_version_number("v41.0"));
     }
 }

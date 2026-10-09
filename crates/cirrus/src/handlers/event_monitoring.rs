@@ -263,7 +263,9 @@ mod tests {
     async fn download_url_accepts_instance_relative_path_from_query() {
         // Mirrors the LogFile field shape from dome_event_log_file_query
         // doc: a /services/data/v66.0/... path that may carry a
-        // different API version than the client's configured one.
+        // different API version than the client's configured one. The
+        // client is built for v61.0 so that rebuilding the path from the
+        // client's version, instead of sending it as issued, fails here.
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -271,10 +273,24 @@ mod tests {
                 "/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_string("X,Y\n1,2\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/services/data/v61.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
             .mount(&server)
             .await;
 
-        let sf = fixture(server.uri());
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder()
+            .auth(auth)
+            .api_version("v61.0")
+            .build()
+            .unwrap();
         let bytes = sf
             .event_monitoring()
             .download_url("/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile")
