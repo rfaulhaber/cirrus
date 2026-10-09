@@ -460,9 +460,7 @@ impl<T> CollectionRecord<T> {
     /// Tags `record` as a `sobject` row.
     pub fn new(sobject: &str, record: T) -> Self {
         Self {
-            attributes: RecordAttributes {
-                sobject_type: sobject.to_string(),
-            },
+            attributes: RecordAttributes::new(sobject),
             record,
         }
     }
@@ -473,10 +471,20 @@ impl<T> CollectionRecord<T> {
 /// Carries only `type`. A collection that inserts or updates blob data
 /// needs more attribute values than this models.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct RecordAttributes {
     /// API name of the record's sObject, e.g. `"Account"`.
     #[serde(rename = "type")]
     pub sobject_type: String,
+}
+
+impl RecordAttributes {
+    /// Attributes naming `sobject_type` as the record's sObject.
+    pub fn new(sobject_type: impl Into<String>) -> Self {
+        Self {
+            sobject_type: sobject_type.into(),
+        }
+    }
 }
 
 /// Refuses a record list longer than [`COLLECTION_MAX_RECORDS`].
@@ -606,8 +614,11 @@ impl CompositeSObjectsHandler<'_> {
     /// call transactional. A longer slice is refused with
     /// [`CirrusError::InvalidInput`] before any request, and a row that
     /// doesn't serialize as an object fails before any request too (see
-    /// [`CollectionRecord`]). To create records of several types in one
-    /// call, build the body with [`SObjectCollection::push`].
+    /// [`CollectionRecord`]). An empty slice is sent as an empty `records`
+    /// array: the Collections pages do not document Salesforce's response
+    /// to that, so there is no client-side guard. To create records of
+    /// several types in one call, build the body with
+    /// [`SObjectCollection::push`].
     pub async fn create_records<T: Serialize>(
         &self,
         sobject: &str,
@@ -624,8 +635,8 @@ impl CompositeSObjectsHandler<'_> {
     /// [`SObjectCollection`] for `sobject`.
     ///
     /// Each row must carry its `id` and serialize as a JSON object. The
-    /// cap, `all_or_none` and the errors are those of
-    /// [`create_records`](Self::create_records).
+    /// cap, `all_or_none`, the errors and the handling of an empty slice
+    /// are those of [`create_records`](Self::create_records).
     pub async fn update_records<T: Serialize>(
         &self,
         sobject: &str,
@@ -642,8 +653,8 @@ impl CompositeSObjectsHandler<'_> {
     /// `records` in an [`SObjectCollection`] for `sobject`.
     ///
     /// Each row must carry the external ID field's value, must not set
-    /// `id`, and must serialize as a JSON object. The cap, `all_or_none`
-    /// and the errors are those of
+    /// `id`, and must serialize as a JSON object. The cap, `all_or_none`,
+    /// the errors and the handling of an empty slice are those of
     /// [`create_records`](Self::create_records).
     pub async fn upsert_records<T: Serialize>(
         &self,
@@ -2207,6 +2218,14 @@ mod tests {
                     {"attributes": {"type": "Contact"}, "LastName": "Doe"}
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn record_attributes_new_serializes_to_the_type_member() {
+        assert_eq!(
+            serde_json::to_value(RecordAttributes::new("Account")).unwrap(),
+            json!({"type": "Account"})
         );
     }
 
