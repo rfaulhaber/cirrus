@@ -42,6 +42,7 @@
 //! # }
 //! ```
 
+mod byte_stream;
 mod error;
 pub mod handlers;
 mod locator;
@@ -71,14 +72,16 @@ pub use cirrus_auth as auth;
 pub use reqwest;
 
 pub use auth::{AuthError, AuthSession, SharedAuth};
+pub use byte_stream::ByteStream;
 pub use bytes::Bytes;
 pub use error::{CirrusError, CirrusResult, SalesforceError};
 pub use handlers::bulk::{
     BulkIngestSpec, BulkJobListOptions, BulkQuerySpec, MAX_MULTIPART_JOB_DATA_CHARS,
 };
 pub use handlers::composite::{
-    BatchRequest, BatchSubrequest, COLLECTION_MAX_RECORDS, CollectionRecord, CompositeRequest,
-    CompositeSubrequest, RecordAttributes, SObjectCollection,
+    BatchRequest, BatchSubrequest, COLLECTION_MAX_RECORDS, CollectionRecord, CompositeGraph,
+    CompositeGraphRequest, CompositeRequest, CompositeSubrequest, RecordAttributes,
+    SObjectCollection,
 };
 pub use handlers::metadata::{
     DeployDetails, DeployMessage, DeployOptions, DeployRequest, DeployResult, DeployStatus,
@@ -94,10 +97,10 @@ pub use response::{
     ApiVersion, BatchResponse, BatchSubresult, BulkColumnDelimiter, BulkIngestJob, BulkJobList,
     BulkJobState, BulkJobStateChange, BulkJobSummary, BulkJobType, BulkLineEnding, BulkOperation,
     BulkQueryJob, BulkQueryResults, BulkResultPage, BulkResultPages, CompositeError,
-    CompositeResponse, CompositeSubresponse, CompositeTreeResponse, CompositeTreeResult,
-    DescribeGlobal, EventLogFileRecord, ExecuteAnonymousResult, Limit, OrgLimits, QueryResult,
-    RawBody, RawResponse, SObjectCollectionResult, SObjectCreateResult, SObjectMetadata,
-    SearchResult,
+    CompositeGraphResponse, CompositeGraphResult, CompositeResponse, CompositeSubresponse,
+    CompositeTreeResponse, CompositeTreeResult, DescribeGlobal, EventLogFileRecord,
+    ExecuteAnonymousResult, Limit, OrgLimits, QueryResult, RawBody, RawResponse,
+    SObjectCollectionResult, SObjectCreateResult, SObjectMetadata, SearchResult,
 };
 pub use retry::{Replay, RetryPolicy};
 
@@ -306,6 +309,42 @@ struct JsonRequest<'a, Q: ?Sized, B: ?Sized> {
     query: Option<&'a Q>,
     headers: &'a [(&'a str, &'a str)],
     body: Option<&'a B>,
+}
+
+/// What one attempt's response became once `finish` handled its body.
+enum Settled<T> {
+    /// The response is the attempt's answer, good or bad.
+    Final(CirrusResult<T>),
+    /// The body died mid-stream, which shares a retry decision with a
+    /// request that never got a response.
+    Transport(CirrusError),
+}
+
+/// Collects a body under `cap` and settles the attempt with `parse`: the
+/// finish step shared by every path that reads a body whole, and by the
+/// streaming path for the error bodies it still reads.
+async fn settle_collected<T>(
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    response: reqwest::Response,
+    cap: usize,
+    parse: impl FnOnce(u16, reqwest::header::HeaderMap, bytes::Bytes) -> CirrusResult<T>,
+) -> Settled<T> {
+    // A terminal 429 or 5xx hands its hint to the caller, who may own
+    // the retries this policy does not make. Read before the headers
+    // move into the parser.
+    let retry_after = retry::parse_retry_after(&headers);
+    match collect_body(response, cap).await {
+        Ok(bytes) => Settled::Final(
+            parse(status, headers, bytes).map_err(|e| e.with_retry_after(retry_after)),
+        ),
+        Err(CollectBodyError::TooLarge { limit }) => {
+            Settled::Final(Err(CirrusError::ResponseTooLarge { status, limit }))
+        }
+        Err(CollectBodyError::Transport(e)) => Settled::Transport(e.into()),
+        // `CollectBodyError` is `non_exhaustive`.
+        Err(other) => Settled::Transport(CirrusError::InvalidResponse(other.to_string())),
+    }
 }
 
 /// Outcome of the shared 401 auth-refresh decision run at the tail of
@@ -1139,6 +1178,45 @@ impl Cirrus {
         Ok(AuthRetry::Retry(fresh))
     }
 
+    /// [`Self::dispatch_with`] for a body read whole: collects it under
+    /// the 2xx cap, or the fixed non-2xx cap, and hands the bytes to
+    /// `parse` with the bearer token the attempt carried, so a path that
+    /// keeps body text on success can scrub it as the error path does.
+    async fn dispatch<T, MakeReq, Parse>(
+        &self,
+        method: &reqwest::Method,
+        url: &str,
+        replay: retry::Replay,
+        headers: &[(&str, &str)],
+        make_request: MakeReq,
+        parse: Parse,
+    ) -> CirrusResult<T>
+    where
+        MakeReq: Fn(&str) -> CirrusResult<reqwest::RequestBuilder>,
+        Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes, &str) -> CirrusResult<T>,
+    {
+        let parse = &parse;
+        self.dispatch_with(
+            method,
+            url,
+            replay,
+            headers,
+            make_request,
+            |status, headers, response, token| async move {
+                let cap = if (200..300).contains(&status) {
+                    self.max_response_size.unwrap_or(usize::MAX)
+                } else {
+                    NON_SUCCESS_BODY_CAP
+                };
+                settle_collected(status, headers, response, cap, |status, headers, bytes| {
+                    parse(status, headers, bytes, &token)
+                })
+                .await
+            },
+        )
+        .await
+    }
+
     /// Shared request loop behind every send path.
     ///
     /// Two nested retry layers, each with its own budget:
@@ -1163,29 +1241,33 @@ impl Cirrus {
     /// retrying. `headers` are the caller's request headers, checked
     /// here before any request and attached to every attempt, so a
     /// malformed pair is [`CirrusError::InvalidHeader`] rather than the
-    /// builder failure reqwest would defer to `send`. `parse` maps the
-    /// terminal response into the caller's result shape, and receives
-    /// the bearer token the attempt carried so a path that keeps body
-    /// text on success can scrub it as the error path does.
-    /// `Sforce-Limit-Info` capture happens here, on every response, so
-    /// no send path can forget it.
+    /// builder failure reqwest would defer to `send`. `finish` decides
+    /// what a response that is not being retried becomes: it is where
+    /// the body is read ([`Self::dispatch`]), or deliberately left
+    /// unread ([`Self::fetch_stream`]). It receives the attempt's token
+    /// owned, so the future it returns borrows nothing from its
+    /// arguments: an `AsyncFn` taking `&str` would leave that future's
+    /// `Send` unprovable for every lifetime, and every public send path
+    /// has to stay `Send`. `Sforce-Limit-Info` capture happens here, on
+    /// every response, so no send path can forget it.
     ///
     /// `replay` replaces the method-derived idempotency assumption where
     /// the HTTP method misstates an endpoint's effect: Apex REST,
     /// anonymous Apex and the Bulk job-data upload opt out, the sObject
     /// Collections `POST` retrieve opts in.
-    async fn dispatch<T, MakeReq, Parse>(
+    async fn dispatch_with<T, MakeReq, Finish, Fut>(
         &self,
         method: &reqwest::Method,
         url: &str,
         replay: retry::Replay,
         headers: &[(&str, &str)],
         make_request: MakeReq,
-        parse: Parse,
+        finish: Finish,
     ) -> CirrusResult<T>
     where
         MakeReq: Fn(&str) -> CirrusResult<reqwest::RequestBuilder>,
-        Parse: Fn(u16, reqwest::header::HeaderMap, bytes::Bytes, &str) -> CirrusResult<T>,
+        Finish: Fn(u16, reqwest::header::HeaderMap, reqwest::Response, String) -> Fut,
+        Fut: Future<Output = Settled<T>>,
     {
         self.check_transport_security(url)?;
         let headers = validate_headers(headers)?;
@@ -1239,27 +1321,9 @@ impl Cirrus {
                             continue;
                         }
 
-                        let cap = if (200..300).contains(&status) {
-                            self.max_response_size.unwrap_or(usize::MAX)
-                        } else {
-                            NON_SUCCESS_BODY_CAP
-                        };
-                        // A terminal 429 or 5xx hands its hint to the
-                        // caller, who may own the retries this policy
-                        // does not make. Read before the headers move
-                        // into the parser.
-                        let retry_after = retry::parse_retry_after(&headers);
-                        match collect_body(response, cap).await {
-                            Ok(bytes) => {
-                                break parse(status, headers, bytes, &token)
-                                    .map_err(|e| e.with_retry_after(retry_after));
-                            }
-                            Err(CollectBodyError::TooLarge { limit }) => {
-                                break Err(CirrusError::ResponseTooLarge { status, limit });
-                            }
-                            Err(CollectBodyError::Transport(e)) => e.into(),
-                            // `CollectBodyError` is `non_exhaustive`.
-                            Err(other) => CirrusError::InvalidResponse(other.to_string()),
+                        match finish(status, headers, response, token.to_string()).await {
+                            Settled::Final(result) => break result,
+                            Settled::Transport(e) => e,
                         }
                     }
                     // reqwest keeps a request it could not build and
@@ -1572,17 +1636,7 @@ impl Cirrus {
             &url,
             retry::Replay::ByMethod,
             &[],
-            |token: &str| {
-                let mut request = self
-                    .client
-                    .request(method.clone(), &url)
-                    .bearer_auth(token)
-                    .header(reqwest::header::ACCEPT, accept);
-                if let Some(q) = query {
-                    request = request.query(q);
-                }
-                Ok(request)
-            },
+            |token: &str| Ok(self.raw_request(&method, &url, accept, query, token)),
             |status, headers, bytes, _token| {
                 if (200..300).contains(&status) {
                     Ok((headers, bytes))
@@ -1592,6 +1646,64 @@ impl Cirrus {
             },
         )
         .await
+    }
+
+    /// Internal: the streaming sibling of [`Self::fetch_raw`]. The
+    /// request goes through the same loop, but a 2xx body is handed back
+    /// as a [`ByteStream`] instead of being collected, so it is not
+    /// subject to `max_response_size` and nothing is replayed once it
+    /// has started. A non-2xx body is still collected under the error
+    /// cap and parsed, so an `INVALID_SESSION_ID` 401 still refreshes.
+    pub(crate) async fn fetch_stream(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        accept: &str,
+        query: Option<&[(&str, &str)]>,
+    ) -> CirrusResult<ByteStream> {
+        let url = self.resolve_url(path);
+        self.dispatch_with(
+            &method,
+            &url,
+            retry::Replay::ByMethod,
+            &[],
+            |token: &str| Ok(self.raw_request(&method, &url, accept, query, token)),
+            |status, headers, response, _token| async move {
+                if (200..300).contains(&status) {
+                    return Settled::Final(Ok(ByteStream::new(status, headers, response)));
+                }
+                settle_collected(
+                    status,
+                    headers,
+                    response,
+                    NON_SUCCESS_BODY_CAP,
+                    |status, _headers, bytes| Err(response::parse_error_response(status, &bytes)),
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    /// A bearer-authenticated request for a raw-body resource: the
+    /// `Accept` the resource documents and optional query pairs.
+    fn raw_request(
+        &self,
+        method: &reqwest::Method,
+        url: &str,
+        accept: &str,
+        query: Option<&[(&str, &str)]>,
+        token: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .request(method.clone(), url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, accept);
+        if let Some(q) = query {
+            request = request.query(q);
+        }
+        request
     }
 
     /// Sends a conditional GET carrying `If-Modified-Since`, returning
@@ -1789,8 +1901,10 @@ impl CirrusBuilder {
     /// [`CirrusError::ResponseTooLarge`] without being buffered.
     ///
     /// Bodies of non-2xx responses are capped at a fixed 256 KiB
-    /// regardless of this setting, and [`Cirrus::execute`] hands back
-    /// the raw response, outside any cap.
+    /// regardless of this setting. Two paths sit outside any cap:
+    /// [`Cirrus::execute`] hands back the raw response, and the
+    /// streaming Event Monitoring downloads hand the body over as a
+    /// [`ByteStream`] of chunks that the client never holds whole.
     pub fn max_response_size(mut self, limit: impl Into<Option<usize>>) -> Self {
         self.max_response_size = Some(limit.into());
         self

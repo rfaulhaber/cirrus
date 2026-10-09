@@ -70,8 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   `cirrus::soql::escape_like` (part of a `LIKE` pattern).
 - **SOSL** — `sf.search(...)` and `sf.parameterized_search(...)`;
   `cirrus::sosl::escape_term` escapes a `FIND` term.
-- **Composite** — all four shapes: `composite/batch`, `composite/tree`,
-  `composite/sobjects` (collections), and the generic chained-reference
+- **Composite** — every documented shape: `composite/batch`, `composite/tree`,
+  `composite/sobjects` (collections), `composite/graph` (up to 500 record
+  nodes in per-graph all-or-nothing units), and the generic chained-reference
   `/composite` endpoint.
 - **Bulk API 2.0** — ingest (`bulk().ingest()`) and query (`bulk().query()`)
   with the full lifecycle: `create` (or the one-request multipart
@@ -84,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   endpoints. `send_raw`
   keeps a non-JSON body or response, and an error body the class wrote, whole.
 - **Event Monitoring** — `event_monitoring().{download, download_url}` for
-  binary `EventLogFile` CSV downloads.
+  binary `EventLogFile` CSV downloads held whole, and
+  `{download_stream, download_url_stream}` for a `ByteStream` of chunks that
+  is not bounded by the response-size cap.
 - **Versions, limits, describe** — `sf.versions()`, `sf.limits()`,
   `sf.sobjects().describe_global()`, `sf.sobject(name).describe()`.
 
@@ -171,7 +174,9 @@ boundary between auth and REST without extra plumbing.
   2xx bodies up to `CirrusBuilder::max_response_size` (1 GiB by default,
   above the 1 GB Bulk result file; `None` lifts it), anything else up to
   256 KiB. A larger body fails with `CirrusError::ResponseTooLarge`.
-  `Cirrus::execute` returns the raw response and is outside the cap.
+  `Cirrus::execute` returns the raw response and the streaming Event
+  Monitoring downloads hand the body over chunk by chunk; both are outside
+  the cap.
 
 ### The escape hatch
 
@@ -231,9 +236,10 @@ let created: Value = sf
 
 Binary downloads stay inside the request loop: `retrieve_blob` on a
 `sf.sobject(..)` handler fetches a blob field, and `sf.event_monitoring().download`
-an Event Monitoring log file; `send_raw`, on `Cirrus` and on `sf.apex()`, sends
-an optional raw body and returns the status, headers and bytes of any
-response. For the remaining unusual cases (SSE),
+an Event Monitoring log file, with `download_stream` handing the same file
+over chunk by chunk once the response head has passed the loop; `send_raw`,
+on `Cirrus` and on `sf.apex()`, sends an optional raw body and returns the
+status, headers and bytes of any response. For the remaining unusual cases (SSE),
 `request_builder` and `execute` give you a pre-authenticated
 `reqwest::RequestBuilder` and a full bypass respectively. Both step outside the
 request loop, so retry, the 401 auto-refresh and the limit-info capture don't

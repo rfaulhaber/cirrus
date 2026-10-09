@@ -719,7 +719,10 @@ pub struct BulkQueryJob {
 /// Carries the CSV body alongside the cursor headers Salesforce uses for
 /// pagination. `locator` is `None` when the result set is fully drained;
 /// pass it back to [`crate::handlers::bulk::BulkQueryHandler::results`]
-/// in subsequent calls to fetch the next page.
+/// in subsequent calls to fetch the next page. A page that arrives
+/// without the `Sforce-Locator` header never becomes a value of this
+/// type; `results` refuses it, so `None` here always means Salesforce
+/// sent its documented end marker.
 ///
 /// The [`Debug`] rendering reports the CSV length in place of the body:
 /// one page holds up to tens of thousands of exported records, and the
@@ -729,7 +732,8 @@ pub struct BulkQueryResults {
     /// CSV body of this result page.
     pub csv: bytes::Bytes,
     /// Pagination cursor (`Sforce-Locator` response header). `None` when
-    /// the job has emitted all rows.
+    /// the job has emitted all rows, which Salesforce signals with the
+    /// literal header value `null`.
     pub locator: Option<String>,
     /// Number of records included in this page (`Sforce-NumberOfRecords`
     /// response header).
@@ -1219,7 +1223,7 @@ pub struct CompositeError {
 /// not entry by entry.
 ///
 /// [allornone]: https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-allornone.html
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompositeResponse {
     /// One entry per sub-request, ordered by submission unless
     /// `collateSubrequests` reordered them server-side.
@@ -1277,6 +1281,46 @@ impl CompositeSubresponse {
     pub fn is_error(&self) -> bool {
         (400..600).contains(&self.http_status_code)
     }
+}
+
+/// Top-level response from `POST /composite/graph`.
+///
+/// One [`CompositeGraphResult`] per graph in the request, each carrying
+/// the graph's `graphId`, the per-node results in the same
+/// [`CompositeResponse`] shape the generic composite call returns, and
+/// the `isSuccessful` verdict for the graph as a whole. There is no
+/// top-level success flag: the outer call succeeded once this type
+/// parses, and each graph reports its own outcome.
+///
+/// [`CompositeGraphResult::is_successful`] is the one place to look. A
+/// graph is atomic, so when it is `false` nothing in that graph was
+/// committed, whatever its individual nodes show; its error nodes say
+/// why, and its other nodes carry the rollback status, as they do for a
+/// generic composite request under `allOrNone`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositeGraphResponse {
+    /// One entry per graph in the request. A 2xx body without the
+    /// documented `graphs` array does not parse, so an empty list here
+    /// means the request carried no graphs, never that the verdicts
+    /// went missing.
+    pub graphs: Vec<CompositeGraphResult>,
+}
+
+/// One graph's outcome inside [`CompositeGraphResponse::graphs`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositeGraphResult {
+    /// The caller's `graphId` for this graph.
+    #[serde(rename = "graphId")]
+    pub graph_id: String,
+    /// The per-node results, in the generic composite response shape.
+    /// Reads as empty when a graph's response omits it.
+    #[serde(rename = "graphResponse", default)]
+    pub graph_response: CompositeResponse,
+    /// Whether the whole graph was processed successfully. `false` means
+    /// nothing in the graph was committed, whether it was rolled back or
+    /// never ran because processing had halted.
+    #[serde(rename = "isSuccessful")]
+    pub is_successful: bool,
 }
 
 /// One per-record entry in the array returned by `/composite/sobjects`
@@ -3225,6 +3269,8 @@ mod tests {
         assert_serialize::<CompositeError>();
         assert_serialize::<CompositeResponse>();
         assert_serialize::<CompositeSubresponse>();
+        assert_serialize::<CompositeGraphResponse>();
+        assert_serialize::<CompositeGraphResult>();
         assert_serialize::<SObjectCollectionResult>();
         assert_serialize::<ExecuteAnonymousResult>();
     }
