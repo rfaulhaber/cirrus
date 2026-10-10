@@ -21,13 +21,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use cirrus_metadata::auth::StaticTokenAuth;
+use cirrus_metadata::auth::{AuthResult, AuthSession, StaticTokenAuth};
 use cirrus_metadata::{
     DebuggingHeader, DeployOptions, DeployProblemType, DeployStatus, LogCategory, LogCategoryLevel,
     LogInfo, MetadataClient, MetadataError, MetadataType, PackageManifest, RetrieveRequest,
     RetrieveStatus, RetryPolicy, TestLevel, WaitConfig,
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1131,8 +1133,8 @@ async fn wait_for_deploy_timeout_fires_within_its_budget() {
 
     assert!(matches!(err, MetadataError::PollTimeout(_)));
     assert!(elapsed >= budget, "returned early at {elapsed:?}");
-    // Generous headroom for the in-flight poll the budget can't
-    // interrupt; the unclamped schedule would land near 280 ms.
+    // Generous headroom for the tick of the poll that runs up to the
+    // deadline; the unclamped schedule would land near 280 ms.
     assert!(
         elapsed < budget * 2,
         "timeout overshot its budget: {elapsed:?}"
@@ -2126,4 +2128,167 @@ async fn wait_for_retrieve_cuts_off_a_poll_that_outlives_its_budget() {
         elapsed < budget * 3,
         "the stalled poll held the wait past its budget: {elapsed:?}"
     );
+}
+
+// -- Argument checks and the budget around the token fetch ---------------------
+
+/// An auth session that counts how often a token is asked for, so a
+/// test can pin what a refusal or a timeout costs.
+struct CountingAuth {
+    instance_url: String,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl AuthSession for CountingAuth {
+    async fn access_token(&self) -> AuthResult<Cow<'_, str>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Cow::Borrowed("tok"))
+    }
+
+    fn instance_url(&self) -> &str {
+        &self.instance_url
+    }
+
+    async fn invalidate(&self, _stale_token: &str) {}
+}
+
+fn counting_client(server: &MockServer) -> (MetadataClient, Arc<CountingAuth>) {
+    let auth = Arc::new(CountingAuth {
+        instance_url: server.uri(),
+        calls: AtomicUsize::new(0),
+    });
+    let md = MetadataClient::builder()
+        .auth(auth.clone())
+        .retry_policy(RetryPolicy {
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter: false,
+            ..RetryPolicy::default()
+        })
+        .build()
+        .unwrap();
+    (md, auth)
+}
+
+/// A deploy whose options Salesforce would fault on, and a retrieve
+/// with no API version, are refused before the auth session is asked
+/// for a token: with a cold cache that fetch is a token-endpoint round
+/// trip, and with a rotating refresh token it is a grant spent for
+/// nothing.
+#[tokio::test]
+async fn argument_refusals_cost_no_token_fetch_and_no_request() {
+    let server = MockServer::start().await;
+    let (md, auth) = counting_client(&server);
+
+    let err = md
+        .deploy(
+            Bytes::from_static(b"PK"),
+            DeployOptions {
+                run_tests: vec!["MyTest".into()],
+                test_level: Some(TestLevel::RunLocalTests),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetadataError::InvalidArgument(_)), "{err:?}");
+
+    let err = md.retrieve(RetrieveRequest::default()).await.unwrap_err();
+    assert!(matches!(err, MetadataError::InvalidArgument(_)), "{err:?}");
+
+    assert_eq!(auth.calls.load(Ordering::SeqCst), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// A wait whose budget runs out during a backoff sleep returns
+/// `PollTimeout` without starting another poll: that poll could only be
+/// cut off at once, and would cost a token fetch for nothing.
+#[tokio::test]
+async fn wait_for_deploy_does_not_start_a_poll_it_cannot_finish() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(deploy_status_response(false, None))
+        .mount(&server)
+        .await;
+    let (md, auth) = counting_client(&server);
+
+    let err = md
+        .wait_for_deploy_with(
+            "0Af00000dbg",
+            WaitConfig {
+                initial_delay: Duration::from_secs(1),
+                max_delay: Duration::from_secs(1),
+                total_timeout: Some(Duration::from_millis(100)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, MetadataError::PollTimeout(_)), "{err:?}");
+    assert_eq!(auth.calls.load(Ordering::SeqCst), 1);
+}
+
+/// `Some(Duration::MAX)` is a valid "no practical limit" and must not
+/// overflow the deadline arithmetic.
+#[tokio::test]
+async fn wait_for_deploy_accepts_an_unbounded_total_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(deploy_status_response(true, None))
+        .mount(&server)
+        .await;
+    let md = client_against(&server);
+
+    let result = md
+        .wait_for_deploy_with(
+            "0Af00000dbg",
+            WaitConfig {
+                total_timeout: Some(Duration::MAX),
+                ..fast_wait()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.done);
+}
+
+/// The zip fetch after a successful retrieve is the one call that must
+/// never be cut off, since the server deletes the zip as it serves it;
+/// it runs outside the budget even when the budget is already spent.
+#[tokio::test]
+async fn wait_for_retrieve_collects_a_zip_whose_fetch_outlives_the_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(xml_response(&retrieve_status_body(true, true, None)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>true</met:includeZip>",
+        ))
+        .respond_with(
+            xml_response(&retrieve_status_body(true, true, Some("UEsDBA==")))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    let md = client_against(&server);
+
+    let result = md
+        .wait_for_retrieve_with(
+            "09S00000poll",
+            WaitConfig {
+                total_timeout: Some(Duration::from_millis(200)),
+                ..fast_wait()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.zip_file.as_deref(), Some("UEsDBA=="));
 }

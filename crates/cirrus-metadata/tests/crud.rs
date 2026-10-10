@@ -932,6 +932,14 @@ async fn write_calls_refuse_a_component_that_is_not_a_well_formed_fragment() {
         "<label>&nbsp;</label>",
         // A declaration cannot appear inside an envelope.
         r#"<?xml version="1.0"?><fullName>A</fullName>"#,
+        // An attribute value with a bare ampersand, an undefined entity
+        // or a `<`.
+        r#"<nameField label="R&D"><type>Text</type></nameField>"#,
+        r#"<nameField label="&nbsp;"><type>Text</type></nameField>"#,
+        r#"<nameField label="a<b"><type>Text</type></nameField>"#,
+        // An unquoted attribute value, and an attribute given twice.
+        "<value xsi:type=xsd:boolean>false</value>",
+        r#"<value xsi:type="xsd:boolean" xsi:type="xsd:string">false</value>"#,
     ];
     for component in malformed {
         let components = ["<fullName>Fine</fullName>", component];
@@ -981,7 +989,7 @@ async fn write_calls_splice_a_well_formed_fragment_as_written() {
          <description><![CDATA[a < b]]></description>\
          <!-- a comment -->\
          <enableActivities/>\
-         <nameField><type>Text</type><label>Name</label></nameField>\
+         <nameField label=\"R&amp;D &#38; a > b\"><type>Text</type></nameField>\
          <values><value xsi:type=\"xsd:boolean\">false</value></values>";
     Mock::given(method("POST"))
         .and(body_string_contains(component))
@@ -993,4 +1001,28 @@ async fn write_calls_splice_a_well_formed_fragment_as_written() {
     md.create_metadata("CustomObject", &[component])
         .await
         .unwrap();
+}
+
+/// The rejection names the call, the component and the escaper, never
+/// the component's text: the undefined-entity case fires exactly when
+/// unescaped interpolated text is present, and CRUD-capable types carry
+/// secrets (a NamedCredential's password, an AuthProvider's consumer
+/// secret).
+#[tokio::test]
+async fn a_rejected_component_s_text_is_not_echoed_in_the_error() {
+    let server = MockServer::start().await;
+    let md = client_against(&server);
+
+    let err = md
+        .create_metadata(
+            "NamedCredential",
+            &["<password>hunter2&secretPart;trailing</password>"],
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(!msg.contains("hunter2"), "{msg}");
+    assert!(!msg.contains("secretPart"), "{msg}");
+    assert!(msg.contains("component 0"), "{msg}");
 }

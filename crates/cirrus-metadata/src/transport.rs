@@ -95,6 +95,18 @@ pub trait SoapOperation {
     /// `<{NAME}Response>...</{NAME}Response>` element.
     type Response: DeserializeOwned;
 
+    /// Checks the operation's arguments before anything else happens:
+    /// the transport calls this first, ahead of asking the
+    /// [`AuthSession`](cirrus_auth::AuthSession) for a token, so an
+    /// argument Salesforce would fault on is refused without a token
+    /// fetch (with a cold cache that is a token-endpoint round trip, and
+    /// for a rotating refresh token a grant spent for nothing). Defaults
+    /// to `Ok(())`. An operation that overrides it should also call it
+    /// from its renderer, so rendering alone refuses the same arguments.
+    fn validate(&self) -> MetadataResult<()> {
+        Ok(())
+    }
+
     /// Render the operation-specific body XML — everything between
     /// `<met:NAME>` and `</met:NAME>`. May be empty for operations that
     /// take no arguments.
@@ -110,9 +122,11 @@ pub trait SoapOperation {
     /// deploy's base64 zip) overrides this to encode straight into `out`
     /// and reports the size through [`body_size_hint`](Self::body_size_hint),
     /// so the body is never held in a second string on its way into the
-    /// envelope. Called once per request the transport sends, so a
-    /// retry after an `INVALID_SESSION_ID` fault renders again; the
-    /// HTTP retry loop reuses the rendered envelope.
+    /// envelope. Called once per envelope the transport builds: once per
+    /// call, and once more for the retry after an `INVALID_SESSION_ID`
+    /// fault; the HTTP retry loop resends the same envelope. It runs
+    /// after the access token has been obtained, which is why argument
+    /// checks belong in [`validate`](Self::validate).
     fn render_body_into(&self, out: &mut String) -> MetadataResult<()> {
         out.push_str(&self.render_body()?);
         Ok(())
@@ -225,6 +239,9 @@ async fn dispatch<O: SoapOperation>(
     client: &MetadataClient,
     op: &O,
 ) -> MetadataResult<(O::Response, OutputHeaders)> {
+    // Argument checks and header rendering come before the token fetch,
+    // so a refused call costs the caller nothing.
+    op.validate()?;
     let response_local = format!("{}Response", O::NAME);
     let headers_xml = render_request_headers(client, op)?;
     let response = call_with_auth_retry(client, op, &headers_xml, &response_local).await?;

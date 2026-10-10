@@ -200,7 +200,17 @@ fn check_component_xml(call: CrudCall, index: usize, component: &str) -> Metadat
         // quick-xml reports where its own error starts; a rejection made
         // here points at the end of the event that caused it.
         match reader.read_event() {
-            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::Start(tag)) => {
+                if let Err(detail) = attributes_well_formed(&tag) {
+                    return Err(reject(&detail, reader.buffer_position()));
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(tag)) => {
+                if let Err(detail) = attributes_well_formed(&tag) {
+                    return Err(reject(&detail, reader.buffer_position()));
+                }
+            }
             Ok(Event::End(_)) => {
                 depth = depth.checked_sub(1).ok_or_else(|| {
                     reject("an end tag with no start tag", reader.buffer_position())
@@ -213,9 +223,11 @@ fn check_component_xml(call: CrudCall, index: usize, component: &str) -> Metadat
                     Ok(None) => resolve_predefined_entity(name).is_some(),
                     Err(e) => return Err(reject(&e.to_string(), reader.buffer_position())),
                 };
+                // The name is caller text and may be a secret that was
+                // meant to be escaped, so it is not echoed.
                 if !resolves {
                     return Err(reject(
-                        &format!("the undefined entity `&{name};`"),
+                        "an undefined entity reference",
                         reader.buffer_position(),
                     ));
                 }
@@ -231,6 +243,26 @@ fn check_component_xml(call: CrudCall, index: usize, component: &str) -> Metadat
     }
     if depth != 0 {
         return Err(reject("an unclosed element", reader.buffer_position()));
+    }
+    Ok(())
+}
+
+/// The attribute-level part of the well-formedness check: every
+/// attribute is quoted, named once and has a value, and every value is
+/// free of `<` and resolves its references like element text does.
+/// quick-xml's reader does not look inside a tag, so these would
+/// otherwise reach Salesforce and come back as a fault. The detail never
+/// quotes the value, which is caller text.
+fn attributes_well_formed(tag: &quick_xml::events::BytesStart<'_>) -> Result<(), String> {
+    for attribute in tag.attributes() {
+        let attribute = attribute.map_err(|e| e.to_string())?;
+        let value: &str = &attribute.value;
+        if value.contains('<') {
+            return Err("an attribute value containing `<`".into());
+        }
+        if quick_xml::escape::unescape(value).is_err() {
+            return Err("an attribute value with a reference that does not resolve".into());
+        }
     }
     Ok(())
 }
