@@ -34,6 +34,21 @@
 //! `<value xsi:type="xsd:boolean">false</value>` needs no namespace
 //! declaration of its own.
 //!
+//! ## Escaping and well-formedness
+//!
+//! A component is spliced into the envelope as written, so text that is
+//! interpolated into one (a label, a description, a value) must be
+//! escaped with [`xml_escape`]: a bare `&` or `<`
+//! makes the request ill-formed, and a crafted value could close the
+//! `<metadata>` wrapper and inject sibling components. Each write call
+//! parses every component before any request is made and refuses one
+//! that is not a well-formed fragment (unbalanced or mismatched tags, a
+//! reference that is neither a predefined entity nor a character
+//! reference, an XML declaration or a DOCTYPE) with
+//! [`MetadataError::InvalidArgument`]. A well-formed fragment is sent
+//! unchanged; whether its elements are valid for the type is for
+//! Salesforce to decide, and comes back in the per-component result.
+//!
 //! ## Per-call component cap
 //!
 //! All five "multi" CRUD calls cap at 10 components per call (server
@@ -62,6 +77,8 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::headers::render_all_or_none;
 use crate::result::{DeleteResult, SaveResult, UpsertResult};
 use crate::transport::SoapOperation;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::Event;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -139,6 +156,80 @@ impl CrudCall {
             _ => MAX_CRUD_COMPONENTS_PER_CALL,
         }
     }
+}
+
+/// The pre-flight of a write call: the per-call cap, then every
+/// component's well-formedness, so a bad component fails before any
+/// request is made.
+fn check_components<S: AsRef<str>>(
+    components: &[S],
+    type_name: &str,
+    call: CrudCall,
+) -> MetadataResult<()> {
+    check_component_cap(components.len(), type_name, call)?;
+    for (index, component) in components.iter().enumerate() {
+        check_component_xml(call, index, component.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Refuses a write component that is not a well-formed XML fragment.
+///
+/// Components are spliced into the envelope as written, so a bare `&`
+/// would make the whole request ill-formed and a stray end tag could
+/// close the `<met:metadata>` wrapper and inject sibling components.
+/// Each component is parsed once: its tags must balance, every
+/// reference must resolve to a predefined entity or a character, and
+/// neither an XML declaration nor a DOCTYPE may appear, since both are
+/// illegal inside an envelope. The error names the escaper because an
+/// unescaped `&` or `<` in interpolated text is the usual cause.
+fn check_component_xml(call: CrudCall, index: usize, component: &str) -> MetadataResult<()> {
+    let reject = |detail: &str, at: u64| {
+        MetadataError::InvalidArgument(format!(
+            "{}: component {index} is not a well-formed XML fragment ({detail} at byte {at}); \
+             escape interpolated text with cirrus_metadata::xml_escape",
+            call.label(),
+        ))
+    };
+    let mut reader = quick_xml::Reader::from_str(component);
+    let mut depth: usize = 0;
+    loop {
+        // quick-xml reports where its own error starts; a rejection made
+        // here points at the end of the event that caused it.
+        match reader.read_event() {
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    reject("an end tag with no start tag", reader.buffer_position())
+                })?;
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                let name: &str = &reference;
+                let resolves = match reference.resolve_char_ref() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => resolve_predefined_entity(name).is_some(),
+                    Err(e) => return Err(reject(&e.to_string(), reader.buffer_position())),
+                };
+                if !resolves {
+                    return Err(reject(
+                        &format!("the undefined entity `&{name};`"),
+                        reader.buffer_position(),
+                    ));
+                }
+            }
+            Ok(Event::Decl(_)) => {
+                return Err(reject("an XML declaration", reader.buffer_position()));
+            }
+            Ok(Event::DocType(_)) => return Err(reject("a DOCTYPE", reader.buffer_position())),
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => return Err(reject(&e.to_string(), reader.error_position())),
+        }
+    }
+    if depth != 0 {
+        return Err(reject("an unclosed element", reader.buffer_position()));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +496,14 @@ impl MetadataClient {
     /// as `<value xsi:type="xsd:boolean">false</value>` work as pasted
     /// from a `-meta.xml` file.
     ///
+    /// Text interpolated into a component must be escaped with
+    /// [`xml_escape`]. Every component is parsed
+    /// before the request is sent, and one that is not a well-formed
+    /// XML fragment (a bare `&`, unbalanced or mismatched tags, an
+    /// undefined entity, an XML declaration) is refused with
+    /// [`MetadataError::InvalidArgument`]
+    /// naming the component's index; nothing reaches the wire.
+    ///
     /// ```no_run
     /// # use cirrus_metadata::{MetadataClient, SaveResult, MetadataError};
     /// # async fn example(md: &MetadataClient) -> Result<(), MetadataError> {
@@ -444,7 +543,7 @@ impl MetadataClient {
         options: CrudOptions,
     ) -> MetadataResult<Vec<SaveResult>> {
         let type_name = type_name.as_ref();
-        check_component_cap(components.len(), type_name, CrudCall::Create)?;
+        check_components(components, type_name, CrudCall::Create)?;
         let op = CreateMetadataOp {
             type_name,
             components,
@@ -456,9 +555,10 @@ impl MetadataClient {
 
     /// Update one or more existing metadata components.
     ///
-    /// Same input shape as [`Self::create_metadata`] — each
-    /// component's `<fullName>` identifies which existing component
-    /// to update. Returns one [`SaveResult`] per component. Partial
+    /// Same input shape as [`Self::create_metadata`], escaping rule and
+    /// well-formedness check included — each component's `<fullName>`
+    /// identifies which existing component to update. Returns one
+    /// [`SaveResult`] per component. Partial
     /// success is possible; [`Self::update_metadata_with`] with
     /// [`CrudOptions::all_or_none`] rolls the whole call back instead.
     pub async fn update_metadata<S: AsRef<str>, N: AsRef<str>>(
@@ -479,7 +579,7 @@ impl MetadataClient {
         options: CrudOptions,
     ) -> MetadataResult<Vec<SaveResult>> {
         let type_name = type_name.as_ref();
-        check_component_cap(components.len(), type_name, CrudCall::Update)?;
+        check_components(components, type_name, CrudCall::Update)?;
         let op = UpdateMetadataOp {
             type_name,
             components,
@@ -491,7 +591,8 @@ impl MetadataClient {
 
     /// Create or update one or more metadata components.
     ///
-    /// Same input shape as [`Self::create_metadata`]. The returned
+    /// Same input shape as [`Self::create_metadata`], escaping rule and
+    /// well-formedness check included. The returned
     /// [`UpsertResult::created`] flag distinguishes per-component
     /// inserts (`true`) from updates (`false`). Available in
     /// API v31+. Partial success is possible;
@@ -515,7 +616,7 @@ impl MetadataClient {
         options: CrudOptions,
     ) -> MetadataResult<Vec<UpsertResult>> {
         let type_name = type_name.as_ref();
-        check_component_cap(components.len(), type_name, CrudCall::Upsert)?;
+        check_components(components, type_name, CrudCall::Upsert)?;
         let op = UpsertMetadataOp {
             type_name,
             components,

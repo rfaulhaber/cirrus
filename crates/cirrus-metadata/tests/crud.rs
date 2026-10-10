@@ -867,3 +867,90 @@ async fn create_metadata_with_still_enforces_the_component_cap() {
         .unwrap_err();
     assert!(matches!(err, MetadataError::InvalidArgument(_)));
 }
+
+// -- Component well-formedness -------------------------------------------
+
+/// A component is spliced into the envelope as written, so one that is
+/// not a well-formed fragment would corrupt the request or, with a
+/// stray `</met:metadata>`, inject sibling components. Each shape here
+/// is refused before any request is made, and the error names the call,
+/// the component and the escaper.
+#[tokio::test]
+async fn write_calls_refuse_a_component_that_is_not_a_well_formed_fragment() {
+    let server = MockServer::start().await;
+    let md = client_against(&server);
+    let malformed = [
+        // A bare ampersand in text.
+        "<fullName>R&D</fullName>",
+        // Closes the wrapper and injects a second component.
+        r#"<fullName>A</fullName></met:metadata><met:metadata xsi:type="met:PermissionSet"><fullName>B</fullName>"#,
+        // An unclosed element.
+        "<fullName>A",
+        // A mismatched end tag.
+        "<fullName>A</label>",
+        // An entity the Metadata API's parser has no definition for.
+        "<label>&nbsp;</label>",
+        // A declaration cannot appear inside an envelope.
+        r#"<?xml version="1.0"?><fullName>A</fullName>"#,
+    ];
+    for component in malformed {
+        let components = ["<fullName>Fine</fullName>", component];
+        let results = [
+            (
+                "create_metadata",
+                md.create_metadata("CustomObject", &components)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "update_metadata",
+                md.update_metadata("CustomObject", &components)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "upsert_metadata",
+                md.upsert_metadata("CustomObject", &components)
+                    .await
+                    .map(drop),
+            ),
+        ];
+        for (label, result) in results {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, MetadataError::InvalidArgument(_)),
+                "{label} {component:?}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(label), "{msg}");
+            assert!(msg.contains("component 1"), "{msg}");
+            assert!(msg.contains("xml_escape"), "{msg}");
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// A well-formed fragment goes out exactly as written: sibling elements,
+/// escaped text, predefined and numeric references, CDATA, a comment, an
+/// empty element and an `xsi:type` attribute all pass.
+#[tokio::test]
+async fn write_calls_splice_a_well_formed_fragment_as_written() {
+    let server = MockServer::start().await;
+    let component = "<fullName>MyCustomObject1__c</fullName>\
+         <label>R&amp;D &#x26; &#38; &quot;</label>\
+         <description><![CDATA[a < b]]></description>\
+         <!-- a comment -->\
+         <enableActivities/>\
+         <nameField><type>Text</type><label>Name</label></nameField>\
+         <values><value xsi:type=\"xsd:boolean\">false</value></values>";
+    Mock::given(method("POST"))
+        .and(body_string_contains(component))
+        .respond_with(save_results_response("createMetadata"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let md = client_against(&server);
+    md.create_metadata("CustomObject", &[component])
+        .await
+        .unwrap();
+}

@@ -1,6 +1,6 @@
 //! End-to-end tests for [`PackageManifest`] — exercising both forms
 //! (standalone `package.xml` and SOAP `unpackaged`) and confirming
-//! quick-xml can round-trip the standalone output.
+//! quick-xml parses the standalone output.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

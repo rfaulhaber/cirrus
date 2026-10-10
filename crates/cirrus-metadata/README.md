@@ -54,8 +54,9 @@ you need anything beyond `deployRequest`.
   binds `xsi` and `xsd`, so values typed `xsi:type="xsd:boolean"` paste
   straight from a `-meta.xml` file.
 - **Utility** — `list_metadata`, `describe_metadata`, `describe_value_type`.
-- **Typed `package.xml`** — `PackageManifest` builder with round-trippable
-  XML serialization. `MetadataType` carries constants for the common
+- **Typed `package.xml`** — `PackageManifest` builder that renders
+  `package.xml` and the SOAP `unpackaged` form; it has no parser for an
+  existing manifest. `MetadataType` carries constants for the common
   types, converts from borrowed strings (so `describe_metadata`'s
   `xml_name`s feed it directly) and `MetadataType::new` accepts any other
   Salesforce-defined type name. `CUSTOM_LABEL` retrieves labels by name;
@@ -108,13 +109,22 @@ you need anything beyond `deployRequest`.
 ## Design principles
 
 - **No user-facing types.** The 200+ concrete metadata types
-  (`CustomObject`, `ApexClass`, `Flow`, …) are caller-supplied XML or
-  generic via `serde`. Only platform-contract envelopes are typed.
+  (`CustomObject`, `ApexClass`, `Flow`, …) are not modeled: a write takes
+  each component as caller-rendered XML (text escaped with `xml_escape`,
+  and a component that is not a well-formed fragment is refused before
+  the request), and `read_metadata` deserializes into a caller-chosen
+  `T: Deserialize`. Only platform-contract envelopes are typed.
 - **No legacy surface.** Operations Salesforce labels deprecated
   (pre-API-31 `create` / `update` / `delete`) are intentionally not
   exposed.
-- **Doc-driven wire shapes.** Every handler ships with wiremock coverage
-  whose request/response bodies match Salesforce's documented examples.
+- **Doc-driven wire shapes.** Every handler ships with wiremock coverage.
+  What sits inside each fixture's `<result>` is cited to the Metadata API
+  Developer Guide's property tables and Java samples; the envelope framing
+  follows the WSDL's document-literal binding, since the guide publishes no
+  SOAP envelope for any call; and the two request element names the guide
+  does not publish (`cancelDeploy`'s `asyncProcessId` and
+  `deployRecentValidation`'s `validationId`) are inferred and pinned by
+  tests rather than read off a page.
 
 ## Quick start
 

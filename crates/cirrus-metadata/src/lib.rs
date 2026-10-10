@@ -22,8 +22,11 @@
 //! ## Design principles
 //!
 //! - **No user-facing types.** The 200+ concrete metadata types
-//!   (`CustomObject`, `ApexClass`, …) are caller-supplied XML or
-//!   `serde_json::Value`. Only platform-contract envelopes are typed.
+//!   (`CustomObject`, `ApexClass`, …) are not modeled: a write takes
+//!   each component as caller-rendered XML (text escaped with
+//!   [`xml_escape`]) and `read_metadata` deserializes into a
+//!   caller-chosen `T: Deserialize`. Only platform-contract envelopes
+//!   are typed.
 //! - **No legacy surface.** Operations Salesforce labels deprecated
 //!   (`create()`, `update()`, `delete()` pre-API-31) are not exposed.
 //! - **Auth is pluggable.** Any [`cirrus_auth::AuthSession`] works.
