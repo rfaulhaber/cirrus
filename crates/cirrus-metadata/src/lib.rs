@@ -40,8 +40,9 @@
 //! the only exemption, for local mock servers, and it holds only while
 //! no [`MetadataClientBuilder::proxy`] is configured. The rule is the one
 //! `cirrus` applies, from [`cirrus_auth::transport`], checked when the
-//! client is built and again on every call because an [`AuthSession`]
-//! may change its instance URL. [`MetadataClientBuilder::allow_insecure_transport`]
+//! client is built and again on every call, since the instance URL is
+//! read from the [`AuthSession`] each time and a custom session could
+//! change it. [`MetadataClientBuilder::allow_insecure_transport`]
 //! is the opt-out for a deliberate plaintext hop. The HTTP client the
 //! builder creates follows no redirects and uses no proxy unless one is
 //! configured, and a `Retry-After` hint longer
@@ -285,9 +286,11 @@ impl MetadataClient {
     /// e.g. `https://my-org.my.salesforce.com/services/Soap/m/66.0`.
     ///
     /// The instance URL is read from the configured [`AuthSession`] on
-    /// every call, so it reflects the *current* session — relevant for
-    /// flows that can change instance URL on refresh (e.g. some token
-    /// exchange scenarios).
+    /// each call. Every session type this SDK ships keeps it fixed for
+    /// the session's lifetime (a refresh whose response names a
+    /// different `instance_url` fails with
+    /// [`AuthError::InstanceUrlMismatch`](cirrus_auth::AuthError::InstanceUrlMismatch)),
+    /// so only a custom [`AuthSession`] can make this value change.
     pub fn endpoint_url(&self) -> String {
         format!(
             "{}/services/Soap/m/{}",
