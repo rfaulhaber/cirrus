@@ -16,7 +16,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use cirrus_metadata::auth::StaticTokenAuth;
-use cirrus_metadata::{ListMetadataQuery, MetadataClient, MetadataError, RetryPolicy};
+use cirrus_metadata::{
+    ListMetadataQuery, ManageableState, MetadataClient, MetadataError, RetryPolicy,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -77,6 +79,7 @@ async fn list_metadata_returns_file_properties_for_each_match() {
         <lastModifiedById>005xx0000abc</lastModifiedById>
         <lastModifiedByName>Stephanie</lastModifiedByName>
         <lastModifiedDate>2026-05-20T12:00:00.000Z</lastModifiedDate>
+        <manageableState>unmanaged</manageableState>
         <type>ApexClass</type>
       </result>
       <result>
@@ -112,7 +115,12 @@ async fn list_metadata_returns_file_properties_for_each_match() {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].full_name, "Foo");
     assert_eq!(results[0].type_name, Some("ApexClass".into()));
+    assert_eq!(
+        results[0].manageable_state,
+        Some(ManageableState::Unmanaged)
+    );
     assert_eq!(results[1].full_name, "Bar");
+    assert_eq!(results[1].manageable_state, None);
 }
 
 /// A query that matches nothing. `listMetadata` returns an array, so
