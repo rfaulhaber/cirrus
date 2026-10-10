@@ -817,6 +817,23 @@ mod tests {
         assert!(!inner.contains("<?xml"));
         assert!(!inner.contains("<Package"));
     }
+
+    #[test]
+    fn soap_inner_escapes_special_chars_in_every_text_node() {
+        let pkg = PackageManifest::new("66.0<")
+            .full_name("Pkg&Name")
+            .add(MetadataType::new("Type<X>"), ["Foo<&>"]);
+        let inner = pkg.render_soap_inner();
+        assert_eq!(
+            inner,
+            "<met:fullName>Pkg&amp;Name</met:fullName>\
+             <met:types>\
+             <met:members>Foo&lt;&amp;&gt;</met:members>\
+             <met:name>Type&lt;X&gt;</met:name>\
+             </met:types>\
+             <met:version>66.0&lt;</met:version>"
+        );
+    }
 }
 
 #[cfg(test)]
