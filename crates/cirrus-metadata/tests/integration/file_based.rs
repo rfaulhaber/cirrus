@@ -58,21 +58,28 @@ fn pkg_version(md: &MetadataClient) -> String {
     md.api_version().trim_start_matches('v').to_string()
 }
 
-/// True when a fault is about the id argument: the `INVALID_ID_FIELD`
-/// code, or a message that mentions the id and calls something
-/// invalid, unknown, missing or not found. A test that passes an id the
-/// org just issued reads such a fault as a request element the server
-/// did not bind to the id.
+/// True when a fault's message calls the id argument invalid, unknown,
+/// missing or not found: the whole word `id` plus one of those flaws.
+/// Salesforce faultstrings begin with the fault code (`INVALID_ID_FIELD:
+/// ...`), so that prefix is dropped before the words are read, and the
+/// code itself is not tested because Salesforce files refusals about
+/// the state of a valid id under `INVALID_ID_FIELD` too. A test that
+/// passes an id the org just issued reads such a message as a request
+/// element the server did not bind to the id.
 fn faults_the_id(fault: &SoapFault) -> bool {
-    let message = fault.faultstring.to_ascii_lowercase();
-    let names_an_id = message
+    let prefix = format!("{}: ", fault.code());
+    let remainder = fault
+        .faultstring
+        .strip_prefix(&prefix)
+        .unwrap_or(&fault.faultstring)
+        .to_ascii_lowercase();
+    let names_an_id = remainder
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| word == "id");
-    fault.code() == "INVALID_ID_FIELD"
-        || (names_an_id
-            && ["invalid", "unknown", "missing", "not found"]
-                .iter()
-                .any(|flaw| message.contains(flaw)))
+    names_an_id
+        && ["invalid", "unknown", "missing", "not found"]
+            .iter()
+            .any(|flaw| remainder.contains(flaw))
 }
 
 /// In-memory deploy zip containing a single empty `<CustomLabels/>`
@@ -279,9 +286,10 @@ async fn deploy_recent_validation_quick_deploys_or_surfaces_typed_error() {
     // we're exercising is the wire path — the request body, the
     // response shape, the error parsing. *Either* a success
     // (AsyncResult-with-new-id) or a typed fault about the validation's
-    // eligibility is a valid outcome; a fault about the id or the
-    // request's shape, a hard panic or a malformed response shape fails
-    // the test.
+    // eligibility, `INVALID_ID_FIELD` included, is a valid outcome. A
+    // message calling the id invalid, unknown, missing or not found, a
+    // SOAP `Client` fault, an `UNKNOWN_EXCEPTION` fault, an unexpected
+    // error variant or a malformed response shape fails the test.
     let Some(md) = try_init_client().await else {
         return;
     };
@@ -323,24 +331,36 @@ async fn deploy_recent_validation_quick_deploys_or_surfaces_typed_error() {
             // for the target environment within the last 10 days.",
             // "As part of the validation, Apex tests in the target org
             // have passed." and "Code coverage requirements are met."
-            // The empty validation phase 1 produced ran no tests, so a
-            // refusal over those requirements is expected on
-            // dev/sandbox orgs. The id, though, is the one deploy()
-            // just returned: a fault calling it invalid, unknown or
-            // missing means the `validationId` element is not the
-            // argument the server reads.
+            // The validation phase 1 produced ran no tests, so a
+            // refusal over those requirements is the usual outcome.
+            //
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
+            // That page reports a refusal about the state of a valid
+            // id ("Deployment already completed") under
+            // `INVALID_ID_FIELD`, so the code alone is read as the
+            // eligibility refusal and accepted. What fails the test is a
+            // message calling the id itself invalid, unknown, missing or
+            // not found: the id is the one deploy() just returned, so
+            // the `validationId` element is then not the argument the
+            // server reads.
             //
             // Wire-shape provenance: unverified. No documentation page
-            // says what a mis-bound element yields. The expectation is
-            // a SOAP-level fault coded `soapenv:Client` (`Client` here)
+            // says what a mis-bound element or an unrecognised id
+            // yields. The expectation for a mis-bound element is a
+            // SOAP-level fault coded `soapenv:Client` (`Client` here)
             // with a message such as "Element {...}x invalid at this
             // location" that never says "id", because Salesforce
             // reports its own application faults under an `sf:` code
-            // and a malformed envelope under the SOAP one.
-            if faults_the_id(&fault) || fault.code() == "Client" {
+            // and a malformed envelope under the SOAP one. For an id
+            // the server does not recognise it is `UNKNOWN_EXCEPTION`
+            // with the message "invalid parameter value", which does
+            // not say "id" either.
+            if faults_the_id(&fault) || matches!(fault.code(), "Client" | "UNKNOWN_EXCEPTION") {
                 panic!(
                     "quick-deploy faulted as if the request did not carry the id \
-                     deploy() just returned; the `validationId` element may not be \
+                     deploy() just returned (a message calling the id invalid, \
+                     unknown, missing or not found, a SOAP Client fault or an \
+                     UNKNOWN_EXCEPTION fault); the `validationId` element may not be \
                      the argument the server reads: {} / {}",
                     fault.faultcode, fault.faultstring,
                 );

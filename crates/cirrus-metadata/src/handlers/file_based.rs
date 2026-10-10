@@ -1023,8 +1023,9 @@ mod tests {
     /// purgeOnDelete, rollbackOnError, runTests, singlePackage and
     /// testLevel; the deprecated runAllTests (API version 33.0 and
     /// earlier) is not modeled. A `false` goes out as `false` rather
-    /// than being omitted: rollbackOnError is "a complete rollback
-    /// (`true`) or not (`false`)", a choice the caller stated.
+    /// than being omitted: ignoreWarnings says whether deployments with
+    /// warnings "complete successfully (`true`) or not (`false`)", a
+    /// choice the caller stated.
     #[test]
     fn deploy_op_renders_every_option_with_its_own_value() {
         // Neighbouring booleans alternate, so reading an option from

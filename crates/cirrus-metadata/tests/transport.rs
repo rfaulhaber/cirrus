@@ -970,8 +970,10 @@ async fn a_response_body_that_stops_mid_stream_is_not_replayed_for_a_non_idempot
     // from the server." A body that dies after the head may mean the
     // org already served it, so an operation not declared replay-safe
     // surfaces the failure instead of asking again. The listener counts
-    // every connection after the first; a replay's connect is made
-    // before the call can return, so no timer is needed to see it.
+    // every connection after the first as it accepts it. A replay
+    // cannot end until the listener has accepted, counted and hung up
+    // on it, or the client would sit out its read timeout, so no timer
+    // is needed to see one.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let replays = Arc::new(AtomicUsize::new(0));
@@ -1004,7 +1006,6 @@ async fn a_response_body_that_stops_mid_stream_is_not_replayed_for_a_non_idempot
         matches!(err, MetadataError::Http(_)),
         "expected a transport error, got {err:?}"
     );
-    tokio::task::yield_now().await;
     server.abort();
     assert_eq!(
         replays.load(Ordering::SeqCst),
