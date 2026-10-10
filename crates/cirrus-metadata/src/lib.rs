@@ -50,6 +50,16 @@
 //! ([`DEFAULT_MAX_RESPONSE_SIZE`] by default), anything else up to a
 //! fixed 256 KiB.
 //!
+//! ## Cargo features
+//!
+//! The TLS backend is a feature under reqwest's name, forwarded to
+//! `cirrus-auth`: `rustls` (the default), `rustls-no-provider`,
+//! `native-tls` and `native-tls-vendored`, plus `bundled-roots`, which
+//! merges Mozilla's root set into every client the crate builds for hosts
+//! with no system CA bundle. The [`auth`] crate's documentation has the
+//! table; pick a backend other than the default with
+//! `default-features = false`.
+//!
 //! ## Quick start
 //!
 //! ```no_run

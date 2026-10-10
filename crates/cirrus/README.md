@@ -165,9 +165,10 @@ boundary between auth and REST without extra plumbing.
   Bulk 2.0 / blob **uploads** and for calls the org takes a long time to
   answer. TLS is verified against the operating system's trust store, which
   the client loads when it is built: a `FROM scratch` or distroless image
-  without `ca-certificates` fails at `build()` with `CirrusError::HttpClient`,
-  so install a CA bundle or hand over a `reqwest::Client` that carries its own
-  roots (`add_root_certificate`). Supplying your own client via
+  without `ca-certificates` fails at `build()` with `CirrusError::HttpClient`.
+  Install a CA bundle, enable the `bundled-roots` feature (see
+  [Cargo features](#cargo-features)) or hand over a `reqwest::Client` that
+  carries its own roots (`tls_certs_merge`). Supplying your own client via
   `CirrusBuilder::http_client` replaces all of it.
 - **Response size cap** — a response body is buffered only up to a limit on
   its decoded size, since a few megabytes of gzip can inflate a thousandfold:
@@ -244,6 +245,33 @@ status, headers and bytes of any response. For the remaining unusual cases (SSE)
 `reqwest::RequestBuilder` and a full bypass respectively. Both step outside the
 request loop, so retry, the 401 auto-refresh and the limit-info capture don't
 apply to them.
+
+## Cargo features
+
+The TLS backend is a feature, under reqwest's names, and `rustls` is the
+default, so a manifest that names no features builds as it always has.
+`cirrus` forwards each feature to `cirrus-auth`, whose README has the full
+table:
+
+- `rustls` (default): rustls with the aws-lc-rs provider, verifying against
+  the operating system's trust store.
+- `rustls-no-provider`: rustls with the crypto provider left to the
+  application, which installs one before building a client.
+- `native-tls` / `native-tls-vendored`: the operating system's TLS stack, with
+  OpenSSL built from source in the vendored case.
+- `bundled-roots`: merges Mozilla's root set into every client the crate
+  builds, alongside the platform's, for hosts without a system CA bundle.
+
+```toml
+[dependencies]
+cirrus = { version = "0.7.0", default-features = false, features = ["native-tls"] }
+```
+
+The features forward to reqwest and unify across the build like reqwest's own,
+so another dependency that enables `reqwest/rustls` brings it back. The
+re-exported `cirrus::reqwest` carries the features this crate uses: `gzip`,
+`system-proxy`, `json`, `query`, `multipart`, `form` (through `cirrus-auth`)
+and the chosen backend.
 
 ## Examples
 

@@ -67,4 +67,5 @@ tag-name = "{{prefix}}{{version}}"
 publish = true
 pre-release-replacements = [
     { file = "README.md", search = "cirrus-metadata = \"[^\"]+\"", replace = "cirrus-metadata = \"{{version}}\"", min = 1 },
+    { file = "README.md", search = 'cirrus-metadata = \{ version = "[^"]+"', replace = 'cirrus-metadata = { version = "{{version}}"', min = 1 },
 ]

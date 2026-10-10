@@ -189,6 +189,10 @@ pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// nothing of the client: keep such a proxy's `NoProxy` rules covering
 /// loopback, or use `https`.
 ///
+/// With the `bundled-roots` feature the builder already carries Mozilla's
+/// root set alongside the platform's, through
+/// [`crate::transport::merge_bundled_roots`].
+///
 /// Start from this builder when the token client needs a setting the
 /// flow builders do not expose, such as a private root CA, a proxy or a
 /// connection pool shared with other clients, so that adding it does not
@@ -200,7 +204,7 @@ pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// use cirrus_auth::{JwtAuth, reqwest, token_client_builder};
 ///
 /// let ca = reqwest::Certificate::from_pem(&fs_err::read("corp-root.pem")?)?;
-/// let http = token_client_builder().add_root_certificate(ca).build()?;
+/// let http = token_client_builder().tls_certs_merge([ca]).build()?;
 /// let auth = JwtAuth::builder()
 ///     .consumer_key("3MVG9...")
 ///     .username("integration-user@example.com")

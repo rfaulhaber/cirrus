@@ -78,3 +78,6 @@ push-remote = "origin"
 tag-prefix = "cirrus-auth-v"
 tag-name = "{{prefix}}{{version}}"
 publish = true
+pre-release-replacements = [
+    { file = "README.md", search = 'cirrus-auth = \{ version = "[^"]+"', replace = 'cirrus-auth = { version = "{{version}}"', min = 1 },
+]

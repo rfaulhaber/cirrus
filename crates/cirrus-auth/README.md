@@ -158,6 +158,39 @@ expose it through `source()` and don't repeat it in `Display`; print the
 chain (anyhow's `{:#}`) to see the cause. It's `#[non_exhaustive]` so
 future variants don't break downstream `match` arms.
 
+## Cargo features
+
+The TLS backend is a feature, under reqwest's names, and `rustls` is the
+default, so a manifest that names no features builds as it always has.
+
+| Feature | Effect |
+|---|---|
+| `rustls` (default) | rustls with the aws-lc-rs crypto provider, verifying against the operating system's trust store through `rustls-platform-verifier`. |
+| `rustls-no-provider` | rustls with the crypto provider left to the application, which calls `rustls::crypto::CryptoProvider::install_default` before building a client; reqwest panics at construction otherwise. For a process that standardizes on `ring` or a FIPS provider. |
+| `native-tls` | The operating system's TLS stack: OpenSSL on Linux, Secure Transport on macOS, SChannel on Windows. |
+| `native-tls-vendored` | `native-tls` with OpenSSL built from source, for a static or cross-compiled binary. |
+| `bundled-roots` | Merges Mozilla's root set (`webpki-root-certs`) into the trust store of every client this crate builds, alongside the platform's, so a host with no system CA bundle can still build one. Presumes a backend. |
+
+Pick a backend other than the default with `default-features = false`:
+
+```toml
+[dependencies]
+cirrus-auth = { version = "0.4.2", default-features = false, features = ["native-tls"] }
+```
+
+Enabling both backends is allowed and makes reqwest default to `native-tls`.
+The features only forward to reqwest, so they unify across the whole build
+the way reqwest's own do: a dependency that enables `reqwest/rustls` for
+itself brings aws-lc-rs back whatever this crate was told. `rustls-no-provider`
+changes which provider TLS uses, not whether aws-lc-rs compiles; JWT
+assertions are signed with it regardless (see
+[Crypto backend](#crypto-backend)).
+
+The crate re-exports `reqwest` with the features it uses itself: `gzip`,
+`system-proxy`, `form` and the chosen backend. Code that reaches
+`RequestBuilder::json`, `query` or `multipart` through `cirrus_auth::reqwest`
+adds reqwest with those features to its own manifest.
+
 ## Transport defaults
 
 When a flow builder isn't given an `http_client`, the client it builds
@@ -168,7 +201,8 @@ follow redirects: the grants here carry their credential in the request
 body, which reqwest replays on a 307/308. TLS is verified against the
 operating system's trust store, which the client loads when the flow is
 built: a `FROM scratch` or distroless image without `ca-certificates` fails
-at `build()` with `AuthError::HttpClient`, so install a CA bundle or add the
+at `build()` with `AuthError::HttpClient`. Install a CA bundle, enable the
+`bundled-roots` feature (see [Cargo features](#cargo-features)) or add the
 roots yourself. `token_client_builder()` returns a `reqwest::ClientBuilder`
 with the same settings, for adding a private root CA, a proxy or a shared
 connection pool without losing them. The client uses no proxy: `HTTP_PROXY`,
@@ -227,7 +261,9 @@ rather than its process-global crypto provider. A build that also enables
 jsonwebtoken's `rust_crypto` feature for its own purposes therefore does not
 affect token minting here, although jsonwebtoken itself requires exactly one
 backend or an explicitly installed provider for its own `encode` and
-`decode`.
+`decode`. For the same reason aws-lc-rs stays in the build under the
+`rustls-no-provider` feature: that feature decides which crypto provider TLS
+uses, and the signing here uses aws-lc-rs regardless.
 
 `cirrus` carries a `From<AuthError> for CirrusError` impl, so REST call
 sites that need an auth token can use `?` and surface the failure as
