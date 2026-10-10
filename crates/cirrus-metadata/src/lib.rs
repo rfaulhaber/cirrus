@@ -289,7 +289,7 @@ impl MetadataClient {
     /// each call. Every session type this SDK ships keeps it fixed for
     /// the session's lifetime (a refresh whose response names a
     /// different `instance_url` fails with
-    /// [`AuthError::InstanceUrlMismatch`](cirrus_auth::AuthError::InstanceUrlMismatch)),
+    /// [`AuthError::InstanceUrlMismatch`]),
     /// so only a custom [`AuthSession`] can make this value change.
     pub fn endpoint_url(&self) -> String {
         format!(
