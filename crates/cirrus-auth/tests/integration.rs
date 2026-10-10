@@ -32,13 +32,13 @@
 //!
 //! - `smoke` — verifies that whichever auth mode is configured
 //!   (`StaticTokenAuth` or `JwtAuth`) actually produces a bearer token
-//!   that Salesforce will accept on a tiny REST call, and that the
+//!   that Salesforce accepts on `/services/oauth2/userinfo`, that the
+//!   same probe refuses a token the org never issued, and that the
 //!   `AuthSession` trait surface (`access_token`, `instance_url`,
 //!   `invalidate`) behaves correctly against a live org.
 //! - `jwt` — full JWT bearer flow exercise: mint a token, verify it
-//!   maps to the expected user via `/services/oauth2/userinfo`, and
-//!   verify the cache returns the same token across consecutive calls
-//!   without re-hitting the token endpoint.
+//!   maps to the configured user via `/services/oauth2/userinfo`, and
+//!   verify the cache returns the same token across consecutive calls.
 //!
 //! Refresh, Client Credentials, and Token Exchange flows are **not**
 //! covered here — each requires bespoke connected-app setup that the

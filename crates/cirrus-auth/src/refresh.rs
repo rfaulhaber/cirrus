@@ -50,6 +50,13 @@
 //! it is set; with the setting on and no secret, every mint fails with an
 //! [`AuthError::OAuth`] from the token endpoint that names no setting.
 //!
+//! When the secret is set, it and the consumer key go out in an
+//! `Authorization: Basic` header (RFC 6749 §2.3.1) rather than the form
+//! body, which Salesforce documents for this grant and which keeps the
+//! secret out of body-logging intermediaries; the body then carries only
+//! `grant_type` and `refresh_token`. A public client sends `client_id`
+//! in the body and no header.
+//!
 //! The alternative to the secret is a `client_assertion`. Give the
 //! builder the private key behind the app's uploaded certificate through
 //! [`RefreshTokenAuthBuilder::private_key_pem_bytes`] or its file form,
@@ -127,7 +134,7 @@ use crate::assertion::{
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
+    ClientAuth, GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
     require_secure_login_url, revoke_token,
 };
 use async_trait::async_trait;
@@ -292,26 +299,41 @@ impl MintConfig {
         // replacement is written back below.
         let current_refresh = state.refresh_token.clone();
 
-        // Compose the form body. The client authenticates with its secret
+        // Compose the request. The client authenticates with its secret
         // or with a freshly signed assertion, never both: Salesforce reads
         // the assertion only when no secret is present, and `build`
-        // refuses the pair.
+        // refuses the pair. A secret goes in the Basic header together
+        // with the consumer key, and the form then carries neither, since
+        // Salesforce ignores the header when the body repeats the pair.
         let assertion;
         let mut body: Vec<(&str, &str)> = vec![
             ("grant_type", "refresh_token"),
-            ("client_id", self.consumer_key.as_str()),
             ("refresh_token", current_refresh.as_str()),
         ];
-        if let Some(secret) = self.consumer_secret.as_deref() {
-            body.push(("client_secret", secret));
-        }
+        let client_auth = match self.consumer_secret.as_deref() {
+            Some(client_secret) => ClientAuth::Basic {
+                client_id: &self.consumer_key,
+                client_secret,
+            },
+            None => {
+                body.push(("client_id", self.consumer_key.as_str()));
+                ClientAuth::Form
+            }
+        };
         if let Some(key) = &self.client_assertion_key {
             assertion = client_assertion(&self.consumer_key, &self.login_url, key)?;
             body.push(("client_assertion", assertion.as_str()));
             body.push(("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER));
         }
 
-        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
+        let token = exchange(
+            &self.http,
+            &self.login_url,
+            &body,
+            client_auth,
+            GrantReplay::Never,
+        )
+        .await?;
 
         // Adopt a rotated refresh token before any post-exchange failure
         // path (e.g. the instance_url check below). Once `exchange` returns
@@ -724,9 +746,11 @@ impl RefreshTokenAuthBuilder {
 mod tests {
     use super::*;
     use crate::test_support::decode_jwt_segment;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn builder_with_required_fields() -> RefreshTokenAuthBuilder {
@@ -953,11 +977,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confidential_client_includes_consumer_secret() {
+    async fn confidential_client_authenticates_with_a_basic_header() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_refresh_token_flow.htm&type=5
+        // (release 264): "Instead of sending client credentials as
+        // parameters in the body of the refresh token POST request, you
+        // can use the HTTP Basic authentication scheme. This scheme's
+        // format requires the client_id and client_secret in the
+        // authorization header of the post as follows:
+        // Authorization: Basic64Encode(client_id:secret)". And: "If the
+        // client_id and client_secret are sent in the POST's body, the
+        // authorization header is ignored", so neither may stay in the
+        // form.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
-            .and(body_string_contains("client_secret=top-secret"))
+            .and(header(
+                "authorization",
+                format!("Basic {}", STANDARD.encode("consumer-key-123:top-secret")),
+            ))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=5Aep861KIwKdekr"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "tok",
                 "instance_url": "https://my-org.my.salesforce.com"
@@ -970,31 +1009,31 @@ mod tests {
             .login_url(server.uri())
             .build()
             .unwrap();
-
-        // The body matcher above asserts client_secret is present. If it
-        // weren't, the mock would 404 and this would error.
         auth.access_token().await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let params: Vec<(String, String)> = serde_urlencoded::from_str(&body).unwrap();
+        assert!(
+            params
+                .iter()
+                .all(|(k, _)| k != "client_id" && k != "client_secret"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
-    async fn public_client_omits_consumer_secret() {
+    async fn public_client_sends_only_the_client_id_in_the_body() {
+        // With no secret there is nothing to put in a Basic header: the
+        // client identifies itself with `client_id` in the form alone.
         let server = MockServer::start().await;
-        // Match a body that does NOT include client_secret. wiremock has no
-        // direct "does not contain" matcher, so we rely on the structure:
-        // assert presence of grant_type and absence is verified by total
-        // body inspection in the responder.
-        let received_body = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let captured = received_body.clone();
-
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
-            .respond_with(BodyCapturingResponder {
-                captured,
-                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "tok",
-                    "instance_url": "https://my-org.my.salesforce.com"
-                })),
-            })
+            .and(body_string_contains("client_id=consumer-key-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "tok",
+                "instance_url": "https://my-org.my.salesforce.com"
+            })))
             .mount(&server)
             .await;
 
@@ -1004,7 +1043,13 @@ mod tests {
             .unwrap();
         auth.access_token().await.unwrap();
 
-        let body = received_body.lock().await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests[0].headers.get("authorization").is_none(),
+            "{:?}",
+            requests[0].headers
+        );
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
         assert!(
             !body.contains("client_secret"),
             "public client should not send client_secret, got: {body}"
@@ -1059,6 +1104,147 @@ mod tests {
         let later = auth.access_token().await;
         assert!(matches!(later, Err(AuthError::OAuth { .. })), "{later:?}");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_share_one_rotating_refresh_grant() {
+        // Callers that queue behind an in-flight refresh must take its
+        // outcome rather than each presenting the refresh token in turn:
+        // under Refresh Token Rotation every extra grant would rotate the
+        // token again and fire the handler again, and the module docs
+        // promise one rotation per refresh.
+        let server = MockServer::start().await;
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(
+                token_response("at-1", Some("rotated-1")).set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .on_rotation(Arc::new(RecordingHandler { seen: seen.clone() }))
+                .build()
+                .unwrap(),
+        );
+
+        let callers: Vec<_> = (0..10)
+            .map(|_| {
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.await.unwrap().unwrap(), "at-1");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(*seen.lock().await, vec!["rotated-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn invalidate_clears_the_cache_only_for_the_token_it_is_given() {
+        // `invalidate` is a compare-and-swap on the access token alone: a
+        // stale token that is not the cached one leaves the cache alone,
+        // and the cached one forces exactly one refresh grant.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: token_response("at-1", None),
+            })
+            .mount(&server)
+            .await;
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let cached = auth.access_token().await.unwrap().into_owned();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        auth.invalidate("not-the-cached-token").await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a non-matching invalidate is a no-op"
+        );
+
+        auth.invalidate(&cached).await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a matching invalidate forces one grant"
+        );
+        auth.access_token().await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the re-minted token is cached again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalidating_an_old_token_during_a_mint_leaves_the_new_token_cached() {
+        // A request that failed with the old token can call `invalidate`
+        // after a concurrent caller has already started a fresh mint. The
+        // call queues behind that mint and then finds a token it was not
+        // given, so it must not throw the new one away.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: token_response("at-1", None),
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: token_response("at-2", None).set_delay(Duration::from_millis(300)),
+            })
+            .mount(&server)
+            .await;
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .build()
+                .unwrap(),
+        );
+        let old = auth.access_token().await.unwrap().into_owned();
+        assert_eq!(old, "at-1");
+        auth.invalidate(&old).await;
+
+        let minter = {
+            let auth = Arc::clone(&auth);
+            tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+        };
+        // Wait until the second grant has reached the server, so the
+        // invalidate below queues behind a mint that is in flight.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hits.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second grant must reach the server");
+        auth.invalidate(&old).await;
+
+        assert_eq!(minter.await.unwrap().unwrap(), "at-2");
+        assert_eq!(&*auth.access_token().await.unwrap(), "at-2");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the late invalidate must not discard the token the mint produced"
+        );
     }
 
     #[tokio::test]

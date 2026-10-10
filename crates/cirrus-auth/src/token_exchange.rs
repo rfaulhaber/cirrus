@@ -69,7 +69,8 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url, revoke_token,
+    ClientAuth, GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
+    revoke_token,
 };
 use std::time::Duration;
 
@@ -241,7 +242,14 @@ impl TokenExchangeFlow {
             body.push(("token_handler", handler));
         }
 
-        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
+        let token = exchange(
+            &self.http,
+            &self.login_url,
+            &body,
+            ClientAuth::Form,
+            GrantReplay::Never,
+        )
+        .await?;
         Ok(TokenExchangeSession {
             access_token: token.access_token,
             refresh_token: token.refresh_token,

@@ -13,8 +13,23 @@
 //! `PRIVATE_KEY_PATH`, `LOGIN_URL`). When only static-token mode is
 //! configured, every test in this module skips silently.
 
-use crate::common::{ping_with_token, try_init_jwt_auth, try_instance_url};
+use crate::common::{
+    assert_token_is_accepted, configured_username, try_init_jwt_auth, try_instance_url,
+};
 use cirrus_auth::AuthSession;
+
+/// Asserts that the org accepts `token` and that it was minted for the
+/// configured user: the JWT names the user in `sub`, so a token for
+/// anyone else means the assertion was built wrongly.
+async fn assert_minted_for_the_configured_user(token: &str) {
+    let instance_url = try_instance_url().unwrap();
+    let username = assert_token_is_accepted(&instance_url, token).await;
+    let expected = configured_username().expect("JWT mode sets the username");
+    assert!(
+        username.eq_ignore_ascii_case(&expected),
+        "the token belongs to {username}, not the configured user",
+    );
+}
 
 #[tokio::test]
 #[ignore]
@@ -34,12 +49,7 @@ async fn jwt_flow_mints_a_token_accepted_by_the_org() {
         token.len(),
     );
 
-    let instance_url = try_instance_url().unwrap();
-    let status = ping_with_token(&instance_url, &token).await.unwrap();
-    assert_eq!(
-        status, 200,
-        "Salesforce should accept the JWT-minted bearer token (got HTTP {status})",
-    );
+    assert_minted_for_the_configured_user(&token).await;
 }
 
 #[tokio::test]
@@ -69,7 +79,7 @@ async fn jwt_flow_caches_token_across_calls() {
 
 #[tokio::test]
 #[ignore]
-async fn jwt_invalidate_forces_a_fresh_mint() {
+async fn jwt_token_after_invalidate_is_usable() {
     let Some(auth) = try_init_jwt_auth().await else {
         return;
     };
@@ -78,19 +88,15 @@ async fn jwt_invalidate_forces_a_fresh_mint() {
     auth.invalidate(&first).await;
     let second = auth.access_token().await.unwrap().to_string();
 
-    // We can't always require the literal token bytes to differ —
-    // Salesforce *may* (rarely) re-issue the same token within a short
-    // window. The real invariant: after invalidate, the next call hits
-    // the token endpoint again and still produces a usable token.
+    // Whether the second call re-minted is not observable from here:
+    // Salesforce may re-issue the same session id within a short window,
+    // and a cached token would pass every check below just as well. The
+    // offline `invalidate_clears_cache_only_when_stale_token_matches`
+    // pins the re-mint; this checks only that what comes back after an
+    // invalidate is a token the org accepts for the configured user.
     assert!(
         !second.is_empty(),
         "post-invalidate JWT mint should succeed"
     );
-
-    let instance_url = try_instance_url().unwrap();
-    let status = ping_with_token(&instance_url, &second).await.unwrap();
-    assert_eq!(
-        status, 200,
-        "post-invalidate JWT-minted token should still be accepted by the org",
-    );
+    assert_minted_for_the_configured_user(&second).await;
 }

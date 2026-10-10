@@ -18,6 +18,16 @@
 //!    instance URL, and (if the connected app's scopes include
 //!    `refresh_token`) a refresh token.
 //!
+//! A denial never reaches the token endpoint. When the user refuses, or
+//! the authorization request is malformed, Salesforce redirects to the
+//! callback with an `error` code (`access_denied` for a refusal) and no
+//! `code`; RFC 6749 §4.1.2.1 adds an optional `error_description`. The
+//! callback handler therefore checks for `error` before calling
+//! `complete`. A callback with no `code` has nothing to exchange;
+//! posting an empty code turns the clear `access_denied` into an opaque
+//! `invalid_grant` from the token endpoint.
+//! (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5>)
+//!
 //! The library is **stateless between the two phases** — it never stores
 //! the verifier internally. This composes cleanly with any web framework
 //! the caller chooses, and lets multiple in-flight authorizations coexist
@@ -78,6 +88,12 @@
 //! secret. With a setting on and no secret, the token endpoint answers
 //! with an [`AuthError::OAuth`] that names no setting.
 //!
+//! When the secret is set, the code exchange and the refresh grant carry
+//! it and the consumer key in an `Authorization: Basic` header (RFC 6749
+//! §2.3.1), which Salesforce documents for both requests, and leave both
+//! out of the form body; a public client sends `client_id` in the body
+//! and no header.
+//!
 //! A confidential client that must not hold the secret on the host can
 //! authenticate both requests with a `client_assertion` instead: give
 //! [`WebServerFlowBuilder::private_key_pem_bytes`] (or its file form) the
@@ -98,7 +114,8 @@ use crate::assertion::{
 use crate::error::{AuthError, AuthResult};
 use crate::refresh::{RefreshTokenAuth, RefreshTokenAuthBuilder};
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url, revoke_token,
+    ClientAuth, GrantReplay, HttpClientConfig, exchange, normalize_url, require_secure_login_url,
+    revoke_token,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -320,24 +337,40 @@ impl WebServerFlow {
         // The client authenticates with its secret or with a freshly
         // signed assertion, never both: Salesforce reads the assertion
         // only when no secret is present, and `build` refuses the pair.
+        // A secret goes in the Basic header together with the consumer
+        // key, and the form then carries neither, since Salesforce
+        // ignores the header when the body repeats the pair.
         let assertion;
         let mut body: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
-            ("client_id", self.consumer_key.as_str()),
             ("redirect_uri", self.redirect_uri.as_str()),
             ("code_verifier", pending.code_verifier.as_str()),
         ];
-        if let Some(secret) = self.consumer_secret.as_deref() {
-            body.push(("client_secret", secret));
-        }
+        let client_auth = match self.consumer_secret.as_deref() {
+            Some(client_secret) => ClientAuth::Basic {
+                client_id: &self.consumer_key,
+                client_secret,
+            },
+            None => {
+                body.push(("client_id", self.consumer_key.as_str()));
+                ClientAuth::Form
+            }
+        };
         if let Some(key) = &self.client_assertion_key {
             assertion = client_assertion(&self.consumer_key, &self.login_url, key)?;
             body.push(("client_assertion", assertion.as_str()));
             body.push(("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER));
         }
 
-        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Never).await?;
+        let token = exchange(
+            &self.http,
+            &self.login_url,
+            &body,
+            client_auth,
+            GrantReplay::Never,
+        )
+        .await?;
         Ok(CompletedSession {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
@@ -907,8 +940,9 @@ mod tests {
     use super::*;
     use crate::AuthSession;
     use crate::test_support::decode_jwt_segment;
+    use base64::engine::general_purpose::STANDARD;
     use std::sync::Arc;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     /// Salesforce's documented token response for the web server flow.
@@ -1395,12 +1429,16 @@ mod tests {
         let state = pending.state().to_string();
         let verifier = pending.code_verifier.clone();
 
-        let published_challenge = url::Url::parse(&url)
-            .unwrap()
-            .query_pairs()
-            .find(|(k, _)| k == "code_challenge")
-            .map(|(_, v)| v.into_owned())
-            .unwrap();
+        let authorize_url = url::Url::parse(&url).unwrap();
+        let query = |name: &str| {
+            authorize_url
+                .query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap()
+        };
+        let published_challenge = query("code_challenge");
+        let published_redirect_uri = query("redirect_uri");
 
         flow.complete(pending, "c", &state).await.unwrap();
 
@@ -1408,6 +1446,17 @@ mod tests {
         let sent = form_value(&body, "code_verifier").expect("code_verifier must be sent");
         assert_eq!(sent, verifier);
         assert_eq!(pkce_s256_challenge(&sent), published_challenge);
+
+        // SOURCE: RFC 6749 §4.1.3, `redirect_uri` is "REQUIRED, if the
+        // redirect_uri parameter was included in the authorization request
+        // ... and their values MUST be identical"; `start` always sends
+        // it. The Web Server flow page lists it among the token request
+        // parameters: "The redirect URI must match one of the values in
+        // the external client app's Callback URL field."
+        assert_eq!(
+            form_value(&body, "redirect_uri").expect("redirect_uri must be sent"),
+            published_redirect_uri
+        );
     }
 
     #[tokio::test]
@@ -1483,8 +1532,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .and(body_string_contains("grant_type=refresh_token"))
-            .and(body_string_contains("client_id=consumer-key-123"))
-            .and(body_string_contains("client_secret=hunter2"))
+            .and(header(
+                "authorization",
+                format!("Basic {}", STANDARD.encode("consumer-key-123:hunter2")),
+            ))
             .and(body_string_contains(
                 "refresh_token=5Aep861KIwKdekr...refresh",
             ))
@@ -1610,6 +1661,55 @@ mod tests {
         assert!(matches!(err, AuthError::StateMismatch), "{err:?}");
     }
 
+    #[tokio::test]
+    async fn complete_rejects_a_state_that_differs_in_any_byte() {
+        // `wrong-state` above fails on length alone. These reach the
+        // byte comparison: the right length with every byte wrong, the
+        // real state with its first or last byte changed, and the two
+        // short forms a dropped length check would let through. None may
+        // reach the token endpoint, which has no mock and would answer
+        // 404.
+        let server = MockServer::start().await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let (_url, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        assert_eq!(state.len(), 22);
+        let flip = |index: usize| {
+            let mut bytes = state.clone().into_bytes();
+            bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
+            String::from_utf8(bytes).unwrap()
+        };
+        let forged = [
+            "A".repeat(22),
+            flip(0),
+            flip(21),
+            String::new(),
+            state[..21].to_string(),
+        ];
+        for returned in forged {
+            let pending = pending.clone();
+            let err = flow.complete(pending, "code", &returned).await.unwrap_err();
+            assert!(
+                matches!(err, AuthError::StateMismatch),
+                "{returned:?}: {err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn constant_time_eq_compares_every_byte() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"same-length", b"same-length"));
+        assert!(!constant_time_eq(b"same-length", b"same-lengtH"));
+        assert!(!constant_time_eq(b"same-length", b"Same-length"));
+        assert!(!constant_time_eq(b"prefix", b"prefix-and-more"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
     /// Throwaway RSA key shared with the JWT tests; see
     /// `tests/fixtures/test_rsa_key.pem`.
     const TEST_PEM: &[u8] = include_bytes!("../tests/fixtures/test_rsa_key.pem");
@@ -1726,11 +1826,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confidential_client_includes_client_secret() {
+    async fn confidential_client_authenticates_with_a_basic_header() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5
+        // (release 264), "HTTP Basic Authentication Scheme": "Instead of
+        // sending client credentials as parameters in the body of the
+        // POST, Salesforce supports the HTTP Basic authentication scheme.
+        // This scheme's format requires the client_id and client_secret
+        // in the authorization header of the post as follows:
+        // Authorization: Basic64Encode(client_id:secret)". And: "If the
+        // client_id and client_secret are sent in the POST's body, the
+        // authorization header is ignored", so neither may stay in the
+        // form.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
-            .and(body_string_contains("client_secret=hunter2"))
+            .and(header(
+                "authorization",
+                format!("Basic {}", STANDARD.encode("consumer-key-123:hunter2")),
+            ))
+            .and(body_string_contains("grant_type=authorization_code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
             .mount(&server)
             .await;
@@ -1743,19 +1857,27 @@ mod tests {
         let (_, pending) = flow.start().unwrap();
         let state = pending.state().to_string();
         flow.complete(pending, "c", &state).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let params: Vec<(String, String)> = serde_urlencoded::from_str(&body).unwrap();
+        assert!(
+            params
+                .iter()
+                .all(|(k, _)| k != "client_id" && k != "client_secret"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
-    async fn public_client_omits_client_secret() {
+    async fn public_client_sends_only_the_client_id_in_the_body() {
+        // With no secret there is nothing to put in a Basic header: the
+        // client identifies itself with `client_id` in the form alone.
         let server = MockServer::start().await;
-        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
-
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
-            .respond_with(BodyCapturingResponder {
-                captured: captured.clone(),
-                response: ResponseTemplate::new(200).set_body_json(documented_token_response()),
-            })
+            .and(body_string_contains("client_id=consumer-key-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(documented_token_response()))
             .mount(&server)
             .await;
 
@@ -1767,7 +1889,13 @@ mod tests {
         let state = pending.state().to_string();
         flow.complete(pending, "c", &state).await.unwrap();
 
-        let body = captured.lock().await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests[0].headers.get("authorization").is_none(),
+            "{:?}",
+            requests[0].headers
+        );
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
         assert!(
             !body.contains("client_secret"),
             "public client should not send client_secret, got: {body}"
@@ -1810,13 +1938,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_denied_surfaces_oauth_error() {
+    async fn a_token_endpoint_error_surfaces_as_oauth_error() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5
+        // (release 264): `invalid_grant` covers "Invalid authorization
+        // code." A user's denial never reaches the token endpoint; it
+        // arrives on the callback as `error=access_denied`, which the
+        // caller checks before `complete` (see the module docs).
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "error": "invalid_grant",
-                "error_description": "user denied access"
+                "error_description": "Invalid authorization code."
             })))
             .mount(&server)
             .await;

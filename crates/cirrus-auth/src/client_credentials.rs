@@ -6,6 +6,18 @@
 //! clients only — there is no public-client variant — so `consumer_secret`
 //! is mandatory.
 //!
+//! ## Client authentication
+//!
+//! The consumer key and secret travel in an `Authorization: Basic`
+//! header (RFC 6749 §2.3.1), and the form body carries only
+//! `grant_type=client_credentials`. Salesforce documents both placements
+//! and recommends the header "for added security": proxies and gateways
+//! that log request bodies routinely mask `Authorization` and nothing
+//! else. The header is the Base64 of `client_id:client_secret`, as the
+//! Help page spells it out.
+//!
+//! (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_client_credentials_flow.htm&type=5>)
+//!
 //! ## Salesforce-specific configuration
 //!
 //! Beyond the standard OAuth wire shape, Salesforce requires the connected
@@ -41,7 +53,7 @@ use crate::AuthSession;
 use crate::error::{AuthError, AuthResult};
 use crate::mint::MintState;
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
+    ClientAuth, GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
     require_secure_login_url,
 };
 use async_trait::async_trait;
@@ -139,13 +151,23 @@ impl ClientCredentialsAuth {
             login_url = %self.login_url,
             "minting fresh access token",
         );
-        let body = [
-            ("grant_type", "client_credentials"),
-            ("client_id", self.consumer_key.as_str()),
-            ("client_secret", self.consumer_secret.as_str()),
-        ];
+        // The credentials travel in the Basic header, so the form carries
+        // only the grant type; Salesforce ignores the header when the
+        // body repeats the pair.
+        let body = [("grant_type", "client_credentials")];
+        let client_auth = ClientAuth::Basic {
+            client_id: &self.consumer_key,
+            client_secret: &self.consumer_secret,
+        };
 
-        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Safe).await?;
+        let token = exchange(
+            &self.http,
+            &self.login_url,
+            &body,
+            client_auth,
+            GrantReplay::Safe,
+        )
+        .await?;
         check_instance_url(&self.instance_url, &token)?;
 
         Ok(crate::mint::CachedToken::from_response(
@@ -342,9 +364,11 @@ impl ClientCredentialsAuthBuilder {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn builder_with_required_fields() -> ClientCredentialsAuthBuilder {
@@ -443,15 +467,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_succeeds_and_caches() {
+    async fn mint_authenticates_with_a_basic_header_and_caches() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_client_credentials_flow.htm&type=5
+        // (release 264): "for added security, put your client credentials
+        // in a Basic authorization header. ... the client_id is appended
+        // to the client_secret in the format client_id:client_secret, and
+        // the resulting value is Base64-encoded. ... If you use this
+        // format, the grant_type is the only required parameter in the
+        // request body." The exact-body matcher pins that neither
+        // credential is also in the form, where it would make the
+        // endpoint ignore the header.
         let server = MockServer::start().await;
         let hits = Arc::new(AtomicUsize::new(0));
 
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
-            .and(body_string_contains("grant_type=client_credentials"))
-            .and(body_string_contains("client_id=consumer-key-123"))
-            .and(body_string_contains("client_secret=top-secret"))
+            .and(header(
+                "authorization",
+                format!("Basic {}", STANDARD.encode("consumer-key-123:top-secret")),
+            ))
+            .and(body_string("grant_type=client_credentials"))
             .respond_with(CountingResponder {
                 hits: hits.clone(),
                 response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -646,6 +681,86 @@ mod tests {
         let _ = auth.access_token().await.unwrap();
         let _ = auth.access_token().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidate_clears_the_cache_only_for_the_token_it_is_given() {
+        // `invalidate` is a compare-and-swap on this flow's own cache: a
+        // stale token that is not the cached one leaves the cache alone
+        // (a concurrent caller may just have minted the cached one), and
+        // the cached one forces exactly one re-mint.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "00DXX!ACCESS",
+                    "instance_url": "https://my-org.my.salesforce.com",
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let cached = auth.access_token().await.unwrap().into_owned();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        auth.invalidate("not-the-cached-token").await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a non-matching invalidate is a no-op"
+        );
+
+        auth.invalidate(&cached).await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a matching invalidate forces one re-mint"
+        );
+        auth.access_token().await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the re-minted token is cached again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_advertised_lifetime_longer_than_the_margin_caches_the_token() {
+        // SOURCE: RFC 6749 §5.1, `expires_in` is "the lifetime in seconds
+        // of the access token". An hour-long token under the default TTL
+        // is served from the cache; read as milliseconds, or zeroed, it
+        // would sit inside the refresh margin and be re-minted every call.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "00DXX!ACCESS",
+                    "instance_url": "https://my-org.my.salesforce.com",
+                    "expires_in": 3600,
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        auth.access_token().await.unwrap();
+        auth.access_token().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
