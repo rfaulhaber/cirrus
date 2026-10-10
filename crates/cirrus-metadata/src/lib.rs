@@ -546,19 +546,20 @@ impl MetadataClientBuilder {
                 HeaderValue::from_str(ua)
                     .map_err(|e| MetadataError::InvalidHeader(e.to_string()))?,
             );
-            let mut builder = reqwest::Client::builder()
-                .default_headers(headers)
-                // The Metadata API carries the session token in the
-                // request body, where a redirect's cross-host header
-                // stripping can't reach it. Surfacing a 3xx as an error
-                // beats re-POSTing the envelope — token included — to
-                // whatever host the Location named.
-                .redirect(reqwest::redirect::Policy::none())
-                // reqwest obeys HTTP_PROXY and the system proxy by
-                // default, and a proxy on the path is what the loopback
-                // exemption to the https rule assumes there is not. Only
-                // a proxy named on the builder is used.
-                .no_proxy();
+            let mut builder =
+                cirrus_auth::transport::merge_bundled_roots(reqwest::Client::builder())
+                    .default_headers(headers)
+                    // The Metadata API carries the session token in the
+                    // request body, where a redirect's cross-host header
+                    // stripping can't reach it. Surfacing a 3xx as an error
+                    // beats re-POSTing the envelope — token included — to
+                    // whatever host the Location named.
+                    .redirect(reqwest::redirect::Policy::none())
+                    // reqwest obeys HTTP_PROXY and the system proxy by
+                    // default, and a proxy on the path is what the loopback
+                    // exemption to the https rule assumes there is not. Only
+                    // a proxy named on the builder is used.
+                    .no_proxy();
             for proxy in self.proxies {
                 builder = builder.proxy(proxy);
             }
@@ -781,6 +782,31 @@ mod tests {
         let md = MetadataClient::builder().auth(auth).build().unwrap();
         let response = md.request_builder().send().await.unwrap();
         assert_eq!(response.status().as_u16(), 200);
+    }
+
+    /// The default client merges Mozilla's roots under `bundled-roots`,
+    /// so an empty system store (Linux only: the variables below are
+    /// what rustls-native-certs reads there) does not fail `build()`.
+    /// Process-wide variables, so a no-op under a threaded runner.
+    #[test]
+    #[cfg(all(unix, not(target_vendor = "apple"), feature = "bundled-roots"))]
+    fn bundled_roots_survive_an_empty_system_store() {
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before any other thread of
+        // that process exists, so nothing reads the environment while it
+        // is modified.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", "/nonexistent/cirrus-no-roots.pem");
+            std::env::set_var("SSL_CERT_DIR", "/nonexistent/cirrus-no-roots");
+        }
+        let auth = Arc::new(auth::StaticTokenAuth::new(
+            "tok",
+            "https://my.salesforce.com",
+        ));
+        MetadataClient::builder().auth(auth).build().unwrap();
     }
 
     #[test]

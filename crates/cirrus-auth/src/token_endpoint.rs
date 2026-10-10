@@ -225,7 +225,7 @@ fn hardened_client_builder(
     connect_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
 ) -> reqwest::ClientBuilder {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::transport::merge_bundled_roots(reqwest::Client::builder())
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
     if let Some(timeout) = connect_timeout {
@@ -1337,5 +1337,71 @@ mod tests {
         let http = token_client_builder().build().unwrap();
         let response = http.post(&url).send().await.unwrap();
         assert_eq!(response.status().as_u16(), 200);
+    }
+
+    // The two tests below point the system-store lookup at paths that
+    // hold nothing. They run on Linux only: rustls-native-certs reads
+    // `SSL_CERT_FILE` / `SSL_CERT_DIR` there, while the macOS and Windows
+    // verifiers read a platform store no variable empties. Both set
+    // process-wide variables, so they are no-ops under a threaded runner.
+
+    /// The premise of the `bundled-roots` feature: with the default
+    /// backend, a host with no system CA bundle cannot build a client at
+    /// all, since the platform verifier is constructed eagerly and
+    /// refuses an empty root store.
+    #[test]
+    #[cfg(all(
+        unix,
+        not(target_vendor = "apple"),
+        feature = "rustls",
+        not(any(
+            feature = "native-tls",
+            feature = "native-tls-vendored",
+            feature = "bundled-roots"
+        ))
+    ))]
+    fn an_empty_system_store_fails_the_default_client() {
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before any other thread of
+        // that process exists, so nothing reads the environment while it
+        // is modified.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", "/nonexistent/cirrus-no-roots.pem");
+            std::env::set_var("SSL_CERT_DIR", "/nonexistent/cirrus-no-roots");
+        }
+        let err = token_client_builder().build().unwrap_err();
+        assert!(err.is_builder(), "{err:?}");
+        let mut chain = Vec::new();
+        let mut source: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = source {
+            chain.push(e.to_string());
+            source = e.source();
+        }
+        assert!(
+            chain
+                .iter()
+                .any(|m| m.contains("No CA certificates were loaded from the system")),
+            "{chain:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_vendor = "apple"), feature = "bundled-roots"))]
+    fn bundled_roots_survive_an_empty_system_store() {
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before any other thread of
+        // that process exists, so nothing reads the environment while it
+        // is modified.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", "/nonexistent/cirrus-no-roots.pem");
+            std::env::set_var("SSL_CERT_DIR", "/nonexistent/cirrus-no-roots");
+        }
+        token_client_builder().build().unwrap();
     }
 }

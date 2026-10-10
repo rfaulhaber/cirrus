@@ -43,6 +43,17 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-
 wiremock.workspace = true
 zip.workspace = true
 
+[features]
+default = ["rustls"]
+# Each forwards the cirrus-auth feature of the same name, which is where
+# the TLS choice is documented, and reqwest's, since this crate builds
+# its own client.
+rustls = ["cirrus-auth/rustls", "reqwest/rustls"]
+rustls-no-provider = ["cirrus-auth/rustls-no-provider", "reqwest/rustls-no-provider"]
+native-tls = ["cirrus-auth/native-tls", "reqwest/native-tls"]
+native-tls-vendored = ["cirrus-auth/native-tls-vendored", "reqwest/native-tls-vendored"]
+bundled-roots = ["cirrus-auth/bundled-roots"]
+
 [lints]
 workspace = true
 
