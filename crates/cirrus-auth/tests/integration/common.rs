@@ -259,22 +259,55 @@ pub async fn try_init_jwt_auth() -> Option<JwtAuth> {
     Some(auth)
 }
 
-/// Lightweight verifier: hits a trivial Salesforce REST endpoint
-/// (`/services/data`) with the given bearer token and asserts the org
-/// accepted it. Used as an end-to-end check that a minted token is
-/// actually valid against the live org, without pulling in the `cirrus`
-/// crate as a dev-dep.
+/// The username the JWT configuration mints for, when JWT mode is
+/// configured.
+pub fn configured_username() -> Option<String> {
+    env_var(ENV_USERNAME)
+}
+
+/// Calls the UserInfo endpoint (`/services/oauth2/userinfo`) with the
+/// given bearer token and returns the HTTP status plus the parsed body
+/// when the org answered 200.
 ///
-/// Returns the HTTP status the org returned for the call so the caller
-/// can also assert on it.
-pub async fn ping_with_token(instance_url: &str, token: &str) -> reqwest::Result<u16> {
-    let url = format!("{instance_url}/services/data");
+/// This is the probe for "is this token valid against the live org":
+/// the Versions resource (`/services/data`) needs no authentication and
+/// answers 200 to any bearer, while UserInfo answers 403
+/// `Bad_OAuth_Token` to an invalid one and names the user behind a valid
+/// one in `preferred_username`. Done with a bare `reqwest` client rather
+/// than the `cirrus` crate, which is not a dev-dependency here.
+///
+/// SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_using_userinfo_endpoint.htm&type=5
+pub async fn userinfo_with_token(
+    instance_url: &str,
+    token: &str,
+) -> reqwest::Result<(u16, Option<serde_json::Value>)> {
+    let url = format!("{instance_url}/services/oauth2/userinfo");
     let resp = reqwest::Client::new()
         .get(&url)
         .bearer_auth(token)
         .send()
         .await?;
-    Ok(resp.status().as_u16())
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Ok((status, None));
+    }
+    let body = serde_json::from_slice::<serde_json::Value>(&resp.bytes().await?)
+        .expect("UserInfo answered 200 with a body that is not JSON");
+    Ok((status, Some(body)))
+}
+
+/// Asserts that the org accepts `token` on an authenticated resource and
+/// returns the `preferred_username` it belongs to.
+pub async fn assert_token_is_accepted(instance_url: &str, token: &str) -> String {
+    let (status, body) = userinfo_with_token(instance_url, token)
+        .await
+        .expect("UserInfo call should not fail at the transport layer");
+    assert_eq!(
+        status, 200,
+        "the org should accept the bearer token on UserInfo (got HTTP {status})"
+    );
+    body.and_then(|body| body["preferred_username"].as_str().map(str::to_owned))
+        .expect("UserInfo should name the user in preferred_username")
 }
 
 #[cfg(test)]

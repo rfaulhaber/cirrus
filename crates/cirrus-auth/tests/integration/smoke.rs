@@ -8,7 +8,9 @@
 //!
 //! [`AuthSession`]: cirrus_auth::AuthSession
 
-use crate::common::{ping_with_token, try_init_auth, try_instance_url};
+use crate::common::{
+    assert_token_is_accepted, try_init_auth, try_instance_url, userinfo_with_token,
+};
 
 #[tokio::test]
 #[ignore]
@@ -24,13 +26,28 @@ async fn auth_session_produces_a_usable_bearer_token() {
     assert!(!token.is_empty(), "minted token should not be empty");
 
     let instance_url = try_instance_url().expect("instance URL was just validated");
-    let status = ping_with_token(&instance_url, &token)
+    assert_token_is_accepted(&instance_url, &token).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_probe_rejects_a_token_the_org_never_issued() {
+    // Negative control for the probe the other tests rely on: a resource
+    // that accepted any bearer would let every "the org accepts this
+    // token" assertion pass on a dead or garbage token.
+    // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_using_userinfo_endpoint.htm&type=5
+    // "403 (forbidden) — Bad_OAuth_Token | Invalid access token".
+    let Some(instance_url) = try_instance_url() else {
+        return;
+    };
+    let (status, body) = userinfo_with_token(&instance_url, "00D000000000000!not-a-session-id")
         .await
-        .expect("REST call to /services/data should not fail at the transport layer");
-    assert_eq!(
-        status, 200,
-        "Salesforce should accept the freshly minted bearer token (got HTTP {status})",
+        .expect("UserInfo call should not fail at the transport layer");
+    assert!(
+        matches!(status, 401 | 403),
+        "UserInfo should refuse a token the org never issued (got HTTP {status})"
     );
+    assert!(body.is_none());
 }
 
 #[tokio::test]
@@ -77,6 +94,5 @@ async fn invalidate_then_access_token_still_returns_a_valid_token() {
     // Either way, the post-invalidate token should be accepted by the
     // org — that's the property `invalidate` is supposed to preserve.
     let instance_url = try_instance_url().unwrap();
-    let status = ping_with_token(&instance_url, &second).await.unwrap();
-    assert_eq!(status, 200, "post-invalidate token should be accepted");
+    assert_token_is_accepted(&instance_url, &second).await;
 }
