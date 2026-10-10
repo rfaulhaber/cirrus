@@ -684,6 +684,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidate_clears_the_cache_only_for_the_token_it_is_given() {
+        // `invalidate` is a compare-and-swap on this flow's own cache: a
+        // stale token that is not the cached one leaves the cache alone
+        // (a concurrent caller may just have minted the cached one), and
+        // the cached one forces exactly one re-mint.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "00DXX!ACCESS",
+                    "instance_url": "https://my-org.my.salesforce.com",
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let cached = auth.access_token().await.unwrap().into_owned();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        auth.invalidate("not-the-cached-token").await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a non-matching invalidate is a no-op"
+        );
+
+        auth.invalidate(&cached).await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a matching invalidate forces one re-mint"
+        );
+        auth.access_token().await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the re-minted token is cached again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_advertised_lifetime_longer_than_the_margin_caches_the_token() {
+        // SOURCE: RFC 6749 §5.1, `expires_in` is "the lifetime in seconds
+        // of the access token". An hour-long token under the default TTL
+        // is served from the cache; read as milliseconds, or dropped, it
+        // would sit inside the refresh margin and be re-minted every call.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "00DXX!ACCESS",
+                    "instance_url": "https://my-org.my.salesforce.com",
+                    "expires_in": 3600,
+                })),
+            })
+            .mount(&server)
+            .await;
+
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        auth.access_token().await.unwrap();
+        auth.access_token().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn an_unbounded_token_ttl_caches_the_token() {
         // `Duration::MAX` means "never expire locally": the token stays
         // cached until it is invalidated. It must not collapse into "mint

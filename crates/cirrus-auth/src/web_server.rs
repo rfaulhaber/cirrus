@@ -18,6 +18,16 @@
 //!    instance URL, and (if the connected app's scopes include
 //!    `refresh_token`) a refresh token.
 //!
+//! A denial never reaches the token endpoint. When the user refuses, or
+//! the authorization request is malformed, Salesforce redirects to the
+//! callback with `error` (for a refusal, `access_denied`) and the
+//! `error_description` in place of `code`, so the callback handler
+//! checks for `error` before calling `complete`. A callback with no
+//! `code` has nothing to exchange; posting an empty code turns the
+//! clear `access_denied` into an opaque `invalid_grant` from the token
+//! endpoint.
+//! (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5>)
+//!
 //! The library is **stateless between the two phases** — it never stores
 //! the verifier internally. This composes cleanly with any web framework
 //! the caller chooses, and lets multiple in-flight authorizations coexist
@@ -1419,12 +1429,16 @@ mod tests {
         let state = pending.state().to_string();
         let verifier = pending.code_verifier.clone();
 
-        let published_challenge = url::Url::parse(&url)
-            .unwrap()
-            .query_pairs()
-            .find(|(k, _)| k == "code_challenge")
-            .map(|(_, v)| v.into_owned())
-            .unwrap();
+        let authorize_url = url::Url::parse(&url).unwrap();
+        let query = |name: &str| {
+            authorize_url
+                .query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap()
+        };
+        let published_challenge = query("code_challenge");
+        let published_redirect_uri = query("redirect_uri");
 
         flow.complete(pending, "c", &state).await.unwrap();
 
@@ -1432,6 +1446,17 @@ mod tests {
         let sent = form_value(&body, "code_verifier").expect("code_verifier must be sent");
         assert_eq!(sent, verifier);
         assert_eq!(pkce_s256_challenge(&sent), published_challenge);
+
+        // SOURCE: RFC 6749 §4.1.3, `redirect_uri` is "REQUIRED, if the
+        // redirect_uri parameter was included in the authorization request
+        // ... and their values MUST be identical"; `start` always sends
+        // it. The Web Server flow page lists it among the token request
+        // parameters: "The redirect URI must match one of the values in
+        // the external client app's Callback URL field."
+        assert_eq!(
+            form_value(&body, "redirect_uri").expect("redirect_uri must be sent"),
+            published_redirect_uri
+        );
     }
 
     #[tokio::test]
@@ -1634,6 +1659,55 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AuthError::StateMismatch), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_a_state_that_differs_in_any_byte() {
+        // `wrong-state` above fails on length alone. These reach the
+        // byte comparison: the right length with every byte wrong, the
+        // real state with its first or last byte changed, and the two
+        // short forms a dropped length check would let through. None may
+        // reach the token endpoint, which has no mock and would answer
+        // 404.
+        let server = MockServer::start().await;
+        let flow = flow_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let (_url, pending) = flow.start().unwrap();
+        let state = pending.state().to_string();
+        assert_eq!(state.len(), 22);
+        let flip = |index: usize| {
+            let mut bytes = state.clone().into_bytes();
+            bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
+            String::from_utf8(bytes).unwrap()
+        };
+        let forged = [
+            "A".repeat(22),
+            flip(0),
+            flip(21),
+            String::new(),
+            state[..21].to_string(),
+        ];
+        for returned in forged {
+            let pending = pending.clone();
+            let err = flow.complete(pending, "code", &returned).await.unwrap_err();
+            assert!(
+                matches!(err, AuthError::StateMismatch),
+                "{returned:?}: {err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn constant_time_eq_compares_every_byte() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"same-length", b"same-length"));
+        assert!(!constant_time_eq(b"same-length", b"same-lengtH"));
+        assert!(!constant_time_eq(b"same-length", b"Same-length"));
+        assert!(!constant_time_eq(b"prefix", b"prefix-and-more"));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 
     /// Throwaway RSA key shared with the JWT tests; see
@@ -1864,13 +1938,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_denied_surfaces_oauth_error() {
+    async fn a_token_endpoint_error_surfaces_as_oauth_error() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5
+        // (release 264): `invalid_grant` covers "Invalid authorization
+        // code." A user's denial never reaches the token endpoint; it
+        // arrives on the callback as `error=access_denied`, which the
+        // caller checks before `complete` (see the module docs).
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "error": "invalid_grant",
-                "error_description": "user denied access"
+                "error_description": "Invalid authorization code."
             })))
             .mount(&server)
             .await;

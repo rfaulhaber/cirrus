@@ -174,6 +174,7 @@ mod tests {
             "http://LOCALHOST",
             "http://127.0.0.1:1234",
             "http://127.1.2.3",
+            "http://127.255.0.1",
             "http://[::1]:8080",
         ] {
             let url = parse(u);
@@ -184,13 +185,20 @@ mod tests {
 
     #[test]
     fn dotted_localhost_names_and_other_hosts_are_not_loopback() {
+        // Names that merely start or end with `localhost`, and private or
+        // documentation addresses, are off-machine as far as the rule is
+        // concerned.
         for u in [
             "http://sf.localhost:8080",
             "http://api.localhost",
+            "http://localhost.evil.example",
+            "http://notlocalhost",
             "http://my-org.my.salesforce.com",
             "http://192.0.2.1",
+            "http://203.0.113.7",
             "http://10.0.0.1",
             "http://[fe80::1]",
+            "http://[2001:db8::1]",
         ] {
             let url = parse(u);
             assert!(!is_loopback_host(&url), "{u}");

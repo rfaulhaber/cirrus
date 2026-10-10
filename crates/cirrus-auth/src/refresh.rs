@@ -1106,6 +1106,143 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_share_one_rotating_refresh_grant() {
+        // Callers that queue behind an in-flight refresh must take its
+        // outcome rather than each presenting the refresh token in turn:
+        // under Refresh Token Rotation every extra grant would rotate the
+        // token again and fire the handler again, and the module docs
+        // promise one rotation per refresh.
+        let server = MockServer::start().await;
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(
+                token_response("at-1", Some("rotated-1")).set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .on_rotation(Arc::new(RecordingHandler { seen: seen.clone() }))
+                .build()
+                .unwrap(),
+        );
+
+        let callers: Vec<_> = (0..10)
+            .map(|_| {
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.await.unwrap().unwrap(), "at-1");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(*seen.lock().await, vec!["rotated-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn invalidate_clears_the_cache_only_for_the_token_it_is_given() {
+        // `invalidate` is a compare-and-swap on the access token alone: a
+        // stale token that is not the cached one leaves the cache alone,
+        // and the cached one forces exactly one refresh grant.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: token_response("at-1", None),
+            })
+            .mount(&server)
+            .await;
+        let auth = builder_with_required_fields()
+            .login_url(server.uri())
+            .build()
+            .unwrap();
+        let cached = auth.access_token().await.unwrap().into_owned();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        auth.invalidate("not-the-cached-token").await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a non-matching invalidate is a no-op"
+        );
+
+        auth.invalidate(&cached).await;
+        assert_eq!(&*auth.access_token().await.unwrap(), cached);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a matching invalidate forces one grant"
+        );
+        auth.access_token().await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the re-minted token is cached again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalidating_an_old_token_during_a_mint_leaves_the_new_token_cached() {
+        // A request that failed with the old token can call `invalidate`
+        // after a concurrent caller has already started a fresh mint. The
+        // call queues behind that mint and then finds a token it was not
+        // given, so it must not throw the new one away.
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: token_response("at-1", None),
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                response: token_response("at-2", None).set_delay(Duration::from_millis(300)),
+            })
+            .mount(&server)
+            .await;
+        let auth = Arc::new(
+            builder_with_required_fields()
+                .login_url(server.uri())
+                .build()
+                .unwrap(),
+        );
+        let old = auth.access_token().await.unwrap().into_owned();
+        assert_eq!(old, "at-1");
+        auth.invalidate(&old).await;
+
+        let minter = {
+            let auth = Arc::clone(&auth);
+            tokio::spawn(async move { auth.access_token().await.map(Cow::into_owned) })
+        };
+        // Wait until the second grant has reached the server, so the
+        // invalidate below queues behind a mint that is in flight.
+        while hits.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        auth.invalidate(&old).await;
+
+        assert_eq!(minter.await.unwrap().unwrap(), "at-2");
+        assert_eq!(&*auth.access_token().await.unwrap(), "at-2");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the late invalidate must not discard the token the mint produced"
+        );
+    }
+
     #[tokio::test]
     async fn a_503_on_the_refresh_grant_is_not_replayed() {
         // Under Refresh Token Rotation the attempt whose answer was a 5xx

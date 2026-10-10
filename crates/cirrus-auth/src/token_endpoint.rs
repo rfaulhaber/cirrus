@@ -1336,8 +1336,29 @@ mod tests {
     fn https_and_loopback_login_urls_are_accepted() {
         require_secure_login_url("https://my-org.my.salesforce.com").unwrap();
         require_secure_login_url("http://127.0.0.1:8080").unwrap();
+        require_secure_login_url("http://127.255.0.1").unwrap();
         require_secure_login_url("http://localhost:8080").unwrap();
         require_secure_login_url("http://[::1]:8080").unwrap();
+    }
+
+    #[test]
+    fn non_loopback_literals_and_localhost_lookalikes_are_rejected() {
+        // The exemption is the exact name `localhost` and the loopback
+        // ranges, not a name that starts or ends with it and not a
+        // private or documentation address.
+        for url in [
+            "http://10.0.0.5",
+            "http://203.0.113.7",
+            "http://[2001:db8::1]",
+            "http://localhost.evil.example",
+            "http://notlocalhost",
+        ] {
+            let err = require_secure_login_url(url).unwrap_err();
+            assert!(
+                matches!(err, AuthError::InsecureLoginUrl { .. }),
+                "{url}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1374,12 +1395,18 @@ mod tests {
         let ttl = Duration::from_secs(300);
 
         // Server advertises longer than the caller configured: the
-        // caller's shorter window wins.
+        // caller's shorter window wins. The lower bound is what pins the
+        // unit: `expires_in` read as milliseconds, or ignored, would
+        // land far below it.
+        let before = Instant::now();
         let long = response("https://x", Some(7200)).cache_expiry(ttl);
+        assert!(long >= before + ttl);
         assert!(long <= Instant::now() + ttl);
 
         // Server advertises shorter: the server's window wins.
+        let before = Instant::now();
         let short = response("https://x", Some(30)).cache_expiry(ttl);
+        assert!(short >= before + Duration::from_secs(30));
         assert!(short <= Instant::now() + Duration::from_secs(30));
     }
 
@@ -1395,8 +1422,13 @@ mod tests {
     fn cache_expiry_saturates_an_unbounded_ttl() {
         // `Duration::MAX` is "never expire locally", which must not
         // collapse into "expired now" because the instant is out of range.
+        // The caller's TTL is the input that can overflow: `expires_in`
+        // is clamped to it first, so the pair together is the worst case.
+        let a_year = Duration::from_secs(365 * 24 * 60 * 60);
         let expiry = response("https://x", None).cache_expiry(Duration::MAX);
-        assert!(expiry >= Instant::now() + Duration::from_secs(365 * 24 * 60 * 60));
+        assert!(expiry >= Instant::now() + a_year);
+        let expiry = response("https://x", Some(u64::MAX)).cache_expiry(Duration::MAX);
+        assert!(expiry >= Instant::now() + a_year);
     }
 
     #[test]

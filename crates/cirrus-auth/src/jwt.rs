@@ -788,9 +788,9 @@ mod tests {
 
     /// `invalidate(stale_token)` is a compare-and-swap: it should
     /// only clear the cached token when the cached value matches
-    /// `stale_token`. This is the contract for all three flows
-    /// (Jwt, Refresh, ClientCredentials); we test it here as the
-    /// canonical example since the impls are identical.
+    /// `stale_token`. This pins the JWT flow's wiring of that contract;
+    /// the refresh and client-credentials flows each have a test of
+    /// their own, since a flow can wire its cache wrongly on its own.
     #[tokio::test]
     async fn invalidate_clears_cache_only_when_stale_token_matches() {
         let server = MockServer::start().await;
