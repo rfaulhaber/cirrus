@@ -32,6 +32,7 @@ use crate::{MetadataClient, PackageManifest};
 use base64::Engine;
 use bytes::Bytes;
 use serde::Deserialize;
+use std::future::Future;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -364,11 +365,18 @@ fn render_unpackaged(pkg: &PackageManifest, out: &mut String) {
 /// [`MetadataClient::wait_for_retrieve_with`].
 ///
 /// Polling uses exponential backoff starting at `initial_delay`,
-/// doubling each round, capped at `max_delay`. Calls don't have a
-/// per-request timeout — the dispatcher's own [`RetryPolicy`] handles
-/// transient failures.
+/// doubling each round, capped at `max_delay`. Each status call runs
+/// under the HTTP client's connect and read timeouts (the builder's
+/// defaults, or whatever a client supplied through
+/// [`MetadataClientBuilder::http_client`] carries) and under the
+/// dispatcher's [`RetryPolicy`], which replays a poll that timed out
+/// or failed transiently. With `total_timeout` set, a poll still in
+/// flight at the deadline is cut off as well, so the budget bounds the
+/// wait's wall-clock time whatever those timeouts and retries would
+/// allow.
 ///
 /// [`RetryPolicy`]: crate::RetryPolicy
+/// [`MetadataClientBuilder::http_client`]: crate::MetadataClientBuilder::http_client
 #[derive(Debug, Clone)]
 pub struct WaitConfig {
     /// Delay between the first and second poll; the first poll is
@@ -377,12 +385,20 @@ pub struct WaitConfig {
     pub initial_delay: Duration,
     /// Cap on the backoff delay. Default 30 s.
     pub max_delay: Duration,
-    /// Total wall-clock budget. `None` = wait indefinitely. Default
-    /// `None` — deploys can legitimately run for hours.
+    /// Total wall-clock budget for the status polls. `None` = wait
+    /// indefinitely. Default `None` — deploys can legitimately run for
+    /// hours.
     ///
-    /// Backoff sleeps are clamped to what's left of the budget, so the
-    /// timeout fires within one in-flight status call of it rather
-    /// than a whole backoff round past it.
+    /// Backoff sleeps are clamped to what's left of the budget and a
+    /// poll still in flight at the deadline is cut off, so
+    /// [`MetadataError::PollTimeout`] fires at the budget rather than a
+    /// backoff round or a stalled response past it. The one fetch made
+    /// after the job reaches a terminal state (a deploy's details, a
+    /// retrieve's zip) is outside the budget: the outcome is already in
+    /// hand, and the zip fetch cannot be interrupted without losing the
+    /// zip.
+    ///
+    /// [`MetadataError::PollTimeout`]: crate::MetadataError::PollTimeout
     pub total_timeout: Option<Duration>,
 }
 
@@ -404,6 +420,32 @@ impl WaitConfig {
         self.total_timeout = Some(timeout);
         self
     }
+}
+
+/// The error a wait returns when its budget runs out.
+fn poll_timeout(kind: &str, id: &str, timeout: Duration) -> MetadataError {
+    MetadataError::PollTimeout(format!("{kind} {id} still in progress after {timeout:?}"))
+}
+
+/// Runs one status poll under what is left of the wait's budget, which
+/// began at `start`. A poll whose response never arrives is cut off at
+/// the deadline, so the budget bounds the wait's wall-clock time even
+/// though the HTTP client's read timeout and the retry policy would
+/// let the poll run for minutes. Every poll is a replayable status
+/// read, so cutting one off loses nothing.
+async fn poll_within_budget<T>(
+    kind: &str,
+    id: &str,
+    start: tokio::time::Instant,
+    timeout: Option<Duration>,
+    poll: impl Future<Output = MetadataResult<T>>,
+) -> MetadataResult<T> {
+    let Some(timeout) = timeout else {
+        return poll.await;
+    };
+    tokio::time::timeout_at(start + timeout, poll)
+        .await
+        .unwrap_or_else(|_| Err(poll_timeout(kind, id, timeout)))
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +738,14 @@ impl MetadataClient {
             // processed component and can balloon into megabytes for
             // large deploys. We fetch the full DeployDetails once after
             // the deploy reaches a terminal state.
-            let (result, info) = self.deploy_status(deploy_id, false, with_debugging).await?;
+            let (result, info) = poll_within_budget(
+                "deploy",
+                deploy_id,
+                start,
+                config.total_timeout,
+                self.deploy_status(deploy_id, false, with_debugging),
+            )
+            .await?;
             if result.done {
                 // The terminal result is already in hand; the details
                 // fetch only enriches it. If the follow-up fails (after
@@ -723,9 +772,7 @@ impl MetadataClient {
                 // the budget before it could fire.
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
-                    return Err(MetadataError::PollTimeout(format!(
-                        "deploy {deploy_id} still in progress after {timeout:?}"
-                    )));
+                    return Err(poll_timeout("deploy", deploy_id, timeout));
                 }
                 tokio::time::sleep(delay.min(remaining)).await;
             } else {
@@ -778,7 +825,7 @@ impl MetadataClient {
     /// server may already have served and deleted it, a later call
     /// comes back without one, and the retrieve has to be started over.
     /// Bound the wait with [`WaitConfig::total_timeout`] instead, which
-    /// is checked only between polls and so never interrupts the
+    /// bounds the status polls only and so never interrupts the
     /// fetch. Alternatively poll with [`Self::wait_for_retrieve_done`]
     /// under any cancellation mechanism and make the one-shot
     /// [`Self::check_retrieve_status`] call yourself once it reports
@@ -847,7 +894,14 @@ impl MetadataClient {
         loop {
             // Each tick is a status read without the zip, so it stays
             // replayable and the future stays safe to drop.
-            let result = self.check_retrieve_status(retrieve_id, false).await?;
+            let result = poll_within_budget(
+                "retrieve",
+                retrieve_id,
+                start,
+                config.total_timeout,
+                self.check_retrieve_status(retrieve_id, false),
+            )
+            .await?;
             if result.done {
                 return Ok(result);
             }
@@ -858,9 +912,7 @@ impl MetadataClient {
                 // the budget before it could fire.
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
-                    return Err(MetadataError::PollTimeout(format!(
-                        "retrieve {retrieve_id} still in progress after {timeout:?}"
-                    )));
+                    return Err(poll_timeout("retrieve", retrieve_id, timeout));
                 }
                 tokio::time::sleep(delay.min(remaining)).await;
             } else {

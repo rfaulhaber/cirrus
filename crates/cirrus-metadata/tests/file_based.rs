@@ -2030,3 +2030,100 @@ async fn debugging_info_debug_output_does_not_grow_with_the_log() {
     assert_eq!(info.debug_log.len(), 1024 * 1024);
     assert!(format!("{info:?}").len() < 128);
 }
+
+// -- total_timeout bounds an in-flight poll -----------------------------------
+
+/// A poll whose response never arrives would otherwise hold the wait
+/// for the client's read timeout, and its retries, long past the
+/// budget. The deadline cuts the in-flight poll off, so the wait
+/// returns within a tick of `total_timeout` whatever the client's own
+/// timeouts are.
+#[tokio::test]
+async fn wait_for_deploy_cuts_off_a_poll_that_outlives_its_budget() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .respond_with(
+            xml_response(
+                r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000slow</id>
+        <done>false</done>
+        <status>InProgress</status>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+            )
+            .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let budget = Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let err = md
+        .wait_for_deploy_with(
+            "0Af00000slow",
+            WaitConfig {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                total_timeout: Some(budget),
+            },
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(err, MetadataError::PollTimeout(_)), "{err:?}");
+    assert!(elapsed >= budget, "returned early at {elapsed:?}");
+    assert!(
+        elapsed < budget * 3,
+        "the stalled poll held the wait past its budget: {elapsed:?}"
+    );
+}
+
+/// The retrieve loop applies the same deadline to its status polls.
+#[tokio::test]
+async fn wait_for_retrieve_cuts_off_a_poll_that_outlives_its_budget() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<met:includeZip>false</met:includeZip>",
+        ))
+        .respond_with(
+            xml_response(&retrieve_status_body(false, false, None))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    let md = client_against(&server);
+    let budget = Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let err = md
+        .wait_for_retrieve_with(
+            "09S00000poll",
+            WaitConfig {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                total_timeout: Some(budget),
+            },
+        )
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(err, MetadataError::PollTimeout(_)), "{err:?}");
+    assert!(elapsed >= budget, "returned early at {elapsed:?}");
+    assert!(
+        elapsed < budget * 3,
+        "the stalled poll held the wait past its budget: {elapsed:?}"
+    );
+}
