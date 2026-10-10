@@ -27,7 +27,9 @@ getrandom.workspace = true
 http-serde.workspace = true
 httpdate.workspace = true
 percent-encoding.workspace = true
-reqwest.workspace = true
+# `json` for request bodies, `query` for the SOQL / Bulk / composite
+# query strings, `multipart` for the sObject blob upload.
+reqwest = { workspace = true, features = ["json", "multipart", "query"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true

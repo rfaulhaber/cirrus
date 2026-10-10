@@ -22,7 +22,9 @@ camino.workspace = true
 fs-err.workspace = true
 getrandom.workspace = true
 jsonwebtoken.workspace = true
-reqwest.workspace = true
+# `form` for the token-endpoint POST body; the token endpoint answers
+# JSON, which serde_json parses from the collected bytes.
+reqwest = { workspace = true, features = ["form"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

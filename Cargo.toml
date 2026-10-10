@@ -23,10 +23,15 @@ cirrus-auth = { path = "crates/cirrus-auth", version = "0.4.2" }
 cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.4.0" }
 
 # Runtime / HTTP
-# `gzip` makes reqwest send `Accept-Encoding: gzip` and transparently
-# decode the response — Salesforce compresses a response only when the
-# request asks for it.
-reqwest = { version = "0.13", default-features = false, features = ["form", "gzip", "json", "multipart", "query", "rustls", "charset", "system-proxy"] }
+# Only what every client needs. `gzip` makes reqwest send
+# `Accept-Encoding: gzip` and transparently decode the response —
+# Salesforce compresses a response only when the request asks for it.
+# The body encoders (`form`, `json`, `query`, `multipart`) are added by
+# the crate whose code calls them, so a consumer of one crate does not
+# compile the others'. All three crates re-export reqwest, so this list
+# is public surface: a feature missing here is missing from
+# `cirrus_auth::reqwest` too.
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "rustls", "system-proxy"] }
 tokio = { version = "1.52", features = ["sync", "time"] }
 url = "2.5"
 percent-encoding = "2.3"
