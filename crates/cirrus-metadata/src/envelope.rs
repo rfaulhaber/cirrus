@@ -822,6 +822,54 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     }
 
     #[test]
+    fn parse_envelope_decodes_entity_and_character_references_in_fault_fields() {
+        // XML 1.0 requires `&` and `<` in character data to be escaped,
+        // so a fault that is not wrapped in CDATA carries them as
+        // references. Each reference reaches the reader as its own
+        // event, and dropping it would turn `'Foo&Bar'` into `FooBar`.
+        let xml = r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <soapenv:Fault>
+      <faultcode>sf:INVALID&#x5F;TYPE</faultcode>
+      <faultstring>INVALID_TYPE: Cannot use &apos;Foo&amp;Bar&apos; for &lt;Baz&gt; or &quot;Qux&quot;, got &#x41;&#66;C</faultstring>
+    </soapenv:Fault>
+  </soapenv:Body>
+</soapenv:Envelope>"#;
+        let body = parse_envelope(xml, "anything").unwrap().body;
+        let EnvelopeBody::Fault(f) = body else {
+            panic!("expected Fault, got {body:?}");
+        };
+        assert_eq!(f.faultcode, "sf:INVALID_TYPE");
+        assert_eq!(f.code(), "INVALID_TYPE");
+        assert_eq!(
+            f.faultstring,
+            r#"INVALID_TYPE: Cannot use 'Foo&Bar' for <Baz> or "Qux", got ABC"#
+        );
+    }
+
+    #[test]
+    fn parse_envelope_keeps_source_order_around_fault_references() {
+        // Text, references and CDATA arrive as separate events; each
+        // piece must land in the field where the document put it.
+        let xml = r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <soapenv:Fault>
+      <faultcode>a&amp;b</faultcode>
+      <faultstring>x&lt;<![CDATA[<y>]]>&gt;z&#38;w</faultstring>
+    </soapenv:Fault>
+  </soapenv:Body>
+</soapenv:Envelope>"#;
+        let body = parse_envelope(xml, "anything").unwrap().body;
+        let EnvelopeBody::Fault(f) = body else {
+            panic!("expected Fault, got {body:?}");
+        };
+        assert_eq!(f.faultcode, "a&b");
+        assert_eq!(f.faultstring, "x<<y>>z&w");
+    }
+
+    #[test]
     fn parse_envelope_errors_on_unexpected_body_child() {
         let xml = r#"<?xml version="1.0"?>
 <Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">
@@ -1177,6 +1225,71 @@ mod property_tests {
                     "unexpected error kind from parse_envelope: {e:?} on body {body:?}",
                 ),
             }
+        }
+    }
+
+    /// Content for one fault field, paired with the text the parser must
+    /// decode it to. Interleaves plain text, CDATA, the five predefined
+    /// entities and decimal / hex character references, so the pieces
+    /// of one field arrive as a run of different events.
+    fn fault_field_content() -> impl Strategy<Value = (String, String)> {
+        let safe_text = "[A-Za-z0-9 ._:-]{0,8}";
+        // Every scalar value XML 1.0 allows below the surrogate range
+        // except the control characters.
+        let referenced_char = proptest::char::range('\u{20}', '\u{D7FF}');
+        let predefined = prop_oneof![
+            Just(("&amp;", "&")),
+            Just(("&lt;", "<")),
+            Just(("&gt;", ">")),
+            Just(("&apos;", "'")),
+            Just(("&quot;", "\"")),
+        ];
+        let segment = prop_oneof![
+            safe_text.prop_map(|t| (t.clone(), t)),
+            safe_text.prop_map(|t| (format!("<![CDATA[{t}]]>"), t)),
+            predefined.prop_map(|(reference, text)| (reference.to_string(), text.to_string())),
+            referenced_char
+                .clone()
+                .prop_map(|c| (format!("&#{};", u32::from(c)), c.to_string())),
+            referenced_char.prop_map(|c| (format!("&#x{:X};", u32::from(c)), c.to_string())),
+        ];
+        proptest::collection::vec(segment, 0..6).prop_map(|segments| {
+            let xml = segments.iter().map(|(xml, _)| xml.as_str()).collect();
+            let text = segments.iter().map(|(_, text)| text.as_str()).collect();
+            (xml, text)
+        })
+    }
+
+    proptest! {
+        /// Whatever mix of text, CDATA, entity references and character
+        /// references a fault's `faultcode` / `faultstring` carries, the
+        /// parsed fields are the decoded pieces in source order. The
+        /// parser trims layout whitespace from both ends, so the
+        /// expectation is trimmed the same way.
+        #[test]
+        fn parse_fault_decodes_field_content_in_source_order(
+            (code_xml, code_text) in fault_field_content(),
+            (string_xml, string_text) in fault_field_content(),
+        ) {
+            let envelope = format!(
+                r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <soapenv:Fault>
+      <faultcode>{code_xml}</faultcode>
+      <faultstring>{string_xml}</faultstring>
+    </soapenv:Fault>
+  </soapenv:Body>
+</soapenv:Envelope>"#
+            );
+            let parsed = parse_envelope(&envelope, "anyResponse").map(|parsed| parsed.body);
+            let Ok(EnvelopeBody::Fault(fault)) = parsed else {
+                return Err(TestCaseError::fail(format!(
+                    "expected a Fault from {envelope:?}, got {parsed:?}"
+                )));
+            };
+            prop_assert_eq!(fault.faultcode.as_str(), code_text.trim());
+            prop_assert_eq!(fault.faultstring.as_str(), string_text.trim());
         }
     }
 }
