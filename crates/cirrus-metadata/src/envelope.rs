@@ -113,8 +113,8 @@ const MAX_RESPONSE_DEPTH: i32 = 64;
 
 /// Extra capacity reserved for the constant envelope wrapper — the two
 /// tag pairs plus the three namespace declarations. Comfortably above
-/// the actual wrapper length, so building an envelope never reallocates
-/// past the initial allocation.
+/// the actual wrapper length, so an envelope whose body size hint covers
+/// its body never reallocates past the initial allocation.
 const ENVELOPE_WRAPPER_HEADROOM: usize = 512;
 
 /// Build a complete SOAP envelope, rendering the body in place.

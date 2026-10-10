@@ -635,13 +635,11 @@ pub struct BulkIngestJob {
     /// only when one was specified at job creation.
     #[serde(rename = "assignmentRuleId", default)]
     pub assignment_rule_id: Option<String>,
-    /// Number of records already processed. Populated only after the
-    /// job reaches `JobComplete` or `Failed`.
+    /// Number of records already processed.
     #[serde(rename = "numberRecordsProcessed", default)]
     pub number_records_processed: Option<i64>,
     /// Number of records that were not processed successfully in this
-    /// job. Populated only after the job reaches `JobComplete` or
-    /// `Failed`.
+    /// job.
     #[serde(rename = "numberRecordsFailed", default)]
     pub number_records_failed: Option<i64>,
     /// Number of times Salesforce attempted to save the results of an

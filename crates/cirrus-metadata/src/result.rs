@@ -1013,9 +1013,9 @@ pub struct CancelDeployResult {
     pub id: String,
     /// Whether the cancellation has completed (`true`). A deployment
     /// still in the queue is canceled immediately and reports `true`;
-    /// for one that has started, this stays `false` while the
-    /// cancellation is in progress, until `check_deploy_status` reports
-    /// `Canceled`.
+    /// one that has started is sometimes canceled later, in which case
+    /// this is `false` and `check_deploy_status` reports `Canceling`
+    /// until the server transitions it to `Canceled`.
     #[serde(default)]
     pub done: bool,
 }
@@ -1240,10 +1240,13 @@ pub struct FileProperties {
     /// Name of the file this entry describes.
     /// [`full_name`](Self::full_name) is derived from it.
     pub file_name: String,
-    /// The file's developer name, its unique identifier for API access.
-    /// Based on `file_name`, but limited to underscores and
-    /// alphanumerics: it begins with a letter and has no spaces,
-    /// trailing underscore or consecutive underscores.
+    /// The component's developer name, its unique identifier for API
+    /// access. The FileProperties page describes it as based on
+    /// `file_name` and limited to a letter followed by alphanumerics and
+    /// single underscores, but that is the rule for a bare developer
+    /// name only: namespaced (`acme__Baz`), custom (`My_Object__c`) and
+    /// child-component (`Account.Industry`) names all carry other
+    /// characters, so do not validate against it.
     pub full_name: String,
     /// Metadata type name, e.g. `"ApexClass"`.
     #[serde(default, rename = "type", deserialize_with = "deserialize_nil_string")]

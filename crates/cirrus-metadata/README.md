@@ -119,12 +119,12 @@ you need anything beyond `deployRequest`.
   exposed.
 - **Doc-driven wire shapes.** Every handler ships with wiremock coverage.
   What sits inside each fixture's `<result>` is cited to the Metadata API
-  Developer Guide's property tables and Java samples; the envelope framing
-  follows the WSDL's document-literal binding, since the guide publishes no
-  SOAP envelope for any call; and the two request element names the guide
-  does not publish (`cancelDeploy`'s `asyncProcessId` and
-  `deployRecentValidation`'s `validationId`) are inferred and pinned by
-  tests rather than read off a page.
+  Developer Guide's property tables and Java samples. The guide publishes
+  no SOAP envelope for any call, so the envelope framing and the request
+  element names follow the Metadata WSDL (API 66.0), with two deviations
+  the live suite exercises and the tests pin: `cancelDeploy` sends
+  `asyncProcessId` where the WSDL names the element `String`, and
+  `retrieve` sends `RetrieveRequest` where the WSDL has `retrieveRequest`.
 
 ## Quick start
 

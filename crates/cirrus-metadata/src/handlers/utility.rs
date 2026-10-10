@@ -201,11 +201,12 @@ impl MetadataClient {
     /// not provide; a name in that namespace is refused with
     /// [`MetadataError::InvalidArgument`] before any request is made.
     ///
-    /// [`MetadataError::InvalidArgument`]: crate::MetadataError::InvalidArgument
     /// Returns field-level metadata — types, requirement flags,
     /// foreign-key relationships, picklist options. Useful for
     /// validating component XML before deploy or for generating
     /// typed bindings.
+    ///
+    /// [`MetadataError::InvalidArgument`]: crate::MetadataError::InvalidArgument
     pub async fn describe_value_type(
         &self,
         qualified_type_name: &str,
