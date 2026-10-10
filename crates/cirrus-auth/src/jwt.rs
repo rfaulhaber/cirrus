@@ -15,7 +15,9 @@
 //!   assigned to the app, or the policy is "All users may self-authorize"
 //!   and the user has already approved the app through an interactive
 //!   flow that issued a refresh token. Without either, the mint fails
-//!   with `invalid_grant` ("User hasn't approved the connected app").
+//!   with `invalid_grant` ("User hasn't approved the connected app") or
+//!   `invalid_app_access` ("User isn't approved by an admin to access
+//!   this app").
 //! - **Scopes.** Salesforce looks at the user's previous approvals that
 //!   include a refresh token and issues a token only when the approved
 //!   scopes include at least one standard scope besides `refresh_token`.

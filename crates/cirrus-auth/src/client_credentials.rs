@@ -737,7 +737,7 @@ mod tests {
     async fn an_advertised_lifetime_longer_than_the_margin_caches_the_token() {
         // SOURCE: RFC 6749 §5.1, `expires_in` is "the lifetime in seconds
         // of the access token". An hour-long token under the default TTL
-        // is served from the cache; read as milliseconds, or dropped, it
+        // is served from the cache; read as milliseconds, or zeroed, it
         // would sit inside the refresh margin and be re-minted every call.
         let server = MockServer::start().await;
         let hits = Arc::new(AtomicUsize::new(0));

@@ -202,8 +202,9 @@ When a flow builder isn't given an `http_client`, the client it builds
 applies a 10 s connect timeout and a 30 s request deadline
 (`DEFAULT_TOKEN_CONNECT_TIMEOUT` and `DEFAULT_TOKEN_REQUEST_TIMEOUT`; every
 builder has `connect_timeout` and `request_timeout` setters) and refuses to
-follow redirects: the grants here carry their credential in the request
-body, which reqwest replays on a 307/308. TLS is verified against the
+follow redirects: the grants here carry a live credential in the request
+body (a refresh token, an assertion, a PKCE verifier) or in a Basic
+`Authorization` header, and reqwest replays the body on a 307/308. TLS is verified against the
 operating system's trust store, which the client loads when the flow is
 built: a `FROM scratch` or distroless image without `ca-certificates` fails
 at `build()` with `AuthError::HttpClient`. Install a CA bundle, enable the

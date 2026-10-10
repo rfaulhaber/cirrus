@@ -38,8 +38,7 @@
 //!   `invalidate`) behaves correctly against a live org.
 //! - `jwt` — full JWT bearer flow exercise: mint a token, verify it
 //!   maps to the configured user via `/services/oauth2/userinfo`, and
-//!   verify the cache returns the same token across consecutive calls
-//!   without re-hitting the token endpoint.
+//!   verify the cache returns the same token across consecutive calls.
 //!
 //! Refresh, Client Credentials, and Token Exchange flows are **not**
 //! covered here — each requires bespoke connected-app setup that the

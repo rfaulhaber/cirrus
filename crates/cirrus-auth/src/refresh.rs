@@ -1229,9 +1229,13 @@ mod tests {
         };
         // Wait until the second grant has reached the server, so the
         // invalidate below queues behind a mint that is in flight.
-        while hits.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hits.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second grant must reach the server");
         auth.invalidate(&old).await;
 
         assert_eq!(minter.await.unwrap().unwrap(), "at-2");

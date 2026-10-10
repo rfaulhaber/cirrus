@@ -20,12 +20,12 @@
 //!
 //! A denial never reaches the token endpoint. When the user refuses, or
 //! the authorization request is malformed, Salesforce redirects to the
-//! callback with `error` (for a refusal, `access_denied`) and the
-//! `error_description` in place of `code`, so the callback handler
-//! checks for `error` before calling `complete`. A callback with no
-//! `code` has nothing to exchange; posting an empty code turns the
-//! clear `access_denied` into an opaque `invalid_grant` from the token
-//! endpoint.
+//! callback with an `error` code (`access_denied` for a refusal) and no
+//! `code`; RFC 6749 §4.1.2.1 adds an optional `error_description`. The
+//! callback handler therefore checks for `error` before calling
+//! `complete`. A callback with no `code` has nothing to exchange;
+//! posting an empty code turns the clear `access_denied` into an opaque
+//! `invalid_grant` from the token endpoint.
 //! (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5>)
 //!
 //! The library is **stateless between the two phases** — it never stores

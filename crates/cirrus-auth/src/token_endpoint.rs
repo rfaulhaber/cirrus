@@ -57,8 +57,8 @@ pub(super) fn refresh_margin(token_ttl: Duration) -> Duration {
 /// - `signature` / `issued_at` — in the web server, refresh token, client
 ///   credentials and token exchange responses, and absent from the JWT
 ///   bearer example and table even though that page says the response
-///   "follows the same format as an authorization code flow". Nothing
-///   may require either of a JWT bearer mint. `issued_at` is
+///   "follows the same format as an authorization code flow". Code must
+///   not require either field of a JWT bearer mint. `issued_at` is
 ///   milliseconds since epoch as a *string*, not a number.
 /// - `refresh_token` — issued by the flows that support issuance (Web
 ///   Server, Token Exchange) when the connected app's scope set includes
@@ -183,12 +183,13 @@ pub const DEFAULT_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// apply to the token-endpoint client they create: the two default
 /// timeouts, a redirect policy that follows nothing, and no proxy.
 ///
-/// Redirects are not followed because every grant in this crate carries
-/// its credential in the form body (`client_secret`, `refresh_token`, the
-/// JWT `assertion`, the RFC 8693 `subject_token`, the PKCE
-/// `code_verifier`), and reqwest replays the body on a 307/308, so a
-/// redirect from the token endpoint would re-POST live credentials to
-/// whatever host the `Location` header names.
+/// Redirects are not followed because a token request carries a live
+/// credential: a `refresh_token`, the JWT `assertion`, the RFC 8693
+/// `subject_token` or the PKCE `code_verifier` in the form body, and the
+/// consumer secret in a Basic `Authorization` header on the flows that
+/// have one. reqwest replays the body on a 307/308, so a redirect from
+/// the token endpoint would re-POST those credentials to whatever host
+/// the `Location` header names.
 ///
 /// No proxy is used, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the
 /// operating system's proxy settings are ignored, where a stock
@@ -444,7 +445,7 @@ pub(super) enum GrantReplay {
 }
 
 /// How the client proves its identity to the token endpoint.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(super) enum ClientAuth<'a> {
     /// The form body already carries whatever identifies the client: a
     /// `client_id` alone for a public client, a `client_assertion`, or
@@ -465,6 +466,21 @@ pub(super) enum ClientAuth<'a> {
         client_id: &'a str,
         client_secret: &'a str,
     },
+}
+
+impl std::fmt::Debug for ClientAuth<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Both halves are credentials: the crate prints neither the
+        // consumer key nor the secret anywhere.
+        match self {
+            Self::Form => f.write_str("Form"),
+            Self::Basic { .. } => f
+                .debug_struct("Basic")
+                .field("client_id", &REDACTED)
+                .field("client_secret", &REDACTED)
+                .finish(),
+        }
+    }
 }
 
 /// Largest token-endpoint response body the SDK buffers. A token response
@@ -1094,6 +1110,22 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn client_auth_debug_redacts_both_credentials() {
+        // The consumer key is a credential identifier everywhere else in
+        // the crate, where no `Debug` prints it, and the secret is a
+        // secret; a `?client_auth` in a tracing event must leak neither.
+        let auth = ClientAuth::Basic {
+            client_id: "MyClientID",
+            client_secret: "MyClientSecret",
+        };
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("MyClientID"), "{debug}");
+        assert!(!debug.contains("MyClientSecret"), "{debug}");
+        assert!(debug.starts_with("Basic"), "{debug}");
+        assert_eq!(format!("{:?}", ClientAuth::Form), "Form");
+    }
+
     #[tokio::test]
     async fn form_client_auth_sends_no_authorization_header() {
         // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5
@@ -1396,8 +1428,9 @@ mod tests {
 
         // Server advertises longer than the caller configured: the
         // caller's shorter window wins. The lower bound is what pins the
-        // unit: `expires_in` read as milliseconds, or ignored, would
-        // land far below it.
+        // unit: `expires_in` read as milliseconds, or zeroed, would
+        // land far below it; the short case's upper bound is what
+        // catches it being ignored.
         let before = Instant::now();
         let long = response("https://x", Some(7200)).cache_expiry(ttl);
         assert!(long >= before + ttl);
