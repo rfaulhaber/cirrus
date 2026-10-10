@@ -1018,12 +1018,13 @@ mod tests {
     }
 
     /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
-    /// The DeployOptions section lists allowMissingFiles,
+    /// The DeployOptions section includes allowMissingFiles,
     /// autoUpdatePackage, checkOnly, ignoreWarnings, performRetrieve,
     /// purgeOnDelete, rollbackOnError, runTests, singlePackage and
-    /// testLevel. A `false` goes out as `false` rather than being
-    /// omitted: rollbackOnError is "a complete rollback (`true`) or not
-    /// (`false`)", a choice the caller stated.
+    /// testLevel; the deprecated runAllTests (API version 33.0 and
+    /// earlier) is not modeled. A `false` goes out as `false` rather
+    /// than being omitted: rollbackOnError is "a complete rollback
+    /// (`true`) or not (`false`)", a choice the caller stated.
     #[test]
     fn deploy_op_renders_every_option_with_its_own_value() {
         // Neighbouring booleans alternate, so reading an option from

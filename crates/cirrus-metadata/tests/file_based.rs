@@ -964,8 +964,9 @@ async fn wait_for_deploy_polls_until_done() {
         .await;
 
     // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
-    // The details element is the DeployDetails table's
-    // `componentSuccesses` (a DeployMessage list).
+    // DeployDetails `componentSuccesses`, type DeployMessage[]: "One or
+    // more DeployMessage objects containing successful deployment
+    // details for each component."
     Mock::given(method("POST"))
         .and(body_string_contains("<met:checkDeployStatus>"))
         .and(body_string_contains(
