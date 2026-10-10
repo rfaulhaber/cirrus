@@ -49,11 +49,30 @@ struct DeployResponseWire {
     result: AsyncResult,
 }
 
+impl DeployOp {
+    /// The rendered `<met:DeployOptions>` children.
+    fn rendered_options(&self) -> String {
+        let mut opts = String::new();
+        render_deploy_options(&self.options, &mut opts);
+        opts
+    }
+}
+
 impl SoapOperation for DeployOp {
     const NAME: &'static str = "deploy";
     type Response = DeployResponseWire;
 
     fn render_body(&self) -> MetadataResult<String> {
+        let mut out = String::with_capacity(self.body_size_hint());
+        self.render_body_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// The base64 zip is encoded straight into the envelope buffer, so
+    /// the only copy of it while the request is in flight is the
+    /// envelope's; the buffer was sized from [`Self::body_size_hint`]
+    /// and nothing appended after the zip reallocates it.
+    fn render_body_into(&self, out: &mut String) -> MetadataResult<()> {
         // Salesforce accepts runTests only under RunSpecifiedTests and
         // faults on any other pairing. Checking here, before the zip is
         // encoded, spares a documented-maximum upload that could only
@@ -66,26 +85,21 @@ impl SoapOperation for DeployOp {
                     .into(),
             ));
         }
-        // The options are rendered first so their exact length is known
-        // before the buffer is sized. Everything after the encoded zip
-        // has to fit in the initial allocation: a reallocation here
-        // would copy a buffer already holding the base64 form of a
-        // documented-maximum 39 MB zip.
-        let mut opts = String::new();
-        render_deploy_options(&self.options, &mut opts);
-
-        // Base64 expands to four characters per three input bytes,
-        // rounded up to a whole quantum. Sizing the buffer for that up
-        // front and encoding straight into it keeps the zip from being
-        // materialized a second time as a standalone encoded string.
-        let encoded_len = self.zip.len().div_ceil(3) * 4;
-        let mut out = String::with_capacity(encoded_len + opts.len() + 128);
         out.push_str("<met:ZipFile>");
-        base64::engine::general_purpose::STANDARD.encode_string(&self.zip, &mut out);
+        base64::engine::general_purpose::STANDARD.encode_string(&self.zip, out);
         out.push_str("</met:ZipFile><met:DeployOptions>");
-        out.push_str(&opts);
+        out.push_str(&self.rendered_options());
         out.push_str("</met:DeployOptions>");
-        Ok(out)
+        Ok(())
+    }
+
+    /// Base64 expands to four characters per three input bytes, rounded
+    /// up to a whole quantum, plus the options and the fixed tags. The
+    /// options are rendered here so the hint is exact: a buffer that
+    /// came up short would reallocate while holding the encoded form of
+    /// a documented-maximum zip.
+    fn body_size_hint(&self) -> usize {
+        self.zip.len().div_ceil(3) * 4 + self.rendered_options().len() + 128
     }
 
     fn render_headers(&self) -> MetadataResult<String> {
@@ -881,6 +895,26 @@ mod tests {
         assert!(body.contains("</met:DeployOptions>"));
         // Base64 of "PK\x03\x04hello"
         assert!(body.contains("UEsDBGhlbGxv"));
+    }
+
+    /// `render_body_into` appends to the buffer it is given and
+    /// `body_size_hint` covers what it appends, so the envelope builder
+    /// can size its buffer once and the base64 zip is never held in a
+    /// second string on its way into the envelope.
+    #[test]
+    fn deploy_op_renders_into_a_sized_buffer_without_a_second_copy() {
+        let op = deploy_op(
+            b"PK\x03\x04hello world, hello world",
+            DeployOptions::default(),
+        );
+        let mut out = String::from("<prefix>");
+        out.reserve(op.body_size_hint());
+        let capacity = out.capacity();
+        op.render_body_into(&mut out).unwrap();
+        assert_eq!(out.capacity(), capacity, "the hint must cover the body");
+        assert!(out.starts_with("<prefix><met:ZipFile>"));
+        assert_eq!(&out["<prefix>".len()..], op.render_body().unwrap());
+        assert!(out.len() - "<prefix>".len() <= op.body_size_hint());
     }
 
     #[test]

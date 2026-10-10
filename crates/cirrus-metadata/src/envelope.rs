@@ -117,32 +117,36 @@ const MAX_RESPONSE_DEPTH: i32 = 64;
 /// past the initial allocation.
 const ENVELOPE_WRAPPER_HEADROOM: usize = 512;
 
-/// Build a complete SOAP envelope.
+/// Build a complete SOAP envelope, rendering the body in place.
 ///
 /// `session_token` is the bearer token from the [`AuthSession`]; it goes
 /// into `<met:SessionHeader><met:sessionId>`. `operation_name` becomes the
 /// body element (e.g. `"deploy"` → `<met:deploy>...</met:deploy>`).
 /// `headers_xml` is spliced into `<soapenv:Header>` right after the
 /// `SessionHeader`; empty yields the session-header-only envelope.
-/// `body_xml` is the already-rendered inner body content — it may
-/// reference the `met:` prefix or declare its own namespaces.
+/// `render_body` appends the inner body content to the buffer it is
+/// given — it may reference the `met:` prefix or declare its own
+/// namespaces — and `body_size_hint` is how many bytes it will append,
+/// so the buffer can be allocated once for the whole envelope.
 ///
 /// [`AuthSession`]: cirrus_auth::AuthSession
 pub(crate) fn build_envelope(
     session_token: &str,
     operation_name: &str,
     headers_xml: &str,
-    body_xml: &str,
-) -> String {
+    body_size_hint: usize,
+    render_body: impl FnOnce(&mut String) -> MetadataResult<()>,
+) -> MetadataResult<String> {
     // XML-escape the token. Salesforce tokens are alphanumeric + `!.`,
     // but escaping is cheap insurance against future format changes.
     let token = xml_escape(session_token);
     // A deploy body carries the base64 zip — tens of megabytes at the
     // documented maximum. Sizing the buffer for the whole envelope up
-    // front keeps that payload out of a doubling-realloc schedule whose
-    // final growth step would otherwise overshoot to twice the
-    // envelope's size.
-    let capacity = body_xml.len()
+    // front, and encoding the zip straight into it, keeps that payload
+    // to one copy and out of a doubling-realloc schedule whose final
+    // growth step would otherwise overshoot to twice the envelope's
+    // size.
+    let capacity = body_size_hint
         + headers_xml.len()
         + token.len()
         + SOAP_NS.len()
@@ -168,11 +172,11 @@ pub(crate) fn build_envelope(
     out.push_str("</soapenv:Header><soapenv:Body><met:");
     out.push_str(operation_name);
     out.push('>');
-    out.push_str(body_xml);
+    render_body(&mut out)?;
     out.push_str("</met:");
     out.push_str(operation_name);
     out.push_str("></soapenv:Body></soapenv:Envelope>");
-    out
+    Ok(out)
 }
 
 /// Parse a SOAP 1.1 response envelope.
@@ -512,6 +516,15 @@ pub fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
 
+    /// The envelope for an already-rendered body string.
+    fn build_envelope(token: &str, operation: &str, headers_xml: &str, body_xml: &str) -> String {
+        super::build_envelope(token, operation, headers_xml, body_xml.len(), |out| {
+            out.push_str(body_xml);
+            Ok(())
+        })
+        .unwrap()
+    }
+
     /// The slice of `xml` that `parse_envelope` locates as the success
     /// element.
     fn success_element<'a>(xml: &'a str, expected: &str) -> &'a str {
@@ -579,6 +592,37 @@ mod tests {
         let env = build_envelope("TOKEN", "ping", &headers, "<inner/>");
         assert!(env.len() > headers.len());
         assert!(env.capacity() >= env.len());
+    }
+
+    /// A body rendered through the callback lands directly in the
+    /// envelope buffer, which is allocated once from the size hint: no
+    /// reallocation after the body is written, and the result is the
+    /// envelope a pre-rendered body string would give.
+    #[test]
+    fn build_envelope_renders_the_body_in_place_from_the_hint() {
+        let body = "<met:ZipFile>".to_string() + &"A".repeat(4096) + "</met:ZipFile>";
+        let env = super::build_envelope("TOKEN", "deploy", "", body.len(), |out| {
+            let before = out.capacity();
+            out.push_str(&body);
+            assert_eq!(
+                out.capacity(),
+                before,
+                "the body must fit the initial allocation"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(env, build_envelope("TOKEN", "deploy", "", &body));
+        assert!(env.capacity() < env.len() + 2 * ENVELOPE_WRAPPER_HEADROOM);
+    }
+
+    #[test]
+    fn build_envelope_propagates_the_renderer_error() {
+        let err = super::build_envelope("TOKEN", "deploy", "", 0, |_| {
+            Err(MetadataError::InvalidArgument("no".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidArgument(_)));
     }
 
     #[test]
