@@ -49,32 +49,45 @@ pub(super) fn refresh_margin(token_ttl: Duration) -> Duration {
 /// `refresh_token`, `scope`) plus Salesforce-specific extensions
 /// (`instance_url`, `id`, `issued_at`, `signature`).
 ///
-/// Field availability depends on the flow + connected-app configuration:
+/// Which fields come back depends on the flow. Per the Help page for each
+/// (linked below), reading the documented response example and parameter
+/// table together:
+/// - `access_token`, `instance_url`, `id`, `token_type`, `scope` — in
+///   every flow's documented response.
+/// - `signature` / `issued_at` — in the web server, refresh token, client
+///   credentials and token exchange responses, and absent from the JWT
+///   bearer example and table even though that page says the response
+///   "follows the same format as an authorization code flow". Nothing
+///   may require either of a JWT bearer mint. `issued_at` is
+///   milliseconds since epoch as a *string*, not a number.
 /// - `refresh_token` — issued by the flows that support issuance (Web
 ///   Server, Token Exchange) when the connected app's scope set includes
 ///   `refresh_token`. A connected app with `isRefreshTokenRotationEnabled`
 ///   *also* returns one on every invocation of the refresh-token grant,
 ///   superseding the token that was just presented — which is why
 ///   [`crate::refresh`] reads this field back out. Never present on
-///   Client Credentials or JWT Bearer.
+///   Client Credentials or JWT Bearer, whose pages each say the flow
+///   issues none.
 ///   (`isRefreshTokenRotationEnabled`: <https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_connectedapp.htm>)
 /// - `id_token` — only when the requested `scope` includes `openid`
-///   (OIDC).
-/// - `scope` — present when the granted scope set differs from the
-///   requested set, or always on some flows. Treat as best-effort.
-/// - `issued_at` — milliseconds since epoch as a *string*, not a number.
+///   (OIDC); the web server and token exchange examples carry one.
 /// - `expires_in` — token lifetime in seconds (RFC 6749 §5.1,
-///   RECOMMENDED). Salesforce omits it on most flows; when present,
+///   RECOMMENDED). No Salesforce page lists it; when present,
 ///   [`TokenResponse::cache_expiry`] caches for the shorter of it and the
 ///   configured TTL. Modeled as `Option<u64>` + `default` so its absence
 ///   never breaks parsing.
-/// - `signature` / `id` / `token_type` — present on every successful
-///   flow except where Salesforce explicitly omits (e.g. some on-behalf-of
-///   exchanges).
 /// - `sfdc_site_url` / `sfdc_site_id` — only when the authenticated user
-///   is a member of an Experience Cloud site; the Web Server and Refresh
-///   Token flow pages list both.
-///   (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5>)
+///   is a member of an Experience Cloud site; the Web Server, Refresh
+///   Token and JWT Bearer pages list both.
+/// - `token_format` — `"jwt"` on the refresh token page when the app
+///   issues JWT-based access tokens. Not modeled: the access token is
+///   opaque to this crate in either format.
+///
+/// (Web server: <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5>;
+/// refresh token: <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_refresh_token_flow.htm&type=5>;
+/// client credentials: <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_client_credentials_flow.htm&type=5>;
+/// JWT bearer: <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_jwt_flow.htm&type=5>;
+/// token exchange: <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_token_exchange_configure.htm&type=5>)
 #[derive(Deserialize)]
 pub(super) struct TokenResponse {
     pub(super) access_token: String,
@@ -104,8 +117,8 @@ pub(super) struct TokenResponse {
     /// secret. Salesforce scopes it to one purpose: verifying that the
     /// identity URL in `id` was not modified in transit. `access_token`
     /// and `instance_url` are not inputs to the HMAC, so a valid
-    /// signature says nothing about them. Absent on flows that don't
-    /// have a consumer secret (some public-client variants).
+    /// signature says nothing about them. Absent from the documented JWT
+    /// bearer response; see the type-level note.
     #[serde(default)]
     pub(super) signature: Option<String>,
     /// Experience Cloud site URL, for a user who is a member of a site.

@@ -1,9 +1,34 @@
 //! OAuth 2.0 JWT Bearer flow for Salesforce server-to-server auth.
 //!
-//! The caller pre-authorizes a Connected App by uploading a public X.509
-//! certificate; this auth implementation holds the corresponding RSA private
-//! key and mints fresh access tokens on demand by signing a short-lived JWT
-//! and exchanging it at the OAuth token endpoint.
+//! This auth implementation holds the RSA private key behind a certificate
+//! registered on the connected app, and mints access tokens on demand by
+//! signing a short-lived JWT and exchanging it at the OAuth token
+//! endpoint. Three things have to be in place on the org side:
+//!
+//! - **The certificate.** Salesforce uses the registered X.509 certificate
+//!   to verify the assertion's signature, and for nothing else;
+//!   registering it approves no app and no user.
+//! - **Prior approval.** The flow "does require prior approval of the
+//!   client app" for the user named in `sub`, in one of two ways: the
+//!   app's permitted-users policy is "Admin approved users are
+//!   pre-authorized" and the user's profile or a permission set is
+//!   assigned to the app, or the policy is "All users may self-authorize"
+//!   and the user has already approved the app through an interactive
+//!   flow that issued a refresh token. Without either, the mint fails
+//!   with `invalid_grant` ("User hasn't approved the connected app").
+//! - **Scopes.** Salesforce looks at the user's previous approvals that
+//!   include a refresh token and issues a token only when the approved
+//!   scopes include at least one standard scope besides `refresh_token`.
+//!   An app without the `refresh_token` scope fails with `invalid_request`
+//!   ("The JWT bearer and SAML assertion bearer flows require a
+//!   refresh_token scope. Install and preauthorize the app."). Scopes
+//!   cannot be requested on the token call itself.
+//!
+//! Both failures surface as [`AuthError::OAuth`]; its `error_description`
+//! field carries Salesforce's sentence, and its `Display` prints it.
+//!
+//! (<https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_jwt_flow.htm&type=5>,
+//! <https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_flow_errors.htm&type=5>)
 //!
 //! ## `instance_url`
 //!
