@@ -87,9 +87,14 @@ pub struct AsyncResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AsyncRequestState {
+    /// The call has not started; it is waiting in a queue.
     Queued,
+    /// The call has started but has not completed.
     InProgress,
+    /// The call has completed.
     Completed,
+    /// An error occurred; [`AsyncResult::status_code`] and
+    /// [`AsyncResult::message`] describe it.
     Error,
     /// A state literal this SDK version doesn't know — kept from
     /// turning the whole response into a deserialization error.
@@ -250,6 +255,8 @@ impl std::str::FromStr for TestLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployResult {
+    /// ID of the deployment job, the value `deploy()` returned in
+    /// [`AsyncResult::id`].
     pub id: String,
     /// Whether the server is done processing the job. Poll until this
     /// is `true`.
@@ -258,28 +265,55 @@ pub struct DeployResult {
     /// Overall success/failure. Only meaningful once `done == true`.
     #[serde(default)]
     pub success: bool,
+    /// Current state of the deployment. `None` when the response omits
+    /// it.
     #[serde(default)]
     pub status: Option<DeployStatus>,
+    /// Whether the deployment only checks the validity of the files
+    /// without changing the org (`true`). A check-only deployment
+    /// deploys no components.
     #[serde(default)]
     pub check_only: bool,
+    /// Whether the deployment continues even if it generates warnings.
+    /// Salesforce advises against `true` for deployments to production
+    /// orgs.
     #[serde(default)]
     pub ignore_warnings: bool,
+    /// Whether any failure rolls the whole deployment back (`true`).
+    /// When `false`, whatever can be done without errors is performed
+    /// and errors are returned for the rest. Must be `true` for a
+    /// production org.
     #[serde(default)]
     pub rollback_on_error: bool,
     /// Whether Apex tests were exercised.
     #[serde(default)]
     pub run_tests_enabled: bool,
 
+    /// Number of components deployed so far. Together with
+    /// [`number_components_total`](Self::number_components_total) it
+    /// estimates the deployment's progress.
     #[serde(default)]
     pub number_components_deployed: i32,
+    /// Total number of components in the deployment. Together with
+    /// [`number_components_deployed`](Self::number_components_deployed)
+    /// it estimates the deployment's progress.
     #[serde(default)]
     pub number_components_total: i32,
+    /// Number of components that generated errors during this
+    /// deployment.
     #[serde(default)]
     pub number_component_errors: i32,
+    /// Number of Apex tests completed so far. Together with
+    /// [`number_tests_total`](Self::number_tests_total) it estimates
+    /// the deployment's test progress.
     #[serde(default)]
     pub number_tests_completed: i32,
+    /// Total number of Apex tests for this deployment. Not accurate
+    /// until the deployment has started running tests.
     #[serde(default)]
     pub number_tests_total: i32,
+    /// Number of Apex tests that generated errors during this
+    /// deployment.
     #[serde(default)]
     pub number_test_errors: i32,
 
@@ -297,25 +331,47 @@ pub struct DeployResult {
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub state_detail: Option<String>,
 
+    /// Status code of the error, if one occurred during the deployment.
+    /// [`error_message`](Self::error_message) carries the matching
+    /// message. The values are the platform `StatusCode` literals the
+    /// SOAP API Developer Guide lists.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub error_status_code: Option<String>,
+    /// Message corresponding to
+    /// [`error_status_code`](Self::error_status_code), if any.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub error_message: Option<String>,
 
+    /// ID of the user who created the deployment. Available in API
+    /// version 30.0 and later.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_by: Option<String>,
+    /// Full name of the user who created the deployment. Available in
+    /// API version 30.0 and later.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_by_name: Option<String>,
+    /// When the `deploy()` call was received, as the ISO 8601
+    /// `dateTime` string Salesforce sends.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_date: Option<String>,
+    /// When the deployment process began, as an ISO 8601 `dateTime`
+    /// string.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub start_date: Option<String>,
+    /// When the deployment process was last updated, as an ISO 8601
+    /// `dateTime` string.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub last_modified_date: Option<String>,
+    /// When the deployment process ended, as an ISO 8601 `dateTime`
+    /// string.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub completed_date: Option<String>,
+    /// ID of the user who canceled the deployment. Available in API
+    /// version 30.0 and later.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub canceled_by: Option<String>,
+    /// Full name of the user who canceled the deployment. Available in
+    /// API version 30.0 and later.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub canceled_by_name: Option<String>,
 
@@ -539,16 +595,28 @@ fn retrieve_message_line(message: &RetrieveMessage) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DeployStatus {
+    /// The deployment is queued and has not started.
     Pending,
+    /// The deployment has started and is in progress.
     InProgress,
+    /// The deployment succeeded.
     Succeeded,
+    /// The deployment succeeded, but some components might not have
+    /// been deployed successfully. Check [`DeployResult::details`] for
+    /// more.
     SucceededPartial,
+    /// The deployment failed.
     Failed,
+    /// The deployment is being canceled. Poll again until the status is
+    /// `Canceled`.
     Canceling,
+    /// The deployment was canceled.
     Canceled,
-    /// Newer status, post-commit phase that can't be canceled in
-    /// API 65.0+.
+    /// The deployment has started and is in the finalizing state. A
+    /// deployment in this state can't be canceled (API version 65.0 and
+    /// later).
     FinalizingDeploy,
+    /// The deployment failed during the finalizing state.
     FinalizingDeployFailed,
     /// A status literal this SDK version doesn't know. Salesforce has
     /// extended the set before (`FinalizingDeploy` arrived in API
@@ -582,8 +650,13 @@ impl DeployStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployDetails {
+    /// Deployment errors, one entry per failed component. Filled in
+    /// while the deployment is still running; the other fields fill in
+    /// once it finishes.
     #[serde(default, rename = "componentFailures")]
     pub component_failures: Vec<DeployMessage>,
+    /// Successful deployment details, one entry per component.
+    /// Populated after the deployment finishes.
     #[serde(default, rename = "componentSuccesses")]
     pub component_successes: Vec<DeployMessage>,
     /// Apex test results.
@@ -600,6 +673,7 @@ pub struct DeployDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployMessage {
+    /// ID of the component this entry reports on.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
     /// Metadata type, e.g. `ApexClass`.
@@ -611,14 +685,23 @@ pub struct DeployMessage {
     /// File path inside the deployed zip.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub file_name: Option<String>,
+    /// Whether the component was deployed successfully.
     #[serde(default)]
     pub success: bool,
+    /// Whether the deployment changed the component (`true`). `false`
+    /// means the deployed component matched the one already in the org.
     #[serde(default)]
     pub changed: bool,
+    /// Whether the deployment created the component (`true`). `false`
+    /// means it was deleted or modified.
     #[serde(default)]
     pub created: bool,
+    /// Whether the deployment deleted the component (`true`). `false`
+    /// means it was new or modified.
     #[serde(default)]
     pub deleted: bool,
+    /// When the deployment created the component, as an ISO 8601
+    /// `dateTime` string. Available in API version 30.0 and later.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_date: Option<String>,
     /// Error or warning message text when `success == false` or
@@ -643,7 +726,10 @@ pub struct DeployMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DeployProblemType {
+    /// The problem is a warning. [`DeployOptions::ignore_warnings`]
+    /// decides whether the deployment continues past one.
     Warning,
+    /// The problem is an error.
     Error,
     /// A problem-type literal this SDK version doesn't know. This enum
     /// rides inside every [`DeployMessage`], so without a fallback a
@@ -658,20 +744,33 @@ pub enum DeployProblemType {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestsResult {
+    /// Number of unit tests that were run.
     #[serde(default)]
     pub num_tests_run: i32,
+    /// Number of unit tests that failed.
     #[serde(default)]
     pub num_failures: i32,
+    /// Total cumulative time spent running tests, in milliseconds.
     #[serde(default)]
     pub total_time: f64,
+    /// ID of the `ApexLog` created at the end of the test run.
+    /// Salesforce creates it only when a trace flag is active on the
+    /// user running the test or on a class or trigger being executed.
+    /// Available in API version 35.0 and later.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub apex_log_id: Option<String>,
+    /// One entry per test that passed.
     #[serde(default)]
     pub successes: Vec<RunTestSuccess>,
+    /// One entry per test that failed.
     #[serde(default)]
     pub failures: Vec<RunTestFailure>,
+    /// Code coverage of each class or trigger the tests exercised.
     #[serde(default)]
     pub code_coverage: Vec<CodeCoverageResult>,
+    /// Code coverage warnings for the test run. An entry whose `name`
+    /// is `None` applies to the overall code coverage rather than to
+    /// one class.
     #[serde(default)]
     pub code_coverage_warnings: Vec<CodeCoverageWarning>,
     /// Coverage of each flow version the test run executed. Available
@@ -686,40 +785,61 @@ pub struct RunTestsResult {
     pub flow_coverage_warnings: Vec<FlowCoverageWarning>,
 }
 
+/// One Apex test that passed, inside [`RunTestsResult::successes`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestSuccess {
+    /// ID of the class that generated the success.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
+    /// Name of the class that succeeded.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub name: Option<String>,
+    /// Name of the test method that succeeded.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub method_name: Option<String>,
+    /// Namespace that contained the unit tests, if one is specified.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace: Option<String>,
+    /// Time spent running this test. Presumably milliseconds like
+    /// [`RunTestsResult::total_time`] and [`RunTestFailure::time`], but
+    /// the Metadata API reference gives this field no unit.
     #[serde(default)]
     pub time: f64,
+    /// Whether the test method has access to organization data
+    /// (`true`). Available in API version 33.0 and later.
     #[serde(default)]
     pub see_all_data: bool,
 }
 
+/// One Apex test that failed, inside [`RunTestsResult::failures`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestFailure {
+    /// ID of the class that generated the failure.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
+    /// Name of the class that failed.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub name: Option<String>,
+    /// Name of the test method that failed.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub method_name: Option<String>,
+    /// Namespace that contained the class, if one was specified.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace: Option<String>,
+    /// The failure message.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub message: Option<String>,
+    /// Stack trace for the failure.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub stack_trace: Option<String>,
+    /// Time spent running tests for this failed operation, in
+    /// milliseconds.
     #[serde(default)]
     pub time: f64,
+    /// Whether the test method has access to organization data
+    /// (`true`). Available in API version 33.0 and later.
     #[serde(default)]
     pub see_all_data: bool,
 }
@@ -733,11 +853,14 @@ pub struct RunTestFailure {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeCoverageResult {
+    /// ID Salesforce gives this coverage entry, unique within the org.
+    /// The reference describes it only as "the ID of the CodeLocation".
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
     /// Name of the class or trigger covered.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub name: Option<String>,
+    /// Namespace that contained the unit tests, if one is specified.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace: Option<String>,
     /// Total number of code locations.
@@ -778,8 +901,10 @@ pub struct CodeCoverageResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeLocation {
+    /// Column location of the Apex tested.
     #[serde(default)]
     pub column: i32,
+    /// Line location of the Apex tested.
     #[serde(default)]
     pub line: i32,
     /// How many times the test run executed this location. `0` for an
@@ -844,19 +969,34 @@ pub struct FlowCoverageWarning {
     /// Namespace that contains the flow, if one was specified.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub flow_namespace: Option<String>,
+    /// The message of the warning Salesforce generated.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub message: Option<String>,
 }
 
+/// A code coverage warning, inside
+/// [`RunTestsResult::code_coverage_warnings`]. Describes the Apex class
+/// that generated it.
+// Wire-shape provenance: the `meta_deployresult` CodeCoverageWarning
+// table describes `name` with the `namespace` text and `id` as "the ID
+// of the CodeLocation". The field descriptions follow the SOAP API
+// RunTestsResult page, whose CodeCoverageWarning table describes `id`
+// and `name` as the class and states that a null `name` marks a warning
+// about the overall code coverage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeCoverageWarning {
+    /// ID of the class that generated the warning.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
+    /// Name of the class that generated the warning. `None` when the
+    /// warning applies to the overall code coverage.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub name: Option<String>,
+    /// Namespace that contains the class, if one was specified.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace: Option<String>,
+    /// The message of the warning generated.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub message: Option<String>,
 }
@@ -869,7 +1009,13 @@ pub struct CodeCoverageWarning {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelDeployResult {
+    /// ID of the deployment being canceled.
     pub id: String,
+    /// Whether the cancellation has completed (`true`). A deployment
+    /// still in the queue is canceled immediately and reports `true`;
+    /// for one that has started, this stays `false` while the
+    /// cancellation is in progress, until `check_deploy_status` reports
+    /// `Canceled`.
     #[serde(default)]
     pub done: bool,
 }
@@ -936,14 +1082,22 @@ pub struct RetrieveResult {
     /// [`DeployDetails::retrieve_result`].
     #[serde(default)]
     pub id: String,
+    /// Whether the retrieve has completed. Poll until this is `true`.
     #[serde(default)]
     pub done: bool,
+    /// Whether the retrieve succeeded.
     #[serde(default)]
     pub success: bool,
+    /// State of the retrieve. `None` when the response omits it.
     #[serde(default)]
     pub status: Option<RetrieveStatus>,
+    /// Status code of the error, if one occurred during the retrieve.
+    /// [`error_message`](Self::error_message) carries the matching
+    /// message.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub error_status_code: Option<String>,
+    /// Descriptive message about the error, if one occurred during the
+    /// retrieve.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub error_message: Option<String>,
     /// One entry per retrieved component, plus `package.xml`. The
@@ -1049,9 +1203,15 @@ impl RetrieveResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum RetrieveStatus {
+    /// The retrieve has not started.
     Pending,
+    /// The retrieve has started and has not finished.
     InProgress,
+    /// The retrieve finished successfully.
     Succeeded,
+    /// The retrieve finished with an error.
+    /// [`RetrieveResult::error_message`] and
+    /// [`RetrieveResult::messages`] describe it.
     Failed,
     /// A status literal this SDK version doesn't know — kept from
     /// turning the whole response into a deserialization error.
@@ -1077,45 +1237,74 @@ impl RetrieveStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileProperties {
+    /// Name of the file this entry describes.
+    /// [`full_name`](Self::full_name) is derived from it.
     pub file_name: String,
+    /// The file's developer name, its unique identifier for API access.
+    /// Based on `file_name`, but limited to underscores and
+    /// alphanumerics: it begins with a letter and has no spaces,
+    /// trailing underscore or consecutive underscores.
     pub full_name: String,
     /// Metadata type name, e.g. `"ApexClass"`.
     #[serde(default, rename = "type", deserialize_with = "deserialize_nil_string")]
     pub type_name: Option<String>,
+    /// ID of the file.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub id: Option<String>,
+    /// ID of the user who created the file.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_by_id: Option<String>,
+    /// Name of the user who created the file.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_by_name: Option<String>,
+    /// When the file was created, as an ISO 8601 `dateTime` string.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub created_date: Option<String>,
+    /// ID of the user who last modified the file.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub last_modified_by_id: Option<String>,
+    /// Name of the user who last modified the file.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub last_modified_by_name: Option<String>,
+    /// When the file was last modified, as an ISO 8601 `dateTime`
+    /// string.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub last_modified_date: Option<String>,
+    /// Namespace prefix of the component, if any.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub namespace_prefix: Option<String>,
+    /// Manageable state of the component, when it is contained in a
+    /// package.
     #[serde(default)]
     pub manageable_state: Option<ManageableState>,
 }
 
 /// Distribution / lifecycle state of a packaged component.
 ///
+/// Salesforce's `FileProperties` reference lists these literals without
+/// describing them one by one, so each variant names only the literal it
+/// deserializes from.
+///
 /// `#[non_exhaustive]`, like [`DeployStatus`]: match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum ManageableState {
+    /// Wire literal `beta`.
     Beta,
+    /// Wire literal `deleted`.
     Deleted,
+    /// Wire literal `deprecated`.
     Deprecated,
+    /// Wire literal `deprecatedEditable`.
     DeprecatedEditable,
+    /// Wire literal `installed`.
     Installed,
+    /// Wire literal `installedEditable`.
     InstalledEditable,
+    /// Wire literal `released`.
     Released,
+    /// Wire literal `unmanaged`.
     Unmanaged,
     /// A state literal this SDK version doesn't know. This enum rides
     /// inside every [`FileProperties`], so without a fallback a single
@@ -1129,8 +1318,11 @@ pub enum ManageableState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrieveMessage {
+    /// Name of the file in the retrieved zip where the problem
+    /// occurred.
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub file_name: Option<String>,
+    /// Description of the problem that occurred.
     pub problem: String,
 }
 
@@ -1343,6 +1535,7 @@ pub struct SaveResult {
     /// `fullName` of the component that was processed.
     #[serde(default)]
     pub full_name: String,
+    /// Whether the operation succeeded for this component.
     #[serde(default)]
     pub success: bool,
     /// Per-component errors when `success == false`.
@@ -1356,8 +1549,11 @@ pub struct SaveResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpsertResult {
+    /// `fullName` of the component that was created or updated, when
+    /// the operation succeeded.
     #[serde(default)]
     pub full_name: String,
+    /// Whether the operation succeeded for this component.
     #[serde(default)]
     pub success: bool,
     /// `true` if the upsert resulted in a newly-created component;
@@ -1365,6 +1561,7 @@ pub struct UpsertResult {
     /// when `success == true`.
     #[serde(default)]
     pub created: bool,
+    /// Per-component errors when `success == false`.
     #[serde(default)]
     pub errors: Vec<MetadataApiError>,
 }
@@ -1374,10 +1571,13 @@ pub struct UpsertResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteResult {
+    /// `fullName` of the deleted component.
     #[serde(default)]
     pub full_name: String,
+    /// Whether the deletion succeeded.
     #[serde(default)]
     pub success: bool,
+    /// Per-component errors when `success == false`.
     #[serde(default)]
     pub errors: Vec<MetadataApiError>,
 }

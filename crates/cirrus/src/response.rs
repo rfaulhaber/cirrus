@@ -239,37 +239,66 @@ pub struct DescribeGlobal {
 
 /// Per-object metadata returned in [`DescribeGlobal::sobjects`]. Mirrors the
 /// flags Salesforce documents for the describe-global response.
+//
+// Wire-shape provenance: the REST Describe Global page (`dome_describeGlobal`)
+// shows these keys in its example response but defines none of them. The
+// flag descriptions follow the SOAP API DescribeGlobalSObjectResult table,
+// which words each one in terms of the SOAP call it gates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SObjectMetadata {
+    /// Reserved for future use.
     pub activateable: bool,
+    /// Whether records of the object can be created.
     pub createable: bool,
+    /// Whether the object is a custom object.
     pub custom: bool,
+    /// Whether the object is a custom setting object.
     #[serde(rename = "customSetting")]
     pub custom_setting: bool,
+    /// Whether records of the object can be deleted.
     pub deletable: bool,
+    /// Reserved for future use.
     #[serde(rename = "deprecatedAndHidden")]
     pub deprecated_and_hidden: bool,
+    /// Whether Chatter feeds are enabled for the object.
     #[serde(rename = "feedEnabled")]
     pub feed_enabled: bool,
     /// Three-character record-ID prefix (e.g. `"001"` for Account). `None`
     /// for objects without a stable prefix.
     #[serde(rename = "keyPrefix", default)]
     pub key_prefix: Option<String>,
+    /// Label of the object: the text of a tab or field renamed in the
+    /// user interface, if applicable, or the object name if not.
     pub label: String,
+    /// Plural form of the label, for example `Accounts`.
     #[serde(rename = "labelPlural")]
     pub label_plural: String,
+    /// Whether the object supports describing its layouts
+    /// (`describeLayout()` in the SOAP API).
     pub layoutable: bool,
+    /// Whether records of the object can be merged with other records
+    /// of its type. `true` for leads, contacts and accounts.
     pub mergeable: bool,
+    /// Whether Most Recently Used (MRU) list functionality is enabled
+    /// for the object.
     #[serde(rename = "mruEnabled")]
     pub mru_enabled: bool,
     /// API name of the object, e.g. `"Account"`, `"My_Object__c"`.
     pub name: String,
+    /// Whether the object can be queried.
     pub queryable: bool,
+    /// Whether the object can be replicated through the `getUpdated()`
+    /// and `getDeleted()` calls.
     pub replicateable: bool,
+    /// Whether records of the object can be retrieved.
     pub retrieveable: bool,
+    /// Whether the object can be searched.
     pub searchable: bool,
+    /// Whether the object supports Apex triggers.
     pub triggerable: bool,
+    /// Whether records of the object can be undeleted.
     pub undeletable: bool,
+    /// Whether records of the object can be updated.
     pub updateable: bool,
     /// Map of related URL slugs (`sobject`, `describe`, `rowTemplate`,
     /// plus per-feature URLs that vary by object). Kept as a generic map
@@ -328,12 +357,18 @@ pub struct SObjectMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum BulkOperation {
+    /// Insert new records.
     #[serde(rename = "insert")]
     Insert,
+    /// Update existing records.
     #[serde(rename = "update")]
     Update,
+    /// Update existing records and insert the rest. Matches on the
+    /// job's external ID field, or on the primary key for Marketing
+    /// objects.
     #[serde(rename = "upsert")]
     Upsert,
+    /// Delete records.
     #[serde(rename = "delete")]
     Delete,
     /// Permanent delete (skips Recycle Bin). Requires "Bulk API Hard
@@ -347,8 +382,11 @@ pub enum BulkOperation {
     /// Salesforce rejects a create-job request that also sends `object`.
     #[serde(rename = "consentImport")]
     ConsentImport,
+    /// Query job: returns data that hasn't been deleted or archived.
     #[serde(rename = "query")]
     Query,
+    /// Query job: also returns records deleted by a merge or delete,
+    /// and information about archived Task and Event records.
     #[serde(rename = "queryAll")]
     QueryAll,
     /// An operation Salesforce returned that this SDK doesn't name, so a
@@ -502,12 +540,18 @@ pub enum BulkLineEnding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum BulkColumnDelimiter {
+    /// Backquote character (`` ` ``).
     Backquote,
+    /// Caret character (`^`).
     Caret,
+    /// Comma character (`,`), Salesforce's default delimiter.
     #[default]
     Comma,
+    /// Pipe character (`|`).
     Pipe,
+    /// Semicolon character (`;`).
     Semicolon,
+    /// Tab character.
     Tab,
 }
 
@@ -521,7 +565,9 @@ pub enum BulkColumnDelimiter {
 /// the `GET` response carries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkIngestJob {
+    /// Unique ID of the job.
     pub id: String,
+    /// Processing operation the job runs.
     pub operation: BulkOperation,
     /// Object type the job's data belongs to. Absent for jobs created
     /// with the `consentImport` operation — consent ingest isn't
@@ -531,13 +577,20 @@ pub struct BulkIngestJob {
     /// [Create a Job]: https://developer.salesforce.com/docs/atlas.en-us.api_asynch.meta/api_asynch/create_job.htm
     #[serde(default)]
     pub object: String,
+    /// Current state of processing for the job.
     pub state: BulkJobState,
+    /// External ID field an upsert job matches on. `None` for the other
+    /// operations.
     #[serde(rename = "externalIdFieldName", default)]
     pub external_id_field_name: Option<String>,
+    /// Line ending used for the job's CSV data.
     #[serde(rename = "lineEnding")]
     pub line_ending: BulkLineEnding,
+    /// Column delimiter used for the job's CSV data.
     #[serde(rename = "columnDelimiter")]
     pub column_delimiter: BulkColumnDelimiter,
+    /// Format of the data being processed. Salesforce supports only
+    /// `CSV`.
     #[serde(rename = "contentType")]
     pub content_type: String,
     /// Where to PUT the job's CSV, populated while the job is `Open`.
@@ -563,26 +616,50 @@ pub struct BulkIngestJob {
     /// [`BulkIngestHandler::create`]: crate::handlers::bulk::BulkIngestHandler::create
     #[serde(rename = "jobType", default)]
     pub job_type: Option<String>,
+    /// For future use: how the job was processed. Salesforce currently
+    /// supports only parallel mode.
     #[serde(rename = "concurrencyMode")]
     pub concurrency_mode: String,
+    /// ID of the user who created the job.
     #[serde(rename = "createdById")]
     pub created_by_id: String,
+    /// When the job was created, as a UTC `dateTime` string.
     #[serde(rename = "createdDate")]
     pub created_date: String,
+    /// Date and time in UTC that the Get Job Info reference describes
+    /// as when the job finished. Its example nonetheless shows a value
+    /// on a job that is still `Open`.
     #[serde(rename = "systemModstamp")]
     pub system_modstamp: String,
+    /// ID of the assignment rule to run for a Case or a Lead. Present
+    /// only when one was specified at job creation.
     #[serde(rename = "assignmentRuleId", default)]
     pub assignment_rule_id: Option<String>,
+    /// Number of records already processed. Populated only after the
+    /// job reaches `JobComplete` or `Failed`.
     #[serde(rename = "numberRecordsProcessed", default)]
     pub number_records_processed: Option<i64>,
+    /// Number of records that were not processed successfully in this
+    /// job. Populated only after the job reaches `JobComplete` or
+    /// `Failed`.
     #[serde(rename = "numberRecordsFailed", default)]
     pub number_records_failed: Option<i64>,
+    /// Number of times Salesforce attempted to save the results of an
+    /// operation. Repeated attempts indicate a problem such as lock
+    /// contention.
     #[serde(default)]
     pub retries: Option<i32>,
+    /// Time taken to process the job, in milliseconds.
     #[serde(rename = "totalProcessingTime", default)]
     pub total_processing_time: Option<i64>,
+    /// Time taken to actively process the job, in milliseconds.
+    /// Includes [`apex_processing_time`](Self::apex_processing_time)
+    /// but not the time the job waited to be processed.
     #[serde(rename = "apiActiveProcessingTime", default)]
     pub api_active_processing_time: Option<i64>,
+    /// Time taken to process triggers and other processes related to
+    /// the job data, in milliseconds. Excludes asynchronous and batch
+    /// Apex. `0` when there are no triggers.
     #[serde(rename = "apexProcessingTime", default)]
     pub apex_processing_time: Option<i64>,
     /// Error message for jobs in `Failed` state. `None` for healthy
@@ -616,22 +693,34 @@ pub struct BulkIngestJob {
 //   query jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkJobStateChange {
+    /// Unique ID of the job.
     pub id: String,
+    /// Processing operation the job runs.
     pub operation: BulkOperation,
+    /// Object type of the job's data; for a query job, the object being
+    /// queried.
     pub object: String,
+    /// Current state of processing for the job.
     pub state: BulkJobState,
     /// The wire sends a JSON number (e.g. `60.0`), so this is a float
     /// rather than the `String` used by [`ApiVersion::version`].
     #[serde(rename = "apiVersion")]
     pub api_version: f64,
+    /// For future use: how the job is processed. Salesforce currently
+    /// supports only parallel mode.
     #[serde(rename = "concurrencyMode")]
     pub concurrency_mode: String,
+    /// Format of the job's data. Salesforce supports only `CSV`.
     #[serde(rename = "contentType")]
     pub content_type: String,
+    /// ID of the user who created the job.
     #[serde(rename = "createdById")]
     pub created_by_id: String,
+    /// When the job was created, as a UTC `dateTime` string.
     #[serde(rename = "createdDate")]
     pub created_date: String,
+    /// When the API last updated the job information, as a UTC
+    /// `dateTime` string.
     #[serde(rename = "systemModstamp")]
     pub system_modstamp: String,
     /// External ID field of an ingest upsert job. `None` for the other
@@ -663,16 +752,24 @@ pub struct BulkJobStateChange {
 /// [`BulkQuerySpec`]: crate::handlers::bulk::BulkQuerySpec
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkQueryJob {
+    /// Unique ID of the job.
     pub id: String,
+    /// The type of query: `query` or `queryAll`.
     pub operation: BulkOperation,
+    /// Current state of processing for the job.
     pub state: BulkJobState,
     /// Object the SOQL targets (parsed and surfaced by Salesforce —
     /// not the original SOQL).
     pub object: String,
+    /// Line ending used for the job's CSV data, marking the end of a
+    /// data row.
     #[serde(rename = "lineEnding")]
     pub line_ending: BulkLineEnding,
+    /// Column delimiter used for the job's CSV data.
     #[serde(rename = "columnDelimiter")]
     pub column_delimiter: BulkColumnDelimiter,
+    /// Format used for the results. Salesforce currently supports only
+    /// `CSV`.
     #[serde(rename = "contentType")]
     pub content_type: String,
     /// The wire sends a JSON number (e.g. `60.0`), so this is a float
@@ -683,18 +780,31 @@ pub struct BulkQueryJob {
     /// in CREATE responses; expect `None` until GET.
     #[serde(rename = "jobType", default)]
     pub job_type: Option<String>,
+    /// Reserved for future use: how the job is processed. Salesforce
+    /// currently supports only parallel mode.
     #[serde(rename = "concurrencyMode")]
     pub concurrency_mode: String,
+    /// ID of the user who created the job.
     #[serde(rename = "createdById")]
     pub created_by_id: String,
+    /// When the job was created, as a UTC `dateTime` string.
     #[serde(rename = "createdDate")]
     pub created_date: String,
+    /// When the API last updated the job information, as a UTC
+    /// `dateTime` string.
     #[serde(rename = "systemModstamp")]
     pub system_modstamp: String,
+    /// Number of records processed in this job. `None` in the CREATE
+    /// response.
     #[serde(rename = "numberRecordsProcessed", default)]
     pub number_records_processed: Option<i64>,
+    /// Number of times Salesforce attempted to save the results of an
+    /// operation. Repeated attempts indicate a problem such as lock
+    /// contention.
     #[serde(default)]
     pub retries: Option<i32>,
+    /// Time taken to process the job, in milliseconds. `None` in the
+    /// CREATE response.
     #[serde(rename = "totalProcessingTime", default)]
     pub total_processing_time: Option<i64>,
     /// Whether PK chunking is supported for the queried object.
@@ -845,16 +955,25 @@ impl BulkJobList {
 // too, so either form is read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkJobSummary {
+    /// Unique ID of the job.
     pub id: String,
+    /// Processing operation the job runs.
     pub operation: BulkOperation,
     /// Object type of the job's data. Empty for a `consentImport` job.
     #[serde(default)]
     pub object: String,
+    /// Current state of processing for the job.
     pub state: BulkJobState,
+    /// The job's type, including the Bulk API 1.0 and BigObjects kinds
+    /// a listing can carry; see [`BulkJobType`]. `None` when the record
+    /// omits it.
     #[serde(rename = "jobType", default)]
     pub job_type: Option<BulkJobType>,
+    /// API version the job was created in.
     #[serde(rename = "apiVersion", deserialize_with = "api_version_number")]
     pub api_version: f64,
+    /// For future use: how the job is processed. Salesforce currently
+    /// supports only parallel mode.
     #[serde(rename = "concurrencyMode")]
     pub concurrency_mode: String,
     /// `CSV` for a Bulk API 2.0 job; a Bulk API 1.0 job can report
@@ -865,14 +984,23 @@ pub struct BulkJobSummary {
     /// [`BulkIngestJob::content_url`] for its unusual form.
     #[serde(rename = "contentUrl", default)]
     pub content_url: Option<String>,
+    /// ID of the user who created the job.
     #[serde(rename = "createdById")]
     pub created_by_id: String,
+    /// When the job was created, as a UTC `dateTime` string.
     #[serde(rename = "createdDate")]
     pub created_date: String,
+    /// UTC `dateTime` string. The ingest listing describes it as when
+    /// the job finished, the query listing as when the API last updated
+    /// the job information.
     #[serde(rename = "systemModstamp")]
     pub system_modstamp: String,
+    /// Line ending used for the job's CSV data. `None` for a Bulk API
+    /// 1.0 job, which has no CSV formatting fields.
     #[serde(rename = "lineEnding", default)]
     pub line_ending: Option<BulkLineEnding>,
+    /// Column delimiter used for the job's CSV data. `None` for a Bulk
+    /// API 1.0 job, which has no CSV formatting fields.
     #[serde(rename = "columnDelimiter", default)]
     pub column_delimiter: Option<BulkColumnDelimiter>,
 }
@@ -991,6 +1119,8 @@ fn query_value(url: &str, name: &str) -> Option<String> {
 /// against partial column sets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventLogFileRecord {
+    /// ID of the `EventLogFile` record, the `0AT...` segment of
+    /// [`log_file`](Self::log_file).
     #[serde(rename = "Id")]
     pub id: String,
     /// Event category — `"API"`, `"Login"`, `"URI"`, `"Apex"`, etc.
