@@ -19,14 +19,27 @@ homepage = "https://github.com/rfaulhaber/cirrus"
 # Workspace members. The `version` field is required so dependent
 # crates can be published to crates.io — Cargo uses `path` for local
 # workspace builds and `version` for the published manifest.
-cirrus-auth = { path = "crates/cirrus-auth", version = "0.4.2" }
+# Without defaults so that each consumer crate's own feature table, not
+# cirrus-auth's default, decides the TLS backend; Cargo only lets a
+# member turn defaults off when the workspace entry already has.
+cirrus-auth = { path = "crates/cirrus-auth", version = "0.4.2", default-features = false }
 cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.4.0" }
 
 # Runtime / HTTP
-# `gzip` makes reqwest send `Accept-Encoding: gzip` and transparently
-# decode the response — Salesforce compresses a response only when the
-# request asks for it.
-reqwest = { version = "0.13", default-features = false, features = ["form", "gzip", "json", "multipart", "query", "rustls", "charset", "system-proxy"] }
+# Only what every client needs. `gzip` makes reqwest send
+# `Accept-Encoding: gzip` and transparently decode the response —
+# Salesforce compresses a response only when the request asks for it.
+# The body encoders (`form`, `json`, `query`, `multipart`) are added by
+# the crate whose code calls them, so a consumer of one crate does not
+# compile the others', and the TLS backend comes from each crate's
+# `[features]` table. All three crates re-export reqwest, so this list
+# is public surface: a feature missing here is missing from
+# `cirrus_auth::reqwest` too.
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "system-proxy"] }
+# Mozilla's CCADB root set, merged into the default clients' trust store
+# under each crate's `bundled-roots` feature for hosts with no system
+# CA bundle.
+webpki-root-certs = "1"
 tokio = { version = "1.52", features = ["sync", "time"] }
 url = "2.5"
 percent-encoding = "2.3"

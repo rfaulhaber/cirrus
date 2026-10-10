@@ -74,6 +74,8 @@
             cargo-nextest
             cargo-release
             cargo-deny
+            # for the per-crate feature matrix CI runs (cargo hack check)
+            cargo-hack
             # for salesforce docs skill
             nodejs
           ];

@@ -20,6 +20,16 @@
 //! - **No legacy surface.** Anything Salesforce labels deprecated or legacy
 //!   is intentionally not supported.
 //!
+//! ## Cargo features
+//!
+//! The TLS backend is a feature under reqwest's name, forwarded to
+//! `cirrus-auth`: `rustls` (the default), `rustls-no-provider`,
+//! `native-tls` and `native-tls-vendored`, plus `bundled-roots`, which
+//! merges Mozilla's root set into every client the crate builds for hosts
+//! with no system CA bundle. The [`auth`] crate's documentation has the
+//! table; pick a backend other than the default with
+//! `default-features = false`.
+//!
 //! ## Quick start
 //!
 //! ```no_run
@@ -1966,21 +1976,22 @@ impl CirrusBuilder {
                 USER_AGENT,
                 HeaderValue::from_str(ua).map_err(|e| CirrusError::InvalidHeader(e.to_string()))?,
             );
-            let mut builder = reqwest::Client::builder()
-                .default_headers(headers)
-                // Salesforce compresses a response only when the request
-                // carries Accept-Encoding, which this turns on.
-                .gzip(true)
-                // Following a 3xx would re-send the request — bearer
-                // token included — to whatever host the Location header
-                // names, so a redirect is surfaced as an error for the
-                // caller to inspect.
-                .redirect(reqwest::redirect::Policy::none())
-                // reqwest obeys HTTP_PROXY and the system proxy by
-                // default, and a proxy on the path is what the loopback
-                // exemption to the https rule assumes there is not. Only
-                // a proxy named on the builder is used.
-                .no_proxy();
+            let mut builder =
+                cirrus_auth::transport::merge_bundled_roots(reqwest::Client::builder())
+                    .default_headers(headers)
+                    // Salesforce compresses a response only when the request
+                    // carries Accept-Encoding, which this turns on.
+                    .gzip(true)
+                    // Following a 3xx would re-send the request — bearer
+                    // token included — to whatever host the Location header
+                    // names, so a redirect is surfaced as an error for the
+                    // caller to inspect.
+                    .redirect(reqwest::redirect::Policy::none())
+                    // reqwest obeys HTTP_PROXY and the system proxy by
+                    // default, and a proxy on the path is what the loopback
+                    // exemption to the https rule assumes there is not. Only
+                    // a proxy named on the builder is used.
+                    .no_proxy();
             for proxy in self.proxies {
                 builder = builder.proxy(proxy);
             }
@@ -2362,6 +2373,28 @@ mod tests {
         let limits: serde_json::Value = sf.get("limits").await.unwrap();
         assert!(limits.is_object());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The default client merges Mozilla's roots under `bundled-roots`,
+    /// so an empty system store (Linux only: the variables below are
+    /// what rustls-native-certs reads there) does not fail `build()`.
+    /// Process-wide variables, so a no-op under a threaded runner.
+    #[test]
+    #[cfg(all(unix, not(target_vendor = "apple"), feature = "bundled-roots"))]
+    fn bundled_roots_survive_an_empty_system_store() {
+        if std::env::var_os("NEXTEST").is_none() {
+            return;
+        }
+        // SAFETY: nextest runs this test in its own process (checked
+        // above), and the variables are set before any other thread of
+        // that process exists, so nothing reads the environment while it
+        // is modified.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", "/nonexistent/cirrus-no-roots.pem");
+            std::env::set_var("SSL_CERT_DIR", "/nonexistent/cirrus-no-roots");
+        }
+        let auth = Arc::new(StaticTokenAuth::new("tok", "https://my.salesforce.com"));
+        Cirrus::builder().auth(auth).build().unwrap();
     }
 
     #[tokio::test]

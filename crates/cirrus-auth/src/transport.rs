@@ -19,6 +19,12 @@
 //! megabytes of gzip inflate a thousandfold. [`collect_body`] reads a
 //! body under a limit on its decoded size, and every client reads
 //! responses through it for the same reason the loopback rule is shared.
+//!
+//! The default TLS backend trusts the operating system's roots and
+//! refuses to build a client when it finds none. [`merge_bundled_roots`]
+//! is where the `bundled-roots` feature adds Mozilla's set alongside
+//! them, and every default client passes through it, so the feature
+//! behaves the same on every crate.
 
 use bytes::{Bytes, BytesMut};
 
@@ -53,6 +59,35 @@ pub fn is_secure_transport(url: &url::Url) -> bool {
 /// proxy their builders installed.
 pub fn is_secure_transport_for(url: &url::Url, proxied: bool) -> bool {
     url.scheme() == "https" || (!proxied && is_loopback_host(url))
+}
+
+/// Adds Mozilla's root certificates to the trust store of the client
+/// `builder` will create, alongside whatever the platform supplies, when
+/// the crate's `bundled-roots` feature is on. Without the feature the
+/// builder is returned unchanged.
+///
+/// The default TLS backend verifies against the operating system's
+/// store and refuses to build a client when that store is empty, as it
+/// is in a `FROM scratch` image or a build sandbox without
+/// `ca-certificates`. Every client the Cirrus crates build passes
+/// through here, so enabling the feature on whichever crate is in use is
+/// enough for the clients it builds. A client supplied through an
+/// `http_client` setter is its owner's and gets its roots from
+/// `reqwest::ClientBuilder::tls_certs_merge` instead.
+pub fn merge_bundled_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    #[cfg(feature = "bundled-roots")]
+    {
+        // The bundle is well-formed DER, so `from_der` can only fail
+        // where a backend rejects a root it cannot use; dropping that
+        // root is better than failing every client over it.
+        builder.tls_certs_merge(
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .filter_map(|der| reqwest::Certificate::from_der(der).ok()),
+        )
+    }
+    #[cfg(not(feature = "bundled-roots"))]
+    builder
 }
 
 /// Why [`collect_body`] did not return a body.

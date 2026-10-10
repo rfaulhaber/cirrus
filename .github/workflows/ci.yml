@@ -63,6 +63,36 @@ jobs:
       - name: cargo test --doc
         run: cargo test --doc --all-features --locked
 
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack,cargo-nextest
+      # Each crate on its own and without its dev-dependencies, the way a
+      # consumer builds it: no features, each TLS backend alone, the
+      # defaults, and all of them together. The other jobs build the whole
+      # workspace with --all-features, which would hide a reqwest feature
+      # one crate only has because another enables it. bundled-roots alone
+      # is skipped because it presumes a backend to merge the roots into,
+      # and native-tls-vendored because it compiles the same Rust as
+      # native-tls and builds OpenSSL from source to do it. No --locked:
+      # removing the dev-dependencies prunes the lockfile, which --locked
+      # refuses; the versions still come from the committed lock.
+      - name: cargo hack check --each-feature
+        run: cargo hack check --workspace --each-feature --exclude-features bundled-roots,native-tls-vendored --no-dev-deps
+      # The bundled roots under the default rustls backend, which is the
+      # configuration the feature exists for. The tests that empty the
+      # system store only prove something here: under --all-features
+      # reqwest defaults to native-tls, which does not read the store when
+      # the client is built.
+      - name: cargo nextest run --features bundled-roots
+        run: cargo nextest run --workspace --features cirrus/bundled-roots,cirrus-auth/bundled-roots,cirrus-metadata/bundled-roots --locked
+
   msrv:
     runs-on: ubuntu-latest
     # RUSTUP_TOOLCHAIN below duplicates `[workspace.package] rust-version` in

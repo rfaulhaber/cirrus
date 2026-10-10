@@ -99,8 +99,9 @@ you need anything beyond `deployRequest`.
   TLS is verified against the operating system's trust store, which the
   client loads when it is built: a `FROM scratch` or distroless image
   without `ca-certificates` fails at `build()` with
-  `MetadataError::HttpClient`, so install a CA bundle or hand over a
-  `reqwest::Client` that carries its own roots (`add_root_certificate`).
+  `MetadataError::HttpClient`. Install a CA bundle, enable the
+  `bundled-roots` feature (see [Cargo features](#cargo-features)) or hand
+  over a `reqwest::Client` that carries its own roots (`tls_certs_merge`).
   Supplying your own client via `MetadataClientBuilder::http_client` replaces
   all of it.
 
@@ -187,6 +188,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Cargo features
+
+The TLS backend is a feature, under reqwest's names, and `rustls` is the
+default, so a manifest that names no features builds as it always has.
+`cirrus-metadata` forwards each feature to `cirrus-auth`, whose README has the
+full table:
+
+- `rustls` (default): rustls with the aws-lc-rs provider, verifying against
+  the operating system's trust store.
+- `rustls-no-provider`: rustls with the crypto provider left to the
+  application, which installs one before building a client.
+- `native-tls` / `native-tls-vendored`: the operating system's TLS stack, with
+  OpenSSL built from source in the vendored case.
+- `bundled-roots`: merges Mozilla's root set into every client the crate
+  builds, alongside the platform's, for hosts without a system CA bundle.
+
+```toml
+[dependencies]
+cirrus-metadata = { version = "0.4.0", default-features = false, features = ["native-tls"] }
+```
+
+The features forward to reqwest and unify across the build like reqwest's own,
+so another dependency that enables `reqwest/rustls` brings it back. The
+re-exported `cirrus_metadata::reqwest` carries only `gzip`, `system-proxy`,
+`form` (through `cirrus-auth`) and the chosen backend; code that reaches
+`RequestBuilder::json`, `query` or `multipart` through it adds reqwest with
+those features to its own manifest.
 
 ## SOAP headers
 

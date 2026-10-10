@@ -22,7 +22,9 @@ camino.workspace = true
 fs-err.workspace = true
 getrandom.workspace = true
 jsonwebtoken.workspace = true
-reqwest.workspace = true
+# `form` for the token-endpoint POST body; the token endpoint answers
+# JSON, which serde_json parses from the collected bytes.
+reqwest = { workspace = true, features = ["form"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -33,6 +35,25 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 url.workspace = true
+webpki-root-certs = { workspace = true, optional = true }
+
+[features]
+default = ["rustls"]
+# The TLS backend, one of reqwest's by the same name. `rustls` is
+# rustls with the aws-lc-rs provider and the platform verifier;
+# `rustls-no-provider` leaves the crypto provider to the application,
+# which must install one before building a client; the `native-tls`
+# pair are the operating system's TLS stack (OpenSSL on Linux, built
+# from source when vendored). Enabling both backends makes reqwest
+# default to native-tls.
+rustls = ["reqwest/rustls"]
+rustls-no-provider = ["reqwest/rustls-no-provider"]
+native-tls = ["reqwest/native-tls"]
+native-tls-vendored = ["reqwest/native-tls-vendored"]
+# Merge Mozilla's root set into the trust store of every client the
+# crate builds, alongside the platform's, so a host with no system CA
+# bundle can still build one. Presumes a TLS backend.
+bundled-roots = ["dep:webpki-root-certs"]
 
 [dev-dependencies]
 dotenvy.workspace = true
@@ -57,3 +78,6 @@ push-remote = "origin"
 tag-prefix = "cirrus-auth-v"
 tag-name = "{{prefix}}{{version}}"
 publish = true
+pre-release-replacements = [
+    { file = "README.md", search = 'cirrus-auth = \{ version = "[^"]+"', replace = 'cirrus-auth = { version = "{{version}}"', min = 1 },
+]

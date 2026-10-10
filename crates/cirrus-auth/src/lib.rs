@@ -41,6 +41,20 @@
 //! bounded body reader, [`transport::collect_body`], that every client
 //! reads responses through.
 //!
+//! ## Cargo features
+//!
+//! The TLS backend is chosen by feature, under reqwest's names: `rustls`
+//! (the default: rustls with the aws-lc-rs provider and the platform's
+//! trust store), `rustls-no-provider` (the application installs the
+//! crypto provider before building a client), `native-tls` and
+//! `native-tls-vendored` (the operating system's stack). `bundled-roots`
+//! merges Mozilla's root set into every client the crate builds, through
+//! [`transport::merge_bundled_roots`], for hosts with no system CA
+//! bundle. The features forward to reqwest and unify across the build as
+//! reqwest's own do; `rustls-no-provider` changes which provider TLS
+//! uses, not whether aws-lc-rs compiles, since JWT assertions are signed
+//! with it regardless.
+//!
 //! ## Transport and logging
 //!
 //! The token-endpoint client a flow builder creates applies
