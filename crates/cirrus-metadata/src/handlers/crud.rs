@@ -4,7 +4,10 @@
 //! rename individual metadata components in a single SOAP round-trip
 //! — no zip files, no async polling. They sit alongside the file-based
 //! [`deploy`] / [`retrieve`] flow and cover the same lifecycle
-//! operations at a finer grain.
+//! operations at a finer grain. Not every type takes them: each type's
+//! reference page lists its supported calls, and `ApexClass` and
+//! `ApexTrigger` document "All Metadata API calls except CRUD-Based
+//! Calls", so Apex goes through [`deploy`] / [`retrieve`] only.
 //!
 //! ## What the SDK does and doesn't model
 //!
@@ -507,13 +510,20 @@ impl MetadataClient {
     /// ```no_run
     /// # use cirrus_metadata::{MetadataClient, SaveResult, MetadataError};
     /// # async fn example(md: &MetadataClient) -> Result<(), MetadataError> {
-    /// let class = r#"
-    ///     <fullName>MyClass</fullName>
-    ///     <apiVersion>66.0</apiVersion>
-    ///     <status>Active</status>
-    ///     <content>cHVibGljIGNsYXNzIE15Q2xhc3Mge30=</content>
+    /// let object = r#"
+    ///     <fullName>MyCustomObject1__c</fullName>
+    ///     <deploymentStatus>Deployed</deploymentStatus>
+    ///     <description>Created by the Metadata API</description>
+    ///     <enableActivities>true</enableActivities>
+    ///     <label>MyCustomObject1 Object</label>
+    ///     <nameField>
+    ///         <label>MyCustomObject1__c Name</label>
+    ///         <type>Text</type>
+    ///     </nameField>
+    ///     <pluralLabel>MyCustomObject1 Objects</pluralLabel>
+    ///     <sharingModel>ReadWrite</sharingModel>
     /// "#;
-    /// let results: Vec<SaveResult> = md.create_metadata("ApexClass", &[class]).await?;
+    /// let results: Vec<SaveResult> = md.create_metadata("CustomObject", &[object]).await?;
     /// for r in &results {
     ///     assert!(r.success, "create failed: {:?}", r.errors);
     /// }
@@ -665,8 +675,8 @@ impl MetadataClient {
     /// The caller supplies a typed `T: Deserialize` shape that maps
     /// over one `<records>` element. Component XML uses the metadata
     /// namespace as default on the wire, so quick-xml's serde
-    /// deserialize sees field names like `fullName`, `apiVersion`,
-    /// `status`, etc.
+    /// deserialize sees field names like `fullName`, `label`,
+    /// `sharingModel`, etc.
     ///
     /// **Every field of `T` must be optional** — `Option<_>` or
     /// `#[serde(default)]`, including `fullName`. A `fullName` that
@@ -683,23 +693,24 @@ impl MetadataClient {
     /// # use serde::Deserialize;
     /// #[derive(Deserialize)]
     /// #[serde(rename_all = "camelCase")]
-    /// struct ApexClassRecord {
+    /// struct CustomObjectRecord {
     ///     #[serde(default)]
     ///     full_name: Option<String>,
     ///     #[serde(default)]
-    ///     api_version: Option<String>,
+    ///     label: Option<String>,
     ///     #[serde(default)]
-    ///     status: Option<String>,
-    ///     #[serde(default)]
-    ///     content: Option<String>,
+    ///     sharing_model: Option<String>,
     /// }
     ///
     /// # async fn example(md: &MetadataClient) -> Result<(), MetadataError> {
-    /// let classes: Vec<ApexClassRecord> = md
-    ///     .read_metadata::<ApexClassRecord, _, _>("ApexClass", &["Foo", "Bar"])
+    /// let objects: Vec<CustomObjectRecord> = md
+    ///     .read_metadata::<CustomObjectRecord, _, _>(
+    ///         "CustomObject",
+    ///         &["MyCustomObject1__c", "MyCustomObject2__c"],
+    ///     )
     ///     .await?;
-    /// for class in &classes {
-    ///     let Some(name) = &class.full_name else {
+    /// for object in &objects {
+    ///     let Some(name) = &object.full_name else {
     ///         continue; // placeholder for a name the org doesn't have
     ///     };
     ///     println!("{name}");

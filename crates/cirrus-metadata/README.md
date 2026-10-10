@@ -255,15 +255,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .call_options_client("my-tool/1.0")
         .build()?;
 
-    // Either both classes are created or neither is.
+    // Either both objects are created or neither is. Interpolated text
+    // goes through `cirrus_metadata::xml_escape`; a component that is
+    // not a well-formed fragment is refused before the request.
     let results = md
         .create_metadata_with(
-            "ApexClass",
+            "CustomObject",
             &[
-                "<fullName>One</fullName><apiVersion>66.0</apiVersion><status>Active</status>\
-                 <content>cHVibGljIGNsYXNzIE9uZSB7fQ==</content>",
-                "<fullName>Two</fullName><apiVersion>66.0</apiVersion><status>Active</status>\
-                 <content>cHVibGljIGNsYXNzIFR3byB7fQ==</content>",
+                "<fullName>MyCustomObject1__c</fullName>\
+                 <deploymentStatus>Deployed</deploymentStatus>\
+                 <label>MyCustomObject1 Object</label>\
+                 <nameField><label>Name</label><type>Text</type></nameField>\
+                 <pluralLabel>MyCustomObject1 Objects</pluralLabel>\
+                 <sharingModel>ReadWrite</sharingModel>",
+                "<fullName>MyCustomObject2__c</fullName>\
+                 <deploymentStatus>Deployed</deploymentStatus>\
+                 <label>MyCustomObject2 Object</label>\
+                 <nameField><label>Name</label><type>Text</type></nameField>\
+                 <pluralLabel>MyCustomObject2 Objects</pluralLabel>\
+                 <sharingModel>ReadWrite</sharingModel>",
             ],
             CrudOptions { all_or_none: true },
         )
