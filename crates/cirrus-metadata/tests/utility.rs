@@ -748,3 +748,26 @@ async fn describe_value_type_rejects_nesting_past_the_cap() {
         "{err:?}"
     );
 }
+
+/// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_describeValueType.htm
+/// "To run the previous example with the Tooling WSDL, replace the
+/// namespace with the Tooling namespace in the helper function call
+/// as follows. Also, use the Tooling connection instead of the
+/// Metadata connection to make the describeValueType() call." The
+/// client has only a Metadata connection, so a Tooling-namespace name
+/// is refused before any request rather than posted to the wrong
+/// endpoint.
+#[tokio::test]
+async fn describe_value_type_refuses_the_tooling_namespace_before_sending() {
+    let server = MockServer::start().await;
+    let md = client_against(&server);
+
+    let err = md
+        .describe_value_type("{urn:metadata.tooling.soap.sforce.com}ApexClass")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, MetadataError::InvalidArgument(_)), "{err:?}");
+    assert!(err.to_string().contains("Tooling"), "{err}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

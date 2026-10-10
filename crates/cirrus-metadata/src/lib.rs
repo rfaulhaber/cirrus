@@ -22,8 +22,11 @@
 //! ## Design principles
 //!
 //! - **No user-facing types.** The 200+ concrete metadata types
-//!   (`CustomObject`, `ApexClass`, …) are caller-supplied XML or
-//!   `serde_json::Value`. Only platform-contract envelopes are typed.
+//!   (`CustomObject`, `ApexClass`, …) are not modeled: a write takes
+//!   each component as caller-rendered XML (text escaped with
+//!   [`xml_escape`]) and `read_metadata` deserializes into a
+//!   caller-chosen `T: Deserialize`. Only platform-contract envelopes
+//!   are typed.
 //! - **No legacy surface.** Operations Salesforce labels deprecated
 //!   (`create()`, `update()`, `delete()` pre-API-31) are not exposed.
 //! - **Auth is pluggable.** Any [`cirrus_auth::AuthSession`] works.
@@ -37,8 +40,9 @@
 //! the only exemption, for local mock servers, and it holds only while
 //! no [`MetadataClientBuilder::proxy`] is configured. The rule is the one
 //! `cirrus` applies, from [`cirrus_auth::transport`], checked when the
-//! client is built and again on every call because an [`AuthSession`]
-//! may change its instance URL. [`MetadataClientBuilder::allow_insecure_transport`]
+//! client is built and again on every call, since the instance URL is
+//! read from the [`AuthSession`] each time and a custom session could
+//! change it. [`MetadataClientBuilder::allow_insecure_transport`]
 //! is the opt-out for a deliberate plaintext hop. The HTTP client the
 //! builder creates follows no redirects and uses no proxy unless one is
 //! configured, and a `Retry-After` hint longer
@@ -282,9 +286,11 @@ impl MetadataClient {
     /// e.g. `https://my-org.my.salesforce.com/services/Soap/m/66.0`.
     ///
     /// The instance URL is read from the configured [`AuthSession`] on
-    /// every call, so it reflects the *current* session — relevant for
-    /// flows that can change instance URL on refresh (e.g. some token
-    /// exchange scenarios).
+    /// each call. Every session type this SDK ships keeps it fixed for
+    /// the session's lifetime (a refresh whose response names a
+    /// different `instance_url` fails with
+    /// [`AuthError::InstanceUrlMismatch`]),
+    /// so only a custom [`AuthSession`] can make this value change.
     pub fn endpoint_url(&self) -> String {
         format!(
             "{}/services/Soap/m/{}",

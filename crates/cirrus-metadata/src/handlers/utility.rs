@@ -192,20 +192,33 @@ impl MetadataClient {
 
     /// Describe the schema of one specific metadata type.
     ///
-    /// `qualified_type_name` is the SOAP-namespace-qualified type
-    /// name. For the standard Metadata API namespace, that's
-    /// `"{http://soap.sforce.com/2006/04/metadata}ApexClass"` (or any
-    /// other type). The Tooling API uses
-    /// `"{urn:metadata.tooling.soap.sforce.com}<Type>"`.
+    /// `qualified_type_name` is the type's name qualified with the
+    /// Metadata API's SOAP namespace, for example
+    /// `"{http://soap.sforce.com/2006/04/metadata}ApexClass"`. The
+    /// Tooling API describes its own types under
+    /// `{urn:metadata.tooling.soap.sforce.com}`, but Salesforce serves
+    /// those through a Tooling SOAP connection, which this client does
+    /// not provide; a name in that namespace is refused with
+    /// [`MetadataError::InvalidArgument`] before any request is made.
     ///
     /// Returns field-level metadata — types, requirement flags,
     /// foreign-key relationships, picklist options. Useful for
     /// validating component XML before deploy or for generating
     /// typed bindings.
+    ///
+    /// [`MetadataError::InvalidArgument`]: crate::MetadataError::InvalidArgument
     pub async fn describe_value_type(
         &self,
         qualified_type_name: &str,
     ) -> MetadataResult<DescribeValueTypeResult> {
+        const TOOLING_NAMESPACE: &str = "{urn:metadata.tooling.soap.sforce.com}";
+        if qualified_type_name.starts_with(TOOLING_NAMESPACE) {
+            return Err(MetadataError::InvalidArgument(format!(
+                "describe_value_type: `{qualified_type_name}` is in the Tooling API's namespace, \
+                 which Salesforce serves through a Tooling SOAP connection; this client posts \
+                 only to the Metadata API"
+            )));
+        }
         let op = DescribeValueTypeOp {
             type_name: qualified_type_name.to_string(),
         };

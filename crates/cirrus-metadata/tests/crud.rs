@@ -13,7 +13,10 @@
 //! guide publishes no SOAP envelope example, so the
 //! `<soapenv:Envelope><soapenv:Body><xxxResponse>` framing follows the
 //! WSDL's document-literal binding rather than a published sample —
-//! only what sits inside `<result>` is doc-cited.
+//! only what sits inside `<result>` is doc-cited. The fixtures use
+//! `CustomObject`, the type in the guide's own Java sample on every
+//! CRUD page; `ApexClass` is documented as supporting every Metadata
+//! API call except the CRUD-based ones.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -68,26 +71,30 @@ async fn create_metadata_returns_save_results_per_component() {
         .and(path("/services/Soap/m/66.0"))
         .and(body_string_contains("<met:createMetadata>"))
         .and(body_string_contains(
-            r#"<met:metadata xsi:type="met:ApexClass""#,
+            r#"<met:metadata xsi:type="met:CustomObject""#,
         ))
         // The wrapper declares the metadata namespace as default so
         // children without prefix end up in the metadata namespace.
         .and(body_string_contains(
             r#"xmlns="http://soap.sforce.com/2006/04/metadata""#,
         ))
-        .and(body_string_contains("<fullName>Foo</fullName>"))
-        .and(body_string_contains("<fullName>Bar</fullName>"))
+        .and(body_string_contains(
+            "<fullName>MyCustomObject1__c</fullName>",
+        ))
+        .and(body_string_contains(
+            "<fullName>MyCustomObject2__c</fullName>",
+        ))
         .respond_with(xml_response(
             r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <createMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>Foo</fullName>
+        <fullName>MyCustomObject1__c</fullName>
         <success>true</success>
       </result>
       <result>
-        <fullName>Bar</fullName>
+        <fullName>MyCustomObject2__c</fullName>
         <success>false</success>
         <errors>
           <statusCode>DUPLICATE_VALUE</statusCode>
@@ -103,19 +110,19 @@ async fn create_metadata_returns_save_results_per_component() {
         .await;
 
     let md = client_against(&server);
-    let class_a = "<fullName>Foo</fullName><apiVersion>66.0</apiVersion>";
-    let class_b = "<fullName>Bar</fullName><apiVersion>66.0</apiVersion>";
+    let object_a = "<fullName>MyCustomObject1__c</fullName><label>MyCustomObject1 Object</label>";
+    let object_b = "<fullName>MyCustomObject2__c</fullName><label>MyCustomObject2 Object</label>";
     let results = md
-        .create_metadata("ApexClass", &[class_a, class_b])
+        .create_metadata("CustomObject", &[object_a, object_b])
         .await
         .unwrap();
 
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].full_name, "Foo");
+    assert_eq!(results[0].full_name, "MyCustomObject1__c");
     assert!(results[0].success);
     assert!(results[0].errors.is_empty());
 
-    assert_eq!(results[1].full_name, "Bar");
+    assert_eq!(results[1].full_name, "MyCustomObject2__c");
     assert!(!results[1].success);
     assert_eq!(results[1].errors.len(), 1);
     assert_eq!(results[1].errors[0].status_code, "DUPLICATE_VALUE");
@@ -251,7 +258,7 @@ async fn create_metadata_rejects_empty_input_before_sending() {
     let md = MetadataClient::builder().auth(auth).build().unwrap();
 
     let err = md
-        .create_metadata::<&str, _>("ApexClass", &[])
+        .create_metadata::<&str, _>("CustomObject", &[])
         .await
         .unwrap_err();
     match err {
@@ -271,7 +278,7 @@ async fn create_metadata_rejects_more_than_ten_components() {
     let xml: Vec<String> = (0..11)
         .map(|i| format!("<fullName>X{i}</fullName>"))
         .collect();
-    let err = md.create_metadata("ApexClass", &xml).await.unwrap_err();
+    let err = md.create_metadata("CustomObject", &xml).await.unwrap_err();
     match err {
         MetadataError::InvalidArgument(msg) => {
             assert!(msg.contains("10"));
@@ -298,7 +305,7 @@ async fn update_metadata_returns_save_results() {
   <soapenv:Body>
     <updateMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>MyClass</fullName>
+        <fullName>MyCustomObject1__c</fullName>
         <success>true</success>
       </result>
     </updateMetadataResponse>
@@ -311,8 +318,8 @@ async fn update_metadata_returns_save_results() {
     let md = client_against(&server);
     let results = md
         .update_metadata(
-            "ApexClass",
-            &["<fullName>MyClass</fullName><apiVersion>66.0</apiVersion>"],
+            "CustomObject",
+            &["<fullName>MyCustomObject1__c</fullName><label>MyCustomObject1 Object Update</label>"],
         )
         .await
         .unwrap();
@@ -368,12 +375,12 @@ async fn upsert_metadata_returns_created_flag_per_component() {
   <soapenv:Body>
     <upsertMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>Foo</fullName>
+        <fullName>MyCustomObject1__c</fullName>
         <success>true</success>
         <created>true</created>
       </result>
       <result>
-        <fullName>Bar</fullName>
+        <fullName>MyCustomObject2__c</fullName>
         <success>true</success>
         <created>false</created>
       </result>
@@ -387,8 +394,11 @@ async fn upsert_metadata_returns_created_flag_per_component() {
     let md = client_against(&server);
     let results = md
         .upsert_metadata(
-            "ApexClass",
-            &["<fullName>Foo</fullName>", "<fullName>Bar</fullName>"],
+            "CustomObject",
+            &[
+                "<fullName>MyCustomObject1__c</fullName>",
+                "<fullName>MyCustomObject2__c</fullName>",
+            ],
         )
         .await
         .unwrap();
@@ -414,20 +424,24 @@ async fn delete_metadata_returns_one_result_per_full_name() {
 
     Mock::given(method("POST"))
         .and(body_string_contains("<met:deleteMetadata>"))
-        .and(body_string_contains("<met:type>ApexClass</met:type>"))
-        .and(body_string_contains("<met:fullNames>Foo</met:fullNames>"))
-        .and(body_string_contains("<met:fullNames>Bar</met:fullNames>"))
+        .and(body_string_contains("<met:type>CustomObject</met:type>"))
+        .and(body_string_contains(
+            "<met:fullNames>MyCustomObject1__c</met:fullNames>",
+        ))
+        .and(body_string_contains(
+            "<met:fullNames>MyCustomObject2__c</met:fullNames>",
+        ))
         .respond_with(xml_response(
             r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
     <deleteMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>Foo</fullName>
+        <fullName>MyCustomObject1__c</fullName>
         <success>true</success>
       </result>
       <result>
-        <fullName>Bar</fullName>
+        <fullName>MyCustomObject2__c</fullName>
         <success>false</success>
         <errors>
           <statusCode>INVALID_TYPE</statusCode>
@@ -443,7 +457,10 @@ async fn delete_metadata_returns_one_result_per_full_name() {
 
     let md = client_against(&server);
     let results = md
-        .delete_metadata("ApexClass", &["Foo", "Bar"])
+        .delete_metadata(
+            "CustomObject",
+            &["MyCustomObject1__c", "MyCustomObject2__c"],
+        )
         .await
         .unwrap();
     assert_eq!(results.len(), 2);
@@ -454,33 +471,34 @@ async fn delete_metadata_returns_one_result_per_full_name() {
 
 // -- read_metadata -----------------------------------------------------------
 
-/// Caller shape for `readMetadata`-of-ApexClass.
+/// Caller shape for `readMetadata`-of-CustomObject, with the three
+/// fields the guide's `readMetadata()` Java sample reads back.
 ///
 /// Every field is optional, including `fullName`: a requested name the
 /// org doesn't have comes back as a content-free placeholder record,
 /// and one required field would fail the whole document.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct ApexClassRecord {
+struct CustomObjectRecord {
     #[serde(default)]
     full_name: Option<String>,
     #[serde(default)]
-    api_version: Option<String>,
+    label: Option<String>,
     #[serde(default)]
-    status: Option<String>,
+    sharing_model: Option<String>,
 }
 
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_readResult.htm
 /// ReadResult: "records | Metadata[] | An array of metadata components
 /// returned from readMetadata()." The children of each `<records>`
-/// element are the caller's own metadata type — here an ApexClass.
+/// element are the caller's own metadata type — here a CustomObject.
 #[tokio::test]
 async fn read_metadata_deserializes_records_into_caller_type() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(body_string_contains("<met:readMetadata>"))
-        .and(body_string_contains("<met:type>ApexClass</met:type>"))
+        .and(body_string_contains("<met:type>CustomObject</met:type>"))
         .respond_with(xml_response(
             r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
@@ -488,14 +506,14 @@ async fn read_metadata_deserializes_records_into_caller_type() {
     <readMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
         <records>
-          <fullName>Foo</fullName>
-          <apiVersion>66.0</apiVersion>
-          <status>Active</status>
+          <fullName>MyCustomObject1__c</fullName>
+          <label>MyCustomObject1 Object</label>
+          <sharingModel>ReadWrite</sharingModel>
         </records>
         <records>
-          <fullName>Bar</fullName>
-          <apiVersion>65.0</apiVersion>
-          <status>Deleted</status>
+          <fullName>MyCustomObject2__c</fullName>
+          <label>MyCustomObject2 Object</label>
+          <sharingModel>Private</sharingModel>
         </records>
       </result>
     </readMetadataResponse>
@@ -506,16 +524,19 @@ async fn read_metadata_deserializes_records_into_caller_type() {
         .await;
 
     let md = client_against(&server);
-    let records: Vec<ApexClassRecord> = md
-        .read_metadata("ApexClass", &["Foo", "Bar"])
+    let records: Vec<CustomObjectRecord> = md
+        .read_metadata(
+            "CustomObject",
+            &["MyCustomObject1__c", "MyCustomObject2__c"],
+        )
         .await
         .unwrap();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].full_name, Some("Foo".into()));
-    assert_eq!(records[0].api_version, Some("66.0".into()));
-    assert_eq!(records[0].status, Some("Active".into()));
-    assert_eq!(records[1].full_name, Some("Bar".into()));
-    assert_eq!(records[1].status, Some("Deleted".into()));
+    assert_eq!(records[0].full_name, Some("MyCustomObject1__c".into()));
+    assert_eq!(records[0].label, Some("MyCustomObject1 Object".into()));
+    assert_eq!(records[0].sharing_model, Some("ReadWrite".into()));
+    assert_eq!(records[1].full_name, Some("MyCustomObject2__c".into()));
+    assert_eq!(records[1].sharing_model, Some("Private".into()));
 }
 
 /// A ReadResult whose `records` array is empty; the handler must
@@ -539,7 +560,10 @@ async fn read_metadata_empty_result_yields_empty_vec() {
         .await;
 
     let md = client_against(&server);
-    let records: Vec<ApexClassRecord> = md.read_metadata("ApexClass", &["NotFound"]).await.unwrap();
+    let records: Vec<CustomObjectRecord> = md
+        .read_metadata("CustomObject", &["NotFound"])
+        .await
+        .unwrap();
     assert!(records.is_empty());
 }
 
@@ -557,7 +581,9 @@ async fn read_metadata_tolerates_the_placeholder_for_a_missing_full_name() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(body_string_contains("<met:fullNames>Foo</met:fullNames>"))
+        .and(body_string_contains(
+            "<met:fullNames>MyCustomObject1__c</met:fullNames>",
+        ))
         .and(body_string_contains(
             "<met:fullNames>DoesNotExist</met:fullNames>",
         ))
@@ -569,9 +595,9 @@ async fn read_metadata_tolerates_the_placeholder_for_a_missing_full_name() {
     <readMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
         <records>
-          <fullName>Foo</fullName>
-          <apiVersion>66.0</apiVersion>
-          <status>Active</status>
+          <fullName>MyCustomObject1__c</fullName>
+          <label>MyCustomObject1 Object</label>
+          <sharingModel>ReadWrite</sharingModel>
         </records>
         <records xsi:nil="true"/>
       </result>
@@ -583,16 +609,16 @@ async fn read_metadata_tolerates_the_placeholder_for_a_missing_full_name() {
         .await;
 
     let md = client_against(&server);
-    let records: Vec<ApexClassRecord> = md
-        .read_metadata("ApexClass", &["Foo", "DoesNotExist"])
+    let records: Vec<CustomObjectRecord> = md
+        .read_metadata("CustomObject", &["MyCustomObject1__c", "DoesNotExist"])
         .await
         .unwrap();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].full_name, Some("Foo".into()));
+    assert_eq!(records[0].full_name, Some("MyCustomObject1__c".into()));
     // Every field absent is the "no such component" signal.
     assert_eq!(records[1].full_name, None);
-    assert_eq!(records[1].api_version, None);
-    assert_eq!(records[1].status, None);
+    assert_eq!(records[1].label, None);
+    assert_eq!(records[1].sharing_model, None);
 }
 
 // -- rename_metadata ---------------------------------------------------------
@@ -607,12 +633,12 @@ async fn rename_metadata_returns_single_save_result() {
 
     Mock::given(method("POST"))
         .and(body_string_contains("<met:renameMetadata>"))
-        .and(body_string_contains("<met:type>ApexClass</met:type>"))
+        .and(body_string_contains("<met:type>CustomObject</met:type>"))
         .and(body_string_contains(
-            "<met:oldFullName>OldName</met:oldFullName>",
+            "<met:oldFullName>MyCustomObject1__c</met:oldFullName>",
         ))
         .and(body_string_contains(
-            "<met:newFullName>NewName</met:newFullName>",
+            "<met:newFullName>MyCustomObject1New__c</met:newFullName>",
         ))
         .respond_with(xml_response(
             r#"<?xml version="1.0"?>
@@ -620,7 +646,7 @@ async fn rename_metadata_returns_single_save_result() {
   <soapenv:Body>
     <renameMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>NewName</fullName>
+        <fullName>MyCustomObject1New__c</fullName>
         <success>true</success>
       </result>
     </renameMetadataResponse>
@@ -632,11 +658,15 @@ async fn rename_metadata_returns_single_save_result() {
 
     let md = client_against(&server);
     let result = md
-        .rename_metadata("ApexClass", "OldName", "NewName")
+        .rename_metadata(
+            "CustomObject",
+            "MyCustomObject1__c",
+            "MyCustomObject1New__c",
+        )
         .await
         .unwrap();
     assert!(result.success);
-    assert_eq!(result.full_name, "NewName");
+    assert_eq!(result.full_name, "MyCustomObject1New__c");
 }
 
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_saveResult.htm
@@ -657,7 +687,7 @@ async fn rename_metadata_propagates_error_in_save_result() {
   <soapenv:Body>
     <renameMetadataResponse xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>OldName</fullName>
+        <fullName>MyCustomObject1__c</fullName>
         <success>false</success>
         <errors>
           <statusCode>INVALID_TYPE</statusCode>
@@ -673,7 +703,11 @@ async fn rename_metadata_propagates_error_in_save_result() {
 
     let md = client_against(&server);
     let result = md
-        .rename_metadata("ApexClass", "OldName", "NewName")
+        .rename_metadata(
+            "CustomObject",
+            "MyCustomObject1__c",
+            "MyCustomObject1New__c",
+        )
         .await
         .unwrap();
     assert!(!result.success);
@@ -696,7 +730,7 @@ fn save_results_response(operation: &str) -> ResponseTemplate {
   <soapenv:Body>
     <{operation}Response xmlns="http://soap.sforce.com/2006/04/metadata">
       <result>
-        <fullName>Foo</fullName>
+        <fullName>MyCustomObject1__c</fullName>
         <success>true</success>
         <created>true</created>
       </result>
@@ -749,8 +783,8 @@ async fn create_metadata_with_all_or_none_sends_the_header_after_the_session_hea
 
     let md = client_against(&server);
     md.create_metadata_with(
-        "ApexClass",
-        &["<fullName>Foo</fullName>"],
+        "CustomObject",
+        &["<fullName>MyCustomObject1__c</fullName>"],
         CrudOptions { all_or_none: true },
     )
     .await
@@ -763,7 +797,7 @@ async fn create_metadata_sends_no_all_or_none_header() {
     mount_all_or_none_expectation(&server, "createMetadata", false).await;
 
     let md = client_against(&server);
-    md.create_metadata("ApexClass", &["<fullName>Foo</fullName>"])
+    md.create_metadata("CustomObject", &["<fullName>MyCustomObject1__c</fullName>"])
         .await
         .unwrap();
 }
@@ -775,8 +809,8 @@ async fn create_metadata_with_default_options_sends_no_all_or_none_header() {
 
     let md = client_against(&server);
     md.create_metadata_with(
-        "ApexClass",
-        &["<fullName>Foo</fullName>"],
+        "CustomObject",
+        &["<fullName>MyCustomObject1__c</fullName>"],
         CrudOptions::default(),
     )
     .await
@@ -790,8 +824,8 @@ async fn update_metadata_with_all_or_none_sends_the_header() {
 
     let md = client_against(&server);
     md.update_metadata_with(
-        "ApexClass",
-        &["<fullName>Foo</fullName>"],
+        "CustomObject",
+        &["<fullName>MyCustomObject1__c</fullName>"],
         CrudOptions { all_or_none: true },
     )
     .await
@@ -804,7 +838,7 @@ async fn update_metadata_sends_no_all_or_none_header() {
     mount_all_or_none_expectation(&server, "updateMetadata", false).await;
 
     let md = client_against(&server);
-    md.update_metadata("ApexClass", &["<fullName>Foo</fullName>"])
+    md.update_metadata("CustomObject", &["<fullName>MyCustomObject1__c</fullName>"])
         .await
         .unwrap();
 }
@@ -816,8 +850,8 @@ async fn upsert_metadata_with_all_or_none_sends_the_header() {
 
     let md = client_against(&server);
     md.upsert_metadata_with(
-        "ApexClass",
-        &["<fullName>Foo</fullName>"],
+        "CustomObject",
+        &["<fullName>MyCustomObject1__c</fullName>"],
         CrudOptions { all_or_none: true },
     )
     .await
@@ -830,7 +864,7 @@ async fn upsert_metadata_sends_no_all_or_none_header() {
     mount_all_or_none_expectation(&server, "upsertMetadata", false).await;
 
     let md = client_against(&server);
-    md.upsert_metadata("ApexClass", &["<fullName>Foo</fullName>"])
+    md.upsert_metadata("CustomObject", &["<fullName>MyCustomObject1__c</fullName>"])
         .await
         .unwrap();
 }
@@ -841,9 +875,13 @@ async fn delete_metadata_with_all_or_none_sends_the_header() {
     mount_all_or_none_expectation(&server, "deleteMetadata", true).await;
 
     let md = client_against(&server);
-    md.delete_metadata_with("ApexClass", &["Foo"], CrudOptions { all_or_none: true })
-        .await
-        .unwrap();
+    md.delete_metadata_with(
+        "CustomObject",
+        &["MyCustomObject1__c"],
+        CrudOptions { all_or_none: true },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -852,7 +890,9 @@ async fn delete_metadata_sends_no_all_or_none_header() {
     mount_all_or_none_expectation(&server, "deleteMetadata", false).await;
 
     let md = client_against(&server);
-    md.delete_metadata("ApexClass", &["Foo"]).await.unwrap();
+    md.delete_metadata("CustomObject", &["MyCustomObject1__c"])
+        .await
+        .unwrap();
 }
 
 /// The `_with` forms keep the per-call component cap.
@@ -862,8 +902,127 @@ async fn create_metadata_with_still_enforces_the_component_cap() {
     let md = MetadataClient::builder().auth(auth).build().unwrap();
     let empty: [&str; 0] = [];
     let err = md
-        .create_metadata_with("ApexClass", &empty, CrudOptions { all_or_none: true })
+        .create_metadata_with("CustomObject", &empty, CrudOptions { all_or_none: true })
         .await
         .unwrap_err();
     assert!(matches!(err, MetadataError::InvalidArgument(_)));
+}
+
+// -- Component well-formedness -------------------------------------------
+
+/// A component is spliced into the envelope as written, so one that is
+/// not a well-formed fragment would corrupt the request or, with a
+/// stray `</met:metadata>`, inject sibling components. Each shape here
+/// is refused before any request is made, and the error names the call,
+/// the component and the escaper.
+#[tokio::test]
+async fn write_calls_refuse_a_component_that_is_not_a_well_formed_fragment() {
+    let server = MockServer::start().await;
+    let md = client_against(&server);
+    let malformed = [
+        // A bare ampersand in text.
+        "<fullName>R&D</fullName>",
+        // Closes the wrapper and injects a second component.
+        r#"<fullName>A</fullName></met:metadata><met:metadata xsi:type="met:PermissionSet"><fullName>B</fullName>"#,
+        // An unclosed element.
+        "<fullName>A",
+        // A mismatched end tag.
+        "<fullName>A</label>",
+        // An entity the Metadata API's parser has no definition for.
+        "<label>&nbsp;</label>",
+        // A declaration cannot appear inside an envelope.
+        r#"<?xml version="1.0"?><fullName>A</fullName>"#,
+        // An attribute value with a bare ampersand, an undefined entity
+        // or a `<`.
+        r#"<nameField label="R&D"><type>Text</type></nameField>"#,
+        r#"<nameField label="&nbsp;"><type>Text</type></nameField>"#,
+        r#"<nameField label="a<b"><type>Text</type></nameField>"#,
+        // An unquoted attribute value, and an attribute given twice.
+        "<value xsi:type=xsd:boolean>false</value>",
+        r#"<value xsi:type="xsd:boolean" xsi:type="xsd:string">false</value>"#,
+    ];
+    for component in malformed {
+        let components = ["<fullName>Fine</fullName>", component];
+        let results = [
+            (
+                "create_metadata",
+                md.create_metadata("CustomObject", &components)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "update_metadata",
+                md.update_metadata("CustomObject", &components)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "upsert_metadata",
+                md.upsert_metadata("CustomObject", &components)
+                    .await
+                    .map(drop),
+            ),
+        ];
+        for (label, result) in results {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, MetadataError::InvalidArgument(_)),
+                "{label} {component:?}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(label), "{msg}");
+            assert!(msg.contains("component 1"), "{msg}");
+            assert!(msg.contains("xml_escape"), "{msg}");
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// A well-formed fragment goes out exactly as written: sibling elements,
+/// escaped text, predefined and numeric references, CDATA, a comment, an
+/// empty element and an `xsi:type` attribute all pass.
+#[tokio::test]
+async fn write_calls_splice_a_well_formed_fragment_as_written() {
+    let server = MockServer::start().await;
+    let component = "<fullName>MyCustomObject1__c</fullName>\
+         <label>R&amp;D &#x26; &#38; &quot;</label>\
+         <description><![CDATA[a < b]]></description>\
+         <!-- a comment -->\
+         <enableActivities/>\
+         <nameField label=\"R&amp;D &#38; a > b\"><type>Text</type></nameField>\
+         <values><value xsi:type=\"xsd:boolean\">false</value></values>";
+    Mock::given(method("POST"))
+        .and(body_string_contains(component))
+        .respond_with(save_results_response("createMetadata"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let md = client_against(&server);
+    md.create_metadata("CustomObject", &[component])
+        .await
+        .unwrap();
+}
+
+/// The rejection names the call, the component and the escaper, never
+/// the component's text: the undefined-entity case fires exactly when
+/// unescaped interpolated text is present, and CRUD-capable types carry
+/// secrets (a NamedCredential's password, an AuthProvider's consumer
+/// secret).
+#[tokio::test]
+async fn a_rejected_component_s_text_is_not_echoed_in_the_error() {
+    let server = MockServer::start().await;
+    let md = client_against(&server);
+
+    let err = md
+        .create_metadata(
+            "NamedCredential",
+            &["<password>hunter2&secretPart;trailing</password>"],
+        )
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(!msg.contains("hunter2"), "{msg}");
+    assert!(!msg.contains("secretPart"), "{msg}");
+    assert!(msg.contains("component 0"), "{msg}");
 }

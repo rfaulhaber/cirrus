@@ -51,7 +51,12 @@ pub enum AuthError {
     /// setter or parameter and `reason` says what is wrong with it. No
     /// request was made.
     #[error("invalid {name}: {reason}")]
-    InvalidArgument { name: &'static str, reason: String },
+    InvalidArgument {
+        /// The builder setter or method parameter that holds the value.
+        name: &'static str,
+        /// What is wrong with the value.
+        reason: String,
+    },
 
     /// OAuth token endpoint returned an error response (`error` /
     /// `error_description` shape from RFC 6749 §5.2).
@@ -61,7 +66,12 @@ pub enum AuthError {
     /// description is scrubbed and capped as the type-level note says.
     #[error("OAuth error: {error}{}", parenthesized(.error_description))]
     OAuth {
+        /// The `error` code the endpoint returned, for example
+        /// `invalid_grant`.
         error: String,
+        /// The `error_description` the endpoint returned, scrubbed and
+        /// capped as described on [`AuthError`]. `None` when the endpoint
+        /// sent none.
         error_description: Option<String>,
     },
 
@@ -103,7 +113,9 @@ pub enum AuthError {
         "token response instance_url ({returned}) does not match configured instance_url ({configured})"
     )]
     InstanceUrlMismatch {
+        /// The `instance_url` configured on the builder.
         configured: String,
+        /// The `instance_url` the token response reported.
         returned: String,
     },
 
@@ -116,7 +128,10 @@ pub enum AuthError {
     /// content type and length are recorded at `TRACE` on the
     /// `cirrus_auth::token_endpoint` target.
     #[error("token endpoint returned status {status} with an unrecognized error body")]
-    UnexpectedResponse { status: u16 },
+    UnexpectedResponse {
+        /// HTTP status the token endpoint answered with.
+        status: u16,
+    },
 
     /// The token endpoint's response body was longer than the SDK reads:
     /// a real token response is a few kilobytes of JSON, so an oversized
@@ -137,7 +152,10 @@ pub enum AuthError {
     /// HTTP. Salesforce serves every OAuth endpoint over HTTPS; loopback
     /// hosts are the only exception the SDK accepts.
     #[error("login URL {url} is not https; OAuth credentials must not cross the wire in cleartext")]
-    InsecureLoginUrl { url: String },
+    InsecureLoginUrl {
+        /// The configured login URL that is not `https`.
+        url: String,
+    },
 
     /// Signing the JWT bearer assertion failed (bad key material,
     /// unsupported key type).

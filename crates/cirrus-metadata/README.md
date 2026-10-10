@@ -54,8 +54,9 @@ you need anything beyond `deployRequest`.
   binds `xsi` and `xsd`, so values typed `xsi:type="xsd:boolean"` paste
   straight from a `-meta.xml` file.
 - **Utility** — `list_metadata`, `describe_metadata`, `describe_value_type`.
-- **Typed `package.xml`** — `PackageManifest` builder with round-trippable
-  XML serialization. `MetadataType` carries constants for the common
+- **Typed `package.xml`** — `PackageManifest` builder that renders
+  `package.xml` and the SOAP `unpackaged` form; it has no parser for an
+  existing manifest. `MetadataType` carries constants for the common
   types, converts from borrowed strings (so `describe_metadata`'s
   `xml_name`s feed it directly) and `MetadataType::new` accepts any other
   Salesforce-defined type name. `CUSTOM_LABEL` retrieves labels by name;
@@ -108,13 +109,22 @@ you need anything beyond `deployRequest`.
 ## Design principles
 
 - **No user-facing types.** The 200+ concrete metadata types
-  (`CustomObject`, `ApexClass`, `Flow`, …) are caller-supplied XML or
-  generic via `serde`. Only platform-contract envelopes are typed.
+  (`CustomObject`, `ApexClass`, `Flow`, …) are not modeled: a write takes
+  each component as caller-rendered XML (text escaped with `xml_escape`,
+  and a component that is not a well-formed fragment is refused before
+  the request), and `read_metadata` deserializes into a caller-chosen
+  `T: Deserialize`. Only platform-contract envelopes are typed.
 - **No legacy surface.** Operations Salesforce labels deprecated
   (pre-API-31 `create` / `update` / `delete`) are intentionally not
   exposed.
-- **Doc-driven wire shapes.** Every handler ships with wiremock coverage
-  whose request/response bodies match Salesforce's documented examples.
+- **Doc-driven wire shapes.** Every handler ships with wiremock coverage.
+  What sits inside each fixture's `<result>` is cited to the Metadata API
+  Developer Guide's property tables and Java samples. The guide publishes
+  no SOAP envelope for any call, so the envelope framing and the request
+  element names follow the Metadata WSDL (API 66.0), with two deviations
+  the live suite exercises and the tests pin: `cancelDeploy` sends
+  `asyncProcessId` where the WSDL names the element `String`, and
+  `retrieve` sends `RetrieveRequest` where the WSDL has `retrieveRequest`.
 
 ## Quick start
 
@@ -245,15 +255,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .call_options_client("my-tool/1.0")
         .build()?;
 
-    // Either both classes are created or neither is.
+    // Either both objects are created or neither is. Interpolated text
+    // goes through `cirrus_metadata::xml_escape`; a component that is
+    // not a well-formed fragment is refused before the request.
     let results = md
         .create_metadata_with(
-            "ApexClass",
+            "CustomObject",
             &[
-                "<fullName>One</fullName><apiVersion>66.0</apiVersion><status>Active</status>\
-                 <content>cHVibGljIGNsYXNzIE9uZSB7fQ==</content>",
-                "<fullName>Two</fullName><apiVersion>66.0</apiVersion><status>Active</status>\
-                 <content>cHVibGljIGNsYXNzIFR3byB7fQ==</content>",
+                "<fullName>MyCustomObject1__c</fullName>\
+                 <deploymentStatus>Deployed</deploymentStatus>\
+                 <label>MyCustomObject1 Object</label>\
+                 <nameField><label>Name</label><type>Text</type></nameField>\
+                 <pluralLabel>MyCustomObject1 Objects</pluralLabel>\
+                 <sharingModel>ReadWrite</sharingModel>",
+                "<fullName>MyCustomObject2__c</fullName>\
+                 <deploymentStatus>Deployed</deploymentStatus>\
+                 <label>MyCustomObject2 Object</label>\
+                 <nameField><label>Name</label><type>Text</type></nameField>\
+                 <pluralLabel>MyCustomObject2 Objects</pluralLabel>\
+                 <sharingModel>ReadWrite</sharingModel>",
             ],
             CrudOptions { all_or_none: true },
         )

@@ -4,7 +4,10 @@
 //! rename individual metadata components in a single SOAP round-trip
 //! — no zip files, no async polling. They sit alongside the file-based
 //! [`deploy`] / [`retrieve`] flow and cover the same lifecycle
-//! operations at a finer grain.
+//! operations at a finer grain. Not every type takes them: each type's
+//! reference page lists its supported calls, and `ApexClass` and
+//! `ApexTrigger` document "All Metadata API calls except CRUD-Based
+//! Calls", so Apex goes through [`deploy`] / [`retrieve`] only.
 //!
 //! ## What the SDK does and doesn't model
 //!
@@ -34,6 +37,21 @@
 //! `<value xsi:type="xsd:boolean">false</value>` needs no namespace
 //! declaration of its own.
 //!
+//! ## Escaping and well-formedness
+//!
+//! A component is spliced into the envelope as written, so text that is
+//! interpolated into one (a label, a description, a value) must be
+//! escaped with [`xml_escape`]: a bare `&` or `<`
+//! makes the request ill-formed, and a crafted value could close the
+//! `<metadata>` wrapper and inject sibling components. Each write call
+//! parses every component before any request is made and refuses one
+//! that is not a well-formed fragment (unbalanced or mismatched tags, a
+//! reference that is neither a predefined entity nor a character
+//! reference, an XML declaration or a DOCTYPE) with
+//! [`MetadataError::InvalidArgument`]. A well-formed fragment is sent
+//! unchanged; whether its elements are valid for the type is for
+//! Salesforce to decide, and comes back in the per-component result.
+//!
 //! ## Per-call component cap
 //!
 //! All five "multi" CRUD calls cap at 10 components per call (server
@@ -62,6 +80,8 @@ use crate::error::{MetadataError, MetadataResult};
 use crate::headers::render_all_or_none;
 use crate::result::{DeleteResult, SaveResult, UpsertResult};
 use crate::transport::SoapOperation;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::Event;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -139,6 +159,112 @@ impl CrudCall {
             _ => MAX_CRUD_COMPONENTS_PER_CALL,
         }
     }
+}
+
+/// The pre-flight of a write call: the per-call cap, then every
+/// component's well-formedness, so a bad component fails before any
+/// request is made.
+fn check_components<S: AsRef<str>>(
+    components: &[S],
+    type_name: &str,
+    call: CrudCall,
+) -> MetadataResult<()> {
+    check_component_cap(components.len(), type_name, call)?;
+    for (index, component) in components.iter().enumerate() {
+        check_component_xml(call, index, component.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Refuses a write component that is not a well-formed XML fragment.
+///
+/// Components are spliced into the envelope as written, so a bare `&`
+/// would make the whole request ill-formed and a stray end tag could
+/// close the `<met:metadata>` wrapper and inject sibling components.
+/// Each component is parsed once: its tags must balance, every
+/// reference must resolve to a predefined entity or a character, and
+/// neither an XML declaration nor a DOCTYPE may appear, since both are
+/// illegal inside an envelope. The error names the escaper because an
+/// unescaped `&` or `<` in interpolated text is the usual cause.
+fn check_component_xml(call: CrudCall, index: usize, component: &str) -> MetadataResult<()> {
+    let reject = |detail: &str, at: u64| {
+        MetadataError::InvalidArgument(format!(
+            "{}: component {index} is not a well-formed XML fragment ({detail} at byte {at}); \
+             escape interpolated text with cirrus_metadata::xml_escape",
+            call.label(),
+        ))
+    };
+    let mut reader = quick_xml::Reader::from_str(component);
+    let mut depth: usize = 0;
+    loop {
+        // quick-xml reports where its own error starts; a rejection made
+        // here points at the end of the event that caused it.
+        match reader.read_event() {
+            Ok(Event::Start(tag)) => {
+                if let Err(detail) = attributes_well_formed(&tag) {
+                    return Err(reject(&detail, reader.buffer_position()));
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(tag)) => {
+                if let Err(detail) = attributes_well_formed(&tag) {
+                    return Err(reject(&detail, reader.buffer_position()));
+                }
+            }
+            Ok(Event::End(_)) => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    reject("an end tag with no start tag", reader.buffer_position())
+                })?;
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                let name: &str = &reference;
+                let resolves = match reference.resolve_char_ref() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => resolve_predefined_entity(name).is_some(),
+                    Err(e) => return Err(reject(&e.to_string(), reader.buffer_position())),
+                };
+                // The name is caller text and may be a secret that was
+                // meant to be escaped, so it is not echoed.
+                if !resolves {
+                    return Err(reject(
+                        "an undefined entity reference",
+                        reader.buffer_position(),
+                    ));
+                }
+            }
+            Ok(Event::Decl(_)) => {
+                return Err(reject("an XML declaration", reader.buffer_position()));
+            }
+            Ok(Event::DocType(_)) => return Err(reject("a DOCTYPE", reader.buffer_position())),
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => return Err(reject(&e.to_string(), reader.error_position())),
+        }
+    }
+    if depth != 0 {
+        return Err(reject("an unclosed element", reader.buffer_position()));
+    }
+    Ok(())
+}
+
+/// The attribute-level part of the well-formedness check: every
+/// attribute is quoted, named once and has a value, and every value is
+/// free of `<` and resolves its references like element text does.
+/// quick-xml's reader does not look inside a tag, so these would
+/// otherwise reach Salesforce and come back as a fault. The detail never
+/// quotes the value, which is caller text.
+fn attributes_well_formed(tag: &quick_xml::events::BytesStart<'_>) -> Result<(), String> {
+    for attribute in tag.attributes() {
+        let attribute = attribute.map_err(|e| e.to_string())?;
+        let value: &str = &attribute.value;
+        if value.contains('<') {
+            return Err("an attribute value containing `<`".into());
+        }
+        if quick_xml::escape::unescape(value).is_err() {
+            return Err("an attribute value with a reference that does not resolve".into());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -405,16 +531,31 @@ impl MetadataClient {
     /// as `<value xsi:type="xsd:boolean">false</value>` work as pasted
     /// from a `-meta.xml` file.
     ///
+    /// Text interpolated into a component must be escaped with
+    /// [`xml_escape`]. Every component is parsed
+    /// before the request is sent, and one that is not a well-formed
+    /// XML fragment (a bare `&`, unbalanced or mismatched tags, an
+    /// undefined entity, an XML declaration) is refused with
+    /// [`MetadataError::InvalidArgument`]
+    /// naming the component's index; nothing reaches the wire.
+    ///
     /// ```no_run
     /// # use cirrus_metadata::{MetadataClient, SaveResult, MetadataError};
     /// # async fn example(md: &MetadataClient) -> Result<(), MetadataError> {
-    /// let class = r#"
-    ///     <fullName>MyClass</fullName>
-    ///     <apiVersion>66.0</apiVersion>
-    ///     <status>Active</status>
-    ///     <content>cHVibGljIGNsYXNzIE15Q2xhc3Mge30=</content>
+    /// let object = r#"
+    ///     <fullName>MyCustomObject1__c</fullName>
+    ///     <deploymentStatus>Deployed</deploymentStatus>
+    ///     <description>Created by the Metadata API</description>
+    ///     <enableActivities>true</enableActivities>
+    ///     <label>MyCustomObject1 Object</label>
+    ///     <nameField>
+    ///         <label>MyCustomObject1__c Name</label>
+    ///         <type>Text</type>
+    ///     </nameField>
+    ///     <pluralLabel>MyCustomObject1 Objects</pluralLabel>
+    ///     <sharingModel>ReadWrite</sharingModel>
     /// "#;
-    /// let results: Vec<SaveResult> = md.create_metadata("ApexClass", &[class]).await?;
+    /// let results: Vec<SaveResult> = md.create_metadata("CustomObject", &[object]).await?;
     /// for r in &results {
     ///     assert!(r.success, "create failed: {:?}", r.errors);
     /// }
@@ -444,7 +585,7 @@ impl MetadataClient {
         options: CrudOptions,
     ) -> MetadataResult<Vec<SaveResult>> {
         let type_name = type_name.as_ref();
-        check_component_cap(components.len(), type_name, CrudCall::Create)?;
+        check_components(components, type_name, CrudCall::Create)?;
         let op = CreateMetadataOp {
             type_name,
             components,
@@ -456,9 +597,10 @@ impl MetadataClient {
 
     /// Update one or more existing metadata components.
     ///
-    /// Same input shape as [`Self::create_metadata`] — each
-    /// component's `<fullName>` identifies which existing component
-    /// to update. Returns one [`SaveResult`] per component. Partial
+    /// Same input shape as [`Self::create_metadata`], escaping rule and
+    /// well-formedness check included — each component's `<fullName>`
+    /// identifies which existing component to update. Returns one
+    /// [`SaveResult`] per component. Partial
     /// success is possible; [`Self::update_metadata_with`] with
     /// [`CrudOptions::all_or_none`] rolls the whole call back instead.
     pub async fn update_metadata<S: AsRef<str>, N: AsRef<str>>(
@@ -479,7 +621,7 @@ impl MetadataClient {
         options: CrudOptions,
     ) -> MetadataResult<Vec<SaveResult>> {
         let type_name = type_name.as_ref();
-        check_component_cap(components.len(), type_name, CrudCall::Update)?;
+        check_components(components, type_name, CrudCall::Update)?;
         let op = UpdateMetadataOp {
             type_name,
             components,
@@ -491,7 +633,8 @@ impl MetadataClient {
 
     /// Create or update one or more metadata components.
     ///
-    /// Same input shape as [`Self::create_metadata`]. The returned
+    /// Same input shape as [`Self::create_metadata`], escaping rule and
+    /// well-formedness check included. The returned
     /// [`UpsertResult::created`] flag distinguishes per-component
     /// inserts (`true`) from updates (`false`). Available in
     /// API v31+. Partial success is possible;
@@ -515,7 +658,7 @@ impl MetadataClient {
         options: CrudOptions,
     ) -> MetadataResult<Vec<UpsertResult>> {
         let type_name = type_name.as_ref();
-        check_component_cap(components.len(), type_name, CrudCall::Upsert)?;
+        check_components(components, type_name, CrudCall::Upsert)?;
         let op = UpsertMetadataOp {
             type_name,
             components,
@@ -564,8 +707,8 @@ impl MetadataClient {
     /// The caller supplies a typed `T: Deserialize` shape that maps
     /// over one `<records>` element. Component XML uses the metadata
     /// namespace as default on the wire, so quick-xml's serde
-    /// deserialize sees field names like `fullName`, `apiVersion`,
-    /// `status`, etc.
+    /// deserialize sees field names like `fullName`, `label`,
+    /// `sharingModel`, etc.
     ///
     /// **Every field of `T` must be optional** — `Option<_>` or
     /// `#[serde(default)]`, including `fullName`. A `fullName` that
@@ -582,23 +725,24 @@ impl MetadataClient {
     /// # use serde::Deserialize;
     /// #[derive(Deserialize)]
     /// #[serde(rename_all = "camelCase")]
-    /// struct ApexClassRecord {
+    /// struct CustomObjectRecord {
     ///     #[serde(default)]
     ///     full_name: Option<String>,
     ///     #[serde(default)]
-    ///     api_version: Option<String>,
+    ///     label: Option<String>,
     ///     #[serde(default)]
-    ///     status: Option<String>,
-    ///     #[serde(default)]
-    ///     content: Option<String>,
+    ///     sharing_model: Option<String>,
     /// }
     ///
     /// # async fn example(md: &MetadataClient) -> Result<(), MetadataError> {
-    /// let classes: Vec<ApexClassRecord> = md
-    ///     .read_metadata::<ApexClassRecord, _, _>("ApexClass", &["Foo", "Bar"])
+    /// let objects: Vec<CustomObjectRecord> = md
+    ///     .read_metadata::<CustomObjectRecord, _, _>(
+    ///         "CustomObject",
+    ///         &["MyCustomObject1__c", "MyCustomObject2__c"],
+    ///     )
     ///     .await?;
-    /// for class in &classes {
-    ///     let Some(name) = &class.full_name else {
+    /// for object in &objects {
+    ///     let Some(name) = &object.full_name else {
     ///         continue; // placeholder for a name the org doesn't have
     ///     };
     ///     println!("{name}");

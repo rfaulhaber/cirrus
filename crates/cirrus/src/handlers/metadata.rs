@@ -378,6 +378,8 @@ pub struct DeployResult {
     #[serde(default)]
     pub success: Option<bool>,
 
+    /// Current state of the deployment. `None` when the response omits
+    /// it.
     #[serde(default)]
     pub status: Option<DeployStatus>,
 
@@ -404,21 +406,36 @@ pub struct DeployResult {
     #[serde(default, alias = "isRunTestsEnabled")]
     pub run_tests_enabled: Option<bool>,
 
+    /// Number of components deployed so far. Together with
+    /// [`number_components_total`](Self::number_components_total) it
+    /// estimates the deployment's progress.
     #[serde(default)]
     pub number_components_deployed: i32,
 
+    /// Total number of components in the deployment. Together with
+    /// [`number_components_deployed`](Self::number_components_deployed)
+    /// it estimates the deployment's progress.
     #[serde(default)]
     pub number_components_total: i32,
 
+    /// Number of components that generated errors during this
+    /// deployment.
     #[serde(default)]
     pub number_component_errors: i32,
 
+    /// Number of Apex tests completed so far. Together with
+    /// [`number_tests_total`](Self::number_tests_total) it estimates
+    /// the deployment's test progress.
     #[serde(default)]
     pub number_tests_completed: i32,
 
+    /// Total number of Apex tests for this deployment. Not accurate
+    /// until the deployment has started running tests.
     #[serde(default)]
     pub number_tests_total: i32,
 
+    /// Number of Apex tests that generated errors during this
+    /// deployment.
     #[serde(default)]
     pub number_test_errors: i32,
 
@@ -427,33 +444,50 @@ pub struct DeployResult {
     #[serde(default)]
     pub state_detail: Option<String>,
 
+    /// Status code of the error, if one occurred during the deploy
+    /// request. [`error_message`](Self::error_message) carries the
+    /// matching message.
     #[serde(default)]
     pub error_status_code: Option<String>,
 
+    /// Message corresponding to
+    /// [`error_status_code`](Self::error_status_code), if any.
     #[serde(default)]
     pub error_message: Option<String>,
 
+    /// ID of the user who created the deployment.
     #[serde(default)]
     pub created_by: Option<String>,
 
+    /// Full name of the user who created the deployment.
     #[serde(default)]
     pub created_by_name: Option<String>,
 
+    /// When the deploy request was received, as the ISO 8601 `DateTime`
+    /// string Salesforce sends.
     #[serde(default)]
     pub created_date: Option<String>,
 
+    /// When the deployment process began, as an ISO 8601 `DateTime`
+    /// string.
     #[serde(default)]
     pub start_date: Option<String>,
 
+    /// When the deployment process was last updated, as an ISO 8601
+    /// `DateTime` string.
     #[serde(default)]
     pub last_modified_date: Option<String>,
 
+    /// When the deployment process ended, as an ISO 8601 `DateTime`
+    /// string.
     #[serde(default)]
     pub completed_date: Option<String>,
 
+    /// ID of the user who canceled the deployment.
     #[serde(default)]
     pub canceled_by: Option<String>,
 
+    /// Full name of the user who canceled the deployment.
     #[serde(default)]
     pub canceled_by_name: Option<String>,
 
@@ -512,9 +546,14 @@ impl DeployResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployDetails {
+    /// Deployment errors, one entry per failed component. Filled in
+    /// while the deployment is still running; the other members fill in
+    /// once it finishes.
     #[serde(default)]
     pub component_failures: Vec<DeployMessage>,
 
+    /// Successful deployment details, one entry per component.
+    /// Populated after the deployment finishes.
     #[serde(default)]
     pub component_successes: Vec<DeployMessage>,
 
@@ -525,6 +564,8 @@ pub struct DeployDetails {
     #[serde(default)]
     pub retrieve_result: Option<serde_json::Value>,
 
+    /// Apex test results, present when tests were run for the
+    /// deployment.
     #[serde(default, alias = "runTestResult")]
     pub run_test_results: Option<RunTestsResult>,
 }
@@ -546,6 +587,7 @@ pub type DeployResultInnerDetails = DeployDetails;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployMessage {
+    /// ID of the component this entry reports on.
     #[serde(default)]
     pub id: Option<String>,
 
@@ -561,18 +603,27 @@ pub struct DeployMessage {
     #[serde(default)]
     pub file_name: Option<String>,
 
+    /// Whether the component was deployed successfully.
     #[serde(default)]
     pub success: bool,
 
+    /// Whether the deployment changed the component (`true`). `false`
+    /// means the deployed component matched the one already in the org.
     #[serde(default)]
     pub changed: bool,
 
+    /// Whether the deployment created the component (`true`). `false`
+    /// means it was deleted or modified.
     #[serde(default)]
     pub created: bool,
 
+    /// Whether the deployment deleted the component (`true`). `false`
+    /// means it was new or modified.
     #[serde(default)]
     pub deleted: bool,
 
+    /// When the deployment created the component, as an ISO 8601
+    /// `DateTime` string.
     #[serde(default)]
     pub created_date: Option<String>,
 
@@ -586,9 +637,13 @@ pub struct DeployMessage {
     #[serde(default)]
     pub problem_type: Option<String>,
 
+    /// Line of the component's text file where the error occurred, if
+    /// one did.
     #[serde(default)]
     pub line_number: Option<i32>,
 
+    /// Column of the component's text file where the error occurred, if
+    /// one did.
     #[serde(default)]
     pub column_number: Option<i32>,
 }
@@ -619,6 +674,7 @@ pub struct RunTestsResult {
     #[serde(default, alias = "numTestsRun")]
     pub num_run: i32,
 
+    /// Number of unit tests that failed.
     #[serde(default)]
     pub num_failures: i32,
 
@@ -631,9 +687,11 @@ pub struct RunTestsResult {
     #[serde(default)]
     pub apex_log_id: Option<String>,
 
+    /// One entry per test that passed (`RunTestSuccess[]`).
     #[serde(default)]
     pub successes: Vec<serde_json::Value>,
 
+    /// One entry per test that failed (`RunTestFailure[]`).
     #[serde(default)]
     pub failures: Vec<serde_json::Value>,
 
@@ -681,14 +739,27 @@ pub type RunTestResults = RunTestsResult;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DeployStatus {
+    /// The deployment is queued and has not started.
     Pending,
+    /// The deployment has started and is in progress.
     InProgress,
+    /// The deployment has started and is in the finalizing state. A
+    /// deployment in this state can't be canceled.
     FinalizingDeploy,
+    /// The deployment failed during the finalizing state.
     FinalizingDeployFailed,
+    /// The deployment succeeded.
     Succeeded,
+    /// The deployment succeeded, but some components might not have
+    /// been deployed successfully. Check [`DeployResult::details`] for
+    /// more.
     SucceededPartial,
+    /// The deployment failed.
     Failed,
+    /// The deployment is being canceled. Poll again until the status is
+    /// `Canceled`.
     Canceling,
+    /// The deployment was canceled.
     Canceled,
     /// A status literal this SDK version doesn't know. Salesforce has
     /// extended the set before (`FinalizingDeploy` arrived in API

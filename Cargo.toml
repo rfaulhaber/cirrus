@@ -98,3 +98,6 @@ unimplemented = "deny"
 dbg_macro = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
+
+[workspace.lints.rust]
+missing_docs = "warn"

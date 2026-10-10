@@ -95,6 +95,18 @@ pub trait SoapOperation {
     /// `<{NAME}Response>...</{NAME}Response>` element.
     type Response: DeserializeOwned;
 
+    /// Checks the operation's arguments before anything else happens:
+    /// the transport calls this first, ahead of asking the
+    /// [`AuthSession`](cirrus_auth::AuthSession) for a token, so an
+    /// argument Salesforce would fault on is refused without a token
+    /// fetch (with a cold cache that is a token-endpoint round trip, and
+    /// for a rotating refresh token a grant spent for nothing). Defaults
+    /// to `Ok(())`. An operation that overrides it should also call it
+    /// from its renderer, so rendering alone refuses the same arguments.
+    fn validate(&self) -> MetadataResult<()> {
+        Ok(())
+    }
+
     /// Render the operation-specific body XML — everything between
     /// `<met:NAME>` and `</met:NAME>`. May be empty for operations that
     /// take no arguments.
@@ -102,6 +114,33 @@ pub trait SoapOperation {
     /// The renderer is responsible for any inner XML namespaces; the
     /// outer `met:` prefix is added by the transport.
     fn render_body(&self) -> MetadataResult<String>;
+
+    /// Append the operation body to `out`, the envelope buffer the
+    /// transport is filling. Defaults to [`render_body`](Self::render_body)
+    /// followed by a copy into `out`, which is fine for the small bodies
+    /// most operations render. An operation with a large body (a
+    /// deploy's base64 zip) overrides this to encode straight into `out`
+    /// and reports the size through [`body_size_hint`](Self::body_size_hint),
+    /// so the body is never held in a second string on its way into the
+    /// envelope. Called once per envelope the transport builds: once per
+    /// call, and once more for the retry after an `INVALID_SESSION_ID`
+    /// fault; the HTTP retry loop resends the same envelope. It runs
+    /// after the access token has been obtained, which is why argument
+    /// checks belong in [`validate`](Self::validate).
+    fn render_body_into(&self, out: &mut String) -> MetadataResult<()> {
+        out.push_str(&self.render_body()?);
+        Ok(())
+    }
+
+    /// The number of bytes [`render_body_into`](Self::render_body_into)
+    /// will append, or an upper estimate, used to size the envelope
+    /// buffer once before the body is written. The default `0` lets the
+    /// buffer grow as the body arrives. An estimate that is too low
+    /// costs one reallocation that copies the body; one that is too
+    /// high wastes the difference.
+    fn body_size_hint(&self) -> usize {
+        0
+    }
 
     /// Render extra elements for `<soapenv:Header>`, such as
     /// `<met:AllOrNoneHeader>`. Defaults to none.
@@ -200,18 +239,12 @@ async fn dispatch<O: SoapOperation>(
     client: &MetadataClient,
     op: &O,
 ) -> MetadataResult<(O::Response, OutputHeaders)> {
+    // Argument checks and header rendering come before the token fetch,
+    // so a refused call costs the caller nothing.
+    op.validate()?;
     let response_local = format!("{}Response", O::NAME);
-    let body_xml = op.render_body()?;
     let headers_xml = render_request_headers(client, op)?;
-    let response = call_with_auth_retry(
-        client,
-        O::NAME,
-        op.idempotent(),
-        &headers_xml,
-        &body_xml,
-        &response_local,
-    )
-    .await?;
+    let response = call_with_auth_retry(client, op, &headers_xml, &response_local).await?;
     // `from_str` borrows text nodes straight out of the envelope text;
     // the `from_reader` path would copy every event — including the
     // multi-megabyte base64 `<zipFile>` — through an internal buffer
@@ -237,16 +270,19 @@ async fn dispatch<O: SoapOperation>(
 }
 
 /// Outer loop: handles INVALID_SESSION_ID auto-refresh (at most once).
-/// Each iteration mints a fresh token from [`AuthSession`] and runs the
-/// inner HTTP retry loop.
-async fn call_with_auth_retry(
+/// Each iteration mints a fresh token from [`AuthSession`], renders the
+/// body straight into a new envelope and runs the inner HTTP retry loop.
+/// Rendering per iteration is what keeps a deploy's base64 zip down to
+/// the one copy inside the envelope: an `INVALID_SESSION_ID` retry
+/// re-encodes it, which is rare, while the HTTP retries clone the
+/// Arc-backed bytes.
+async fn call_with_auth_retry<O: SoapOperation>(
     client: &MetadataClient,
-    op_name: &str,
-    idempotent: bool,
+    op: &O,
     headers_xml: &str,
-    body_xml: &str,
     response_local: &str,
 ) -> MetadataResult<SoapResponse> {
+    let idempotent = op.idempotent();
     // First iteration fetches a token from the auth session. On a
     // refresh-after-INVALID_SESSION_ID we thread the *already-fetched*
     // fresh token in here, instead of calling access_token() a second
@@ -263,7 +299,13 @@ async fn call_with_auth_retry(
             }
         };
 
-        let envelope = envelope::build_envelope(&token_str, op_name, headers_xml, body_xml);
+        let envelope = envelope::build_envelope(
+            &token_str,
+            O::NAME,
+            headers_xml,
+            op.body_size_hint(),
+            |out| op.render_body_into(out),
+        )?;
         // Bytes is Arc-backed — clones on retry are cheap.
         let body = Bytes::from(envelope.into_bytes());
         // An intermediary's error page may echo the envelope, token

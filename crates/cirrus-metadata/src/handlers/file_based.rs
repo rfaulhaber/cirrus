@@ -32,6 +32,7 @@ use crate::{MetadataClient, PackageManifest};
 use base64::Engine;
 use bytes::Bytes;
 use serde::Deserialize;
+use std::future::Future;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -49,15 +50,24 @@ struct DeployResponseWire {
     result: AsyncResult,
 }
 
+impl DeployOp {
+    /// The rendered `<met:DeployOptions>` children.
+    fn rendered_options(&self) -> String {
+        let mut opts = String::new();
+        render_deploy_options(&self.options, &mut opts);
+        opts
+    }
+}
+
 impl SoapOperation for DeployOp {
     const NAME: &'static str = "deploy";
     type Response = DeployResponseWire;
 
-    fn render_body(&self) -> MetadataResult<String> {
-        // Salesforce accepts runTests only under RunSpecifiedTests and
-        // faults on any other pairing. Checking here, before the zip is
-        // encoded, spares a documented-maximum upload that could only
-        // come back INVALID_OPERATION.
+    /// Salesforce accepts runTests only under RunSpecifiedTests and
+    /// faults on any other pairing. Refusing it here, before a token is
+    /// fetched or the zip encoded, spares a documented-maximum upload
+    /// that could only come back INVALID_OPERATION.
+    fn validate(&self) -> MetadataResult<()> {
         if !self.options.run_tests.is_empty()
             && self.options.test_level != Some(TestLevel::RunSpecifiedTests)
         {
@@ -66,26 +76,36 @@ impl SoapOperation for DeployOp {
                     .into(),
             ));
         }
-        // The options are rendered first so their exact length is known
-        // before the buffer is sized. Everything after the encoded zip
-        // has to fit in the initial allocation: a reallocation here
-        // would copy a buffer already holding the base64 form of a
-        // documented-maximum 39 MB zip.
-        let mut opts = String::new();
-        render_deploy_options(&self.options, &mut opts);
+        Ok(())
+    }
 
-        // Base64 expands to four characters per three input bytes,
-        // rounded up to a whole quantum. Sizing the buffer for that up
-        // front and encoding straight into it keeps the zip from being
-        // materialized a second time as a standalone encoded string.
-        let encoded_len = self.zip.len().div_ceil(3) * 4;
-        let mut out = String::with_capacity(encoded_len + opts.len() + 128);
-        out.push_str("<met:ZipFile>");
-        base64::engine::general_purpose::STANDARD.encode_string(&self.zip, &mut out);
-        out.push_str("</met:ZipFile><met:DeployOptions>");
-        out.push_str(&opts);
-        out.push_str("</met:DeployOptions>");
+    fn render_body(&self) -> MetadataResult<String> {
+        let mut out = String::with_capacity(self.body_size_hint());
+        self.render_body_into(&mut out)?;
         Ok(out)
+    }
+
+    /// The base64 zip is encoded straight into the envelope buffer, so
+    /// the only copy of it while the request is in flight is the
+    /// envelope's; the buffer was sized from [`Self::body_size_hint`]
+    /// and nothing appended after the zip reallocates it.
+    fn render_body_into(&self, out: &mut String) -> MetadataResult<()> {
+        self.validate()?;
+        out.push_str("<met:ZipFile>");
+        base64::engine::general_purpose::STANDARD.encode_string(&self.zip, out);
+        out.push_str("</met:ZipFile><met:DeployOptions>");
+        out.push_str(&self.rendered_options());
+        out.push_str("</met:DeployOptions>");
+        Ok(())
+    }
+
+    /// Base64 expands to four characters per three input bytes, rounded
+    /// up to a whole quantum, plus the options and the fixed tags. The
+    /// options are rendered here so the hint is exact: a buffer that
+    /// came up short would reallocate while holding the encoded form of
+    /// a documented-maximum zip.
+    fn body_size_hint(&self) -> usize {
+        self.zip.len().div_ceil(3) * 4 + self.rendered_options().len() + 128
     }
 
     fn render_headers(&self) -> MetadataResult<String> {
@@ -203,7 +223,9 @@ impl SoapOperation for RetrieveOp {
     const NAME: &'static str = "retrieve";
     type Response = RetrieveResponseWire;
 
-    fn render_body(&self) -> MetadataResult<String> {
+    /// The argument checks the server would otherwise answer with an
+    /// opaque fault, run before a token is fetched.
+    fn validate(&self) -> MetadataResult<()> {
         // RetrieveRequest derives Default, which produces an empty
         // apiVersion. The server rejects that with an opaque fault; fail
         // fast with a useful message instead.
@@ -229,6 +251,11 @@ impl SoapOperation for RetrieveOp {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn render_body(&self) -> MetadataResult<String> {
+        self.validate()?;
         let mut out = String::with_capacity(256);
         out.push_str("<met:RetrieveRequest>");
         out.push_str("<met:apiVersion>");
@@ -350,11 +377,23 @@ fn render_unpackaged(pkg: &PackageManifest, out: &mut String) {
 /// [`MetadataClient::wait_for_retrieve_with`].
 ///
 /// Polling uses exponential backoff starting at `initial_delay`,
-/// doubling each round, capped at `max_delay`. Calls don't have a
-/// per-request timeout — the dispatcher's own [`RetryPolicy`] handles
-/// transient failures.
+/// doubling each round, capped at `max_delay`. Each status call runs
+/// under the HTTP client's connect and read timeouts (the builder's
+/// defaults, or whatever a client supplied through
+/// [`MetadataClientBuilder::http_client`] carries) and under the
+/// dispatcher's [`RetryPolicy`], which replays a poll that failed to
+/// connect or failed transiently, and a poll that hit the read timeout
+/// only when [`RetryPolicy::retry_read_timeouts`] is set. With
+/// `total_timeout` set, a poll still in flight at the deadline is cut
+/// off as well, so the budget bounds the status polls' wall-clock time
+/// whatever those timeouts and retries would allow; a budget shorter
+/// than one round trip ends in [`MetadataError::PollTimeout`] even for
+/// a job that has already finished.
 ///
+/// [`RetryPolicy::retry_read_timeouts`]: crate::RetryPolicy::retry_read_timeouts
+/// [`MetadataError::PollTimeout`]: crate::MetadataError::PollTimeout
 /// [`RetryPolicy`]: crate::RetryPolicy
+/// [`MetadataClientBuilder::http_client`]: crate::MetadataClientBuilder::http_client
 #[derive(Debug, Clone)]
 pub struct WaitConfig {
     /// Delay between the first and second poll; the first poll is
@@ -363,12 +402,18 @@ pub struct WaitConfig {
     pub initial_delay: Duration,
     /// Cap on the backoff delay. Default 30 s.
     pub max_delay: Duration,
-    /// Total wall-clock budget. `None` = wait indefinitely. Default
-    /// `None` — deploys can legitimately run for hours.
+    /// Total wall-clock budget for the status polls. `None` = wait
+    /// indefinitely. Default `None` — deploys can legitimately run for
+    /// hours.
     ///
-    /// Backoff sleeps are clamped to what's left of the budget, so the
-    /// timeout fires within one in-flight status call of it rather
-    /// than a whole backoff round past it.
+    /// Backoff sleeps are clamped to what's left of the budget and a
+    /// poll still in flight at the deadline is cut off, so
+    /// [`MetadataError::PollTimeout`] fires at the budget rather than a
+    /// backoff round or a stalled response past it. The one fetch made
+    /// after the job reaches a terminal state (a deploy's details, a
+    /// retrieve's zip) is outside the budget: the outcome is already in
+    /// hand, and the zip fetch cannot be interrupted without losing the
+    /// zip.
     pub total_timeout: Option<Duration>,
 }
 
@@ -390,6 +435,34 @@ impl WaitConfig {
         self.total_timeout = Some(timeout);
         self
     }
+}
+
+/// The error a wait returns when its budget runs out.
+fn poll_timeout(kind: &str, id: &str, timeout: Duration) -> MetadataError {
+    MetadataError::PollTimeout(format!("{kind} {id} still in progress after {timeout:?}"))
+}
+
+/// Runs one status poll under what is left of the wait's budget, which
+/// began at `start`. A poll whose response never arrives is cut off at
+/// the deadline, so the budget bounds the wait's wall-clock time even
+/// though the HTTP client's read timeout and the retry policy would
+/// let the poll run for minutes. Every poll is a replayable status
+/// read, so cutting one off loses nothing.
+async fn poll_within_budget<T>(
+    kind: &str,
+    id: &str,
+    start: tokio::time::Instant,
+    timeout: Option<Duration>,
+    poll: impl Future<Output = MetadataResult<T>>,
+) -> MetadataResult<T> {
+    // A budget too large to express as a deadline (`Duration::MAX`) is
+    // no budget at all, not a panic.
+    let Some(deadline) = timeout.and_then(|timeout| start.checked_add(timeout)) else {
+        return poll.await;
+    };
+    tokio::time::timeout_at(deadline, poll)
+        .await
+        .unwrap_or_else(|_| Err(poll_timeout(kind, id, timeout.unwrap_or(Duration::MAX))))
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +755,14 @@ impl MetadataClient {
             // processed component and can balloon into megabytes for
             // large deploys. We fetch the full DeployDetails once after
             // the deploy reaches a terminal state.
-            let (result, info) = self.deploy_status(deploy_id, false, with_debugging).await?;
+            let (result, info) = poll_within_budget(
+                "deploy",
+                deploy_id,
+                start,
+                config.total_timeout,
+                self.deploy_status(deploy_id, false, with_debugging),
+            )
+            .await?;
             if result.done {
                 // The terminal result is already in hand; the details
                 // fetch only enriches it. If the follow-up fails (after
@@ -709,11 +789,14 @@ impl MetadataClient {
                 // the budget before it could fire.
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
-                    return Err(MetadataError::PollTimeout(format!(
-                        "deploy {deploy_id} still in progress after {timeout:?}"
-                    )));
+                    return Err(poll_timeout("deploy", deploy_id, timeout));
                 }
                 tokio::time::sleep(delay.min(remaining)).await;
+                // A sleep clamped to the deadline leaves no budget for the
+                // next poll, which could only be cut off at once.
+                if start.elapsed() >= timeout {
+                    return Err(poll_timeout("deploy", deploy_id, timeout));
+                }
             } else {
                 tokio::time::sleep(delay).await;
             }
@@ -764,7 +847,7 @@ impl MetadataClient {
     /// server may already have served and deleted it, a later call
     /// comes back without one, and the retrieve has to be started over.
     /// Bound the wait with [`WaitConfig::total_timeout`] instead, which
-    /// is checked only between polls and so never interrupts the
+    /// bounds the status polls only and so never interrupts the
     /// fetch. Alternatively poll with [`Self::wait_for_retrieve_done`]
     /// under any cancellation mechanism and make the one-shot
     /// [`Self::check_retrieve_status`] call yourself once it reports
@@ -833,7 +916,14 @@ impl MetadataClient {
         loop {
             // Each tick is a status read without the zip, so it stays
             // replayable and the future stays safe to drop.
-            let result = self.check_retrieve_status(retrieve_id, false).await?;
+            let result = poll_within_budget(
+                "retrieve",
+                retrieve_id,
+                start,
+                config.total_timeout,
+                self.check_retrieve_status(retrieve_id, false),
+            )
+            .await?;
             if result.done {
                 return Ok(result);
             }
@@ -844,11 +934,12 @@ impl MetadataClient {
                 // the budget before it could fire.
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
-                    return Err(MetadataError::PollTimeout(format!(
-                        "retrieve {retrieve_id} still in progress after {timeout:?}"
-                    )));
+                    return Err(poll_timeout("retrieve", retrieve_id, timeout));
                 }
                 tokio::time::sleep(delay.min(remaining)).await;
+                if start.elapsed() >= timeout {
+                    return Err(poll_timeout("retrieve", retrieve_id, timeout));
+                }
             } else {
                 tokio::time::sleep(delay).await;
             }
@@ -881,6 +972,25 @@ mod tests {
         assert!(body.contains("</met:DeployOptions>"));
         // Base64 of "PK\x03\x04hello"
         assert!(body.contains("UEsDBGhlbGxv"));
+    }
+
+    /// `render_body_into` appends to the buffer it is given and
+    /// `body_size_hint` covers what it appends, so an envelope buffer
+    /// sized from the hint takes the body without reallocating.
+    #[test]
+    fn deploy_op_size_hint_covers_the_rendered_body() {
+        let op = deploy_op(
+            b"PK\x03\x04hello world, hello world",
+            DeployOptions::default(),
+        );
+        let mut out = String::from("<prefix>");
+        out.reserve(op.body_size_hint());
+        let capacity = out.capacity();
+        op.render_body_into(&mut out).unwrap();
+        assert_eq!(out.capacity(), capacity, "the hint must cover the body");
+        assert!(out.starts_with("<prefix><met:ZipFile>"));
+        assert_eq!(&out["<prefix>".len()..], op.render_body().unwrap());
+        assert!(out.len() - "<prefix>".len() <= op.body_size_hint());
     }
 
     #[test]

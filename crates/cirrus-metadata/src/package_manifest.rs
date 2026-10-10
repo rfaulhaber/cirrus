@@ -140,16 +140,34 @@ impl From<&MetadataType> for MetadataType {
 // convention.
 impl MetadataType {
     // -- Apex --
+    /// An Apex class, a template or blueprint from which Apex objects
+    /// are created.
     pub const APEX_CLASS: MetadataType = MetadataType(Cow::Borrowed("ApexClass"));
+    /// A Visualforce component.
     pub const APEX_COMPONENT: MetadataType = MetadataType(Cow::Borrowed("ApexComponent"));
+    /// A Visualforce page.
     pub const APEX_PAGE: MetadataType = MetadataType(Cow::Borrowed("ApexPage"));
+    /// An Apex trigger, Apex code that runs before or after specific
+    /// DML events such as an insert or a delete.
     pub const APEX_TRIGGER: MetadataType = MetadataType(Cow::Borrowed("ApexTrigger"));
+    /// A suite of Apex test classes to include in a test run.
     pub const APEX_TEST_SUITE: MetadataType = MetadataType(Cow::Borrowed("ApexTestSuite"));
 
     // -- Customization --
+    /// A custom object that stores data unique to the org, or an
+    /// external object that maps to data stored outside it. Also
+    /// carries customizations of standard objects such as accounts.
     pub const CUSTOM_OBJECT: MetadataType = MetadataType(Cow::Borrowed("CustomObject"));
+    /// A field definition: custom fields on standard, custom and
+    /// external objects, and the customizable standard fields of
+    /// standard objects.
     pub const CUSTOM_FIELD: MetadataType = MetadataType(Cow::Borrowed("CustomField"));
+    /// A custom tab, which displays custom object data or other web
+    /// content in Salesforce.
     pub const CUSTOM_TAB: MetadataType = MetadataType(Cow::Borrowed("CustomTab"));
+    /// A custom or standard application: a list of tab references with
+    /// a description and a logo. API version 29.0 and earlier represent
+    /// custom applications only.
     pub const CUSTOM_APPLICATION: MetadataType = MetadataType(Cow::Borrowed("CustomApplication"));
     /// The container of every custom label in the org. Salesforce only
     /// retrieves it whole: use it with [`PackageManifest::all`], since
@@ -162,55 +180,130 @@ impl MetadataType {
     /// CRUD-based calls; [`CUSTOM_LABELS`](Self::CUSTOM_LABELS) is the
     /// wildcard-only container.
     pub const CUSTOM_LABEL: MetadataType = MetadataType(Cow::Borrowed("CustomLabel"));
+    /// A record of a custom metadata type.
     pub const CUSTOM_METADATA: MetadataType = MetadataType(Cow::Borrowed("CustomMetadata"));
+    /// The translations of a custom object for a variety of languages.
+    /// Translating component labels is part of the Translation
+    /// Workbench.
     pub const CUSTOM_OBJECT_TRANSLATION: MetadataType =
         MetadataType(Cow::Borrowed("CustomObjectTranslation"));
+    /// The translations for the supported languages. Translating
+    /// component labels is part of the Translation Workbench.
     pub const TRANSLATIONS: MetadataType = MetadataType(Cow::Borrowed("Translations"));
+    /// The set of values in a standard picklist field.
     pub const STANDARD_VALUE_SET: MetadataType = MetadataType(Cow::Borrowed("StandardValueSet"));
+    /// A global picklist value set: the shared values custom picklist
+    /// fields can use. It is not a field itself.
     pub const GLOBAL_VALUE_SET: MetadataType = MetadataType(Cow::Borrowed("GlobalValueSet"));
+    /// A record type, which offers different business processes,
+    /// picklist values and page layouts to different users. Defined for
+    /// a custom object.
     pub const RECORD_TYPE: MetadataType = MetadataType(Cow::Borrowed("RecordType"));
+    /// A page layout.
     pub const LAYOUT: MetadataType = MetadataType(Cow::Borrowed("Layout"));
+    /// A list view, a filtered list of records. A list view set to
+    /// "Visible only to me" is not accessible through the Metadata API.
     pub const LIST_VIEW: MetadataType = MetadataType(Cow::Borrowed("ListView"));
+    /// A field set, a grouping of fields that Visualforce pages can
+    /// reference dynamically.
     pub const FIELD_SET: MetadataType = MetadataType(Cow::Borrowed("FieldSet"));
+    /// A validation rule, which verifies that the data a user enters in
+    /// a record is valid and can be saved.
     pub const VALIDATION_RULE: MetadataType = MetadataType(Cow::Borrowed("ValidationRule"));
+    /// A custom button or link defined in a custom object.
     pub const WEB_LINK: MetadataType = MetadataType(Cow::Borrowed("WebLink"));
+    /// A create or update quick action for an object, made available in
+    /// the Chatter publisher.
     pub const QUICK_ACTION: MetadataType = MetadataType(Cow::Borrowed("QuickAction"));
 
     // -- Security --
+    /// A user profile, which defines a user's permission to perform
+    /// different functions within Salesforce.
     pub const PROFILE: MetadataType = MetadataType(Cow::Borrowed("Profile"));
+    /// A set of permissions that grants more access to one or more
+    /// users without changing their profile. It grants access but
+    /// cannot deny it.
     pub const PERMISSION_SET: MetadataType = MetadataType(Cow::Borrowed("PermissionSet"));
+    /// A group of permission sets and the permissions within them, for
+    /// organizing permissions by job function or task.
     pub const PERMISSION_SET_GROUP: MetadataType =
         MetadataType(Cow::Borrowed("PermissionSetGroup"));
+    /// A role in the org.
     pub const ROLE: MetadataType = MetadataType(Cow::Borrowed("Role"));
+    /// A set of public groups, which can have users, roles and other
+    /// groups.
     pub const GROUP: MetadataType = MetadataType(Cow::Borrowed("Group"));
+    /// A holding area for items before they are processed.
     pub const QUEUE: MetadataType = MetadataType(Cow::Borrowed("Queue"));
+    /// The base container for sharing rules: criteria-based,
+    /// ownership-based, territory-based or for guest user access.
     pub const SHARING_RULES: MetadataType = MetadataType(Cow::Borrowed("SharingRules"));
 
     // -- Process automation --
+    /// A flow: its structure, logic and run-time behavior.
     pub const FLOW: MetadataType = MetadataType(Cow::Borrowed("Flow"));
+    /// A flow's description and its active version number. From API
+    /// version 44.0 Salesforce recommends activating and deactivating
+    /// flows through [`FLOW`](Self::FLOW) instead.
     pub const FLOW_DEFINITION: MetadataType = MetadataType(Cow::Borrowed("FlowDefinition"));
+    /// Workflow rules, which set workflow actions in motion when their
+    /// conditions are met.
     pub const WORKFLOW: MetadataType = MetadataType(Cow::Borrowed("Workflow"));
+    /// An approval process, which automates how records are approved:
+    /// each step, who to request approval from, and what to do at each
+    /// point.
     pub const APPROVAL_PROCESS: MetadataType = MetadataType(Cow::Borrowed("ApprovalProcess"));
 
     // -- Reporting --
+    /// A custom report. Standard reports are not supported.
     pub const REPORT: MetadataType = MetadataType(Cow::Borrowed("Report"));
+    /// A custom report type, the framework from which users create and
+    /// customize reports.
     pub const REPORT_TYPE: MetadataType = MetadataType(Cow::Borrowed("ReportType"));
+    /// A dashboard, a visual representation of data for seeing key
+    /// metrics at a glance.
     pub const DASHBOARD: MetadataType = MetadataType(Cow::Borrowed("Dashboard"));
+    /// A document. Every document must be in a document folder, as in
+    /// `sampleFolder/TestDocument`.
     pub const DOCUMENT: MetadataType = MetadataType(Cow::Borrowed("Document"));
+    /// A template for an email, mass email, list email or Sales
+    /// Engagement email. Supported in first-generation managed packages
+    /// only.
     pub const EMAIL_TEMPLATE: MetadataType = MetadataType(Cow::Borrowed("EmailTemplate"));
 
     // -- Lightning / static assets --
+    /// A Lightning web component bundle, which contains the component's
+    /// resources.
     pub const LIGHTNING_COMPONENT_BUNDLE: MetadataType =
         MetadataType(Cow::Borrowed("LightningComponentBundle"));
+    /// An Aura definition bundle: one definition (component,
+    /// application, event, interface or tokens collection) and its
+    /// related resources.
     pub const AURA_DEFINITION_BUNDLE: MetadataType =
         MetadataType(Cow::Borrowed("AuraDefinitionBundle"));
+    /// A static resource file, often a code library in a ZIP file, that
+    /// Visualforce pages can reference. Usable only within the org.
     pub const STATIC_RESOURCE: MetadataType = MetadataType(Cow::Borrowed("StaticResource"));
+    /// An asset file, which lets a Salesforce file be used for org
+    /// setup and configuration purposes.
     pub const CONTENT_ASSET: MetadataType = MetadataType(Cow::Borrowed("ContentAsset"));
 
     // -- Integration / connected apps --
+    /// A connected app, through which an external application
+    /// integrates with Salesforce over protocols such as SAML, OAuth
+    /// and OpenID Connect. Salesforce restricts creating new ones as of
+    /// Spring '26 and recommends external client apps instead.
     pub const CONNECTED_APP: MetadataType = MetadataType(Cow::Borrowed("ConnectedApp"));
+    /// A named credential: the URL of a callout endpoint and its
+    /// authentication parameters in one definition.
     pub const NAMED_CREDENTIAL: MetadataType = MetadataType(Cow::Borrowed("NamedCredential"));
+    /// An authentication provider, which lets users log in to
+    /// Salesforce from an external service provider such as Facebook,
+    /// Google or GitHub.
     pub const AUTH_PROVIDER: MetadataType = MetadataType(Cow::Borrowed("AuthProvider"));
+    /// A remote site setting. An external site must be registered as
+    /// one before Visualforce, Apex callouts or JavaScript
+    /// XmlHttpRequest code can call it.
     pub const REMOTE_SITE_SETTING: MetadataType = MetadataType(Cow::Borrowed("RemoteSiteSetting"));
 }
 
@@ -373,11 +466,14 @@ impl PackageManifest {
     /// `StandardValueSet`, `RecordType`, `Report`, `Dashboard`,
     /// `Document` and `EmailTemplate` are among the types that must be
     /// listed by explicit `fullName`. Whether a given type accepts `*`
-    /// is stated in that type's reference topic in the Metadata API
-    /// Developer Guide and summarized in the "Allows Wildcard (*)?"
-    /// column of the Metadata Types list. This builder doesn't
+    /// is stated in the "Wildcard Support in the Manifest File" section
+    /// of that type's reference page in the Metadata API Developer
+    /// Guide; the [Metadata Types] page is the index of those pages and
+    /// carries no wildcard column of its own. This builder doesn't
     /// validate, so a wildcard on a non-supporting type surfaces as a
     /// server-side error at deploy/retrieve time.
+    ///
+    /// [Metadata Types]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_types_list.htm
     pub fn all<T: Into<MetadataType>>(self, type_name: T) -> Self {
         self.add(type_name, [WILDCARD])
     }
