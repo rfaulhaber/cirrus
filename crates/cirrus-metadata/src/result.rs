@@ -946,8 +946,12 @@ pub struct RetrieveResult {
     pub error_status_code: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nil_string")]
     pub error_message: Option<String>,
-    /// Per-file properties for everything in the retrieved zip,
-    /// including the manifest.
+    /// One entry per retrieved component, plus `package.xml`. The
+    /// companion `-meta.xml` files are not listed: the RetrieveResult
+    /// page says the array "doesn't contain information about any
+    /// associated metadata files in the .zip file, only the component
+    /// files and manifest file". Enumerate the decoded zip
+    /// ([`zip_bytes`](Self::zip_bytes)) to get the full file set.
     #[serde(default)]
     pub file_properties: Vec<FileProperties>,
     /// Errors and warnings encountered during the retrieve.

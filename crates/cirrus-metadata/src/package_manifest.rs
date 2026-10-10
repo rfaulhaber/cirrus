@@ -373,11 +373,14 @@ impl PackageManifest {
     /// `StandardValueSet`, `RecordType`, `Report`, `Dashboard`,
     /// `Document` and `EmailTemplate` are among the types that must be
     /// listed by explicit `fullName`. Whether a given type accepts `*`
-    /// is stated in that type's reference topic in the Metadata API
-    /// Developer Guide and summarized in the "Allows Wildcard (*)?"
-    /// column of the Metadata Types list. This builder doesn't
+    /// is stated in the "Wildcard Support in the Manifest File" section
+    /// of that type's reference page in the Metadata API Developer
+    /// Guide; the [Metadata Types] page is the index of those pages and
+    /// carries no wildcard column of its own. This builder doesn't
     /// validate, so a wildcard on a non-supporting type surfaces as a
     /// server-side error at deploy/retrieve time.
+    ///
+    /// [Metadata Types]: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_types_list.htm
     pub fn all<T: Into<MetadataType>>(self, type_name: T) -> Self {
         self.add(type_name, [WILDCARD])
     }
