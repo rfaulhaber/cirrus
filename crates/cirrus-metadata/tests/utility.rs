@@ -52,7 +52,8 @@ fn client_against(server: &MockServer) -> MetadataClient {
 /// per matching component.
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
 /// The FileProperties table (created/lastModified ids and names,
-/// fileName, fullName, id, type) lives on the RetrieveResult page.
+/// fileName, fullName, id, manageableState, type) lives on the
+/// RetrieveResult page.
 #[tokio::test]
 async fn list_metadata_returns_file_properties_for_each_match() {
     let server = MockServer::start().await;

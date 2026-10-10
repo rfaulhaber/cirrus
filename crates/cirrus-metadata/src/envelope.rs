@@ -826,7 +826,8 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
         // XML 1.0 requires `&` and `<` in character data to be escaped,
         // so a fault that is not wrapped in CDATA carries them as
         // references. Each reference reaches the reader as its own
-        // event, and dropping it would turn `'Foo&Bar'` into `FooBar`.
+        // event, so a dropped reference would silently remove `&` and
+        // `'` from the message.
         let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
@@ -851,7 +852,7 @@ Execute Anonymous: a &amp; b</debugLog></DebuggingInfo>
     #[test]
     fn parse_envelope_keeps_source_order_around_fault_references() {
         // Text, references and CDATA arrive as separate events; each
-        // piece must land in the field where the document put it.
+        // piece must appear in the order the document put it.
         let xml = r#"<?xml version="1.0"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
@@ -1234,8 +1235,8 @@ mod property_tests {
     /// of one field arrive as a run of different events.
     fn fault_field_content() -> impl Strategy<Value = (String, String)> {
         let safe_text = "[A-Za-z0-9 ._:-]{0,8}";
-        // Every scalar value XML 1.0 allows below the surrogate range
-        // except the control characters.
+        // XML 1.0 `Char` from U+0020 up to the surrogates (TAB, LF and
+        // CR are left out).
         let referenced_char = proptest::char::range('\u{20}', '\u{D7FF}');
         let predefined = prop_oneof![
             Just(("&amp;", "&")),
