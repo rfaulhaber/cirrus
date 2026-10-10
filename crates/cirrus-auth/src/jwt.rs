@@ -44,7 +44,7 @@ use crate::assertion::{bearer_assertion, private_key_from_pem, private_key_from_
 use crate::error::{AuthError, AuthResult};
 use crate::mint::{CachedToken, MintState};
 use crate::token_endpoint::{
-    GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
+    ClientAuth, GrantReplay, HttpClientConfig, check_instance_url, exchange, normalize_url,
     require_secure_login_url,
 };
 use async_trait::async_trait;
@@ -140,7 +140,14 @@ impl JwtAuth {
             ("assertion", assertion.as_str()),
         ];
 
-        let token = exchange(&self.http, &self.login_url, &body, GrantReplay::Safe).await?;
+        let token = exchange(
+            &self.http,
+            &self.login_url,
+            &body,
+            ClientAuth::Form,
+            GrantReplay::Safe,
+        )
+        .await?;
         check_instance_url(&self.instance_url, &token)?;
 
         Ok(CachedToken::from_response(token, self.token_ttl))

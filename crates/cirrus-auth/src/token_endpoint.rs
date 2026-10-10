@@ -365,26 +365,41 @@ const PUBLIC_FORM_PARAMETERS: [&str; 6] = [
 const REDACTED: &str = "[redacted]";
 
 /// The [`AuthError::OAuth`] for a parsed error body: the description is
-/// scrubbed of the request's own form values and capped before it is
-/// stored, so no later `Display` or `Debug` can leak what the request
+/// scrubbed of the request's own form values and of the credentials a
+/// Basic header carried in place of form values, then capped before it
+/// is stored, so no later `Display` or `Debug` can leak what the request
 /// sent.
-fn oauth_error(response: OAuthErrorResponse, form: &[(&str, &str)]) -> AuthError {
+fn oauth_error(
+    response: OAuthErrorResponse,
+    form: &[(&str, &str)],
+    client_auth: ClientAuth<'_>,
+) -> AuthError {
+    let header_pair = match client_auth {
+        ClientAuth::Form => Vec::new(),
+        ClientAuth::Basic {
+            client_id,
+            client_secret,
+        } => vec![("client_id", client_id), ("client_secret", client_secret)],
+    };
     AuthError::OAuth {
         error: response.error,
-        error_description: response
-            .error_description
-            .map(|description| scrub_description(description, form)),
+        error_description: response.error_description.map(|description| {
+            scrub_description(description, form.iter().copied().chain(header_pair))
+        }),
     }
 }
 
-/// Replaces every non-public form value that appears verbatim in
-/// `description` with [`REDACTED`], then cuts the text to
+/// Replaces every non-public value the request sent that appears
+/// verbatim in `description` with [`REDACTED`], then cuts the text to
 /// [`OAUTH_ERROR_DESCRIPTION_CAP`] characters. Scrubbing runs first so a
 /// value straddling the cut cannot survive it in part.
-fn scrub_description(description: String, form: &[(&str, &str)]) -> String {
+fn scrub_description<'a>(
+    description: String,
+    sent: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
     let mut text = description;
-    for (name, value) in form {
-        if value.is_empty() || PUBLIC_FORM_PARAMETERS.contains(name) {
+    for (name, value) in sent {
+        if value.is_empty() || PUBLIC_FORM_PARAMETERS.contains(&name) {
             continue;
         }
         if text.contains(value) {
@@ -413,6 +428,30 @@ pub(super) enum GrantReplay {
     /// exchange may issue tokens on every call. Only a failure where the
     /// request never left the client retries.
     Never,
+}
+
+/// How the client proves its identity to the token endpoint.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ClientAuth<'a> {
+    /// The form body already carries whatever identifies the client: a
+    /// `client_id` alone for a public client, a `client_assertion`, or
+    /// nothing at all for a bearer assertion the connected app is named
+    /// in.
+    Form,
+    /// HTTP Basic (RFC 6749 §2.3.1): `Authorization: Basic` carrying the
+    /// Base64 of `client_id:client_secret`, with neither parameter in the
+    /// form. Salesforce documents the scheme for the client credentials,
+    /// refresh token and web server flows, and ignores the header when
+    /// the body carries the pair as well, so a flow that uses it leaves
+    /// both out of the form.
+    ///
+    /// The pair is encoded as Salesforce documents it, unescaped; RFC
+    /// 6749 Appendix B form-encodes each half first, which only differs
+    /// for characters a consumer key or secret never contains.
+    Basic {
+        client_id: &'a str,
+        client_secret: &'a str,
+    },
 }
 
 /// Largest token-endpoint response body the SDK buffers. A token response
@@ -456,8 +495,9 @@ fn status_is_retryable(status: u16) -> bool {
 /// and parses the response.
 ///
 /// The caller assembles the form body with the flow-specific fields
-/// (`grant_type`, `assertion`, `refresh_token`, etc.) and says whether the
-/// grant is safe to replay. A connect failure is retried for every grant;
+/// (`grant_type`, `assertion`, `refresh_token`, etc.), says how the client
+/// authenticates (see [`ClientAuth`]) and whether the grant is safe to
+/// replay. A connect failure is retried for every grant;
 /// a 429, a 5xx and an ambiguous transport failure are retried only for a
 /// [`GrantReplay::Safe`] grant, up to [`TOKEN_REQUEST_BACKOFF`]'s budget.
 /// On a terminal non-2xx, the body is parsed as the OAuth error shape if
@@ -472,6 +512,7 @@ pub(super) async fn exchange(
     http: &reqwest::Client,
     login_url: &str,
     body: &[(&str, &str)],
+    client_auth: ClientAuth<'_>,
     replay: GrantReplay,
 ) -> AuthResult<TokenResponse> {
     let url = format!("{login_url}/services/oauth2/token");
@@ -479,7 +520,15 @@ pub(super) async fn exchange(
     let (status, content_type, bytes) = loop {
         // `None` once the budget is spent: the attempt below is the last.
         let backoff = TOKEN_REQUEST_BACKOFF.get(attempt).copied();
-        let response = match (http.post(&url).form(body).send().await, backoff) {
+        let request = http.post(&url).form(body);
+        let request = match client_auth {
+            ClientAuth::Form => request,
+            ClientAuth::Basic {
+                client_id,
+                client_secret,
+            } => request.basic_auth(client_id, Some(client_secret)),
+        };
+        let response = match (request.send().await, backoff) {
             (Ok(response), _) => response,
             (Err(e), Some(delay)) if transport_failure_is_retryable(&e, replay) => {
                 tracing::warn!(
@@ -560,7 +609,7 @@ pub(super) async fn exchange(
 
     if !(200..300).contains(&status) {
         if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
-            return Err(oauth_error(oauth_err, body));
+            return Err(oauth_error(oauth_err, body, client_auth));
         }
         // A body outside the OAuth error shape came from an intermediary
         // (an HTML error page, a proxy), and those tend to echo the form
@@ -647,7 +696,7 @@ pub async fn revoke_token(http: &reqwest::Client, login_url: &str, token: &str) 
         Err(CollectBodyError::Transport(e)) => return Err(e.into()),
     };
     if let Ok(oauth_err) = serde_json::from_slice::<OAuthErrorResponse>(&bytes) {
-        return Err(oauth_error(oauth_err, &form));
+        return Err(oauth_error(oauth_err, &form, ClientAuth::Form));
     }
     // Same rule as `exchange`: a body outside the OAuth error shape is an
     // intermediary's page and may echo the token it was sent.
@@ -760,6 +809,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
@@ -773,6 +823,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
@@ -789,6 +840,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
@@ -809,6 +861,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "refresh_token")],
+            ClientAuth::Form,
             GrantReplay::Never,
         )
         .await
@@ -842,6 +895,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
@@ -878,6 +932,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "refresh_token")],
+            ClientAuth::Form,
             GrantReplay::Never,
         )
         .await
@@ -923,6 +978,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
@@ -940,6 +996,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
@@ -974,12 +1031,133 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
             GrantReplay::Safe,
         )
         .await
         .unwrap_err();
         assert!(matches!(err, AuthError::OAuth { ref error, .. } if error == "invalid_grant"));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn basic_client_auth_puts_the_credentials_in_the_header_and_not_the_body() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_client_credentials_flow.htm&type=5
+        // (release 264): "for added security, put your client credentials
+        // in a Basic authorization header. ... the client_id is appended
+        // to the client_secret in the format client_id:client_secret, and
+        // the resulting value is Base64-encoded. ... If you use this
+        // format, the grant_type is the only required parameter in the
+        // request body." The header value is the page's own example; the
+        // credentials are what it decodes to.
+        use wiremock::matchers::{body_string, header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .and(header(
+                "authorization",
+                "Basic TXlDbGllbnRJRDpNeUNsaWVudFNlY3JldA==",
+            ))
+            .and(body_string("grant_type=client_credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!ACCESS",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            ClientAuth::Basic {
+                client_id: "MyClientID",
+                client_secret: "MyClientSecret",
+            },
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn form_client_auth_sends_no_authorization_header() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5
+        // (release 264): "If the client_id and client_secret are sent in
+        // the POST's body, the authorization header is ignored." A grant
+        // that carries its credentials in the form sends no header the
+        // endpoint would discard.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "00DXX!ACCESS",
+                "instance_url": "https://my-org.my.salesforce.com",
+            })))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        exchange(
+            &http,
+            &server.uri(),
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", "MyClientID"),
+                ("refresh_token", "5Aep861KIwKdekr"),
+            ],
+            ClientAuth::Form,
+            GrantReplay::Never,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get("authorization").is_none(),
+            "{:?}",
+            requests[0].headers
+        );
+    }
+
+    #[tokio::test]
+    async fn a_description_echoing_the_basic_credentials_is_scrubbed() {
+        // The credentials leave the form when they move to the header,
+        // and the form is what the scrub reads, so the header's pair is
+        // scrubbed on its own.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/oauth2/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_client",
+                "error_description": "MyClientID presented MyClientSecret",
+            })))
+            .mount(&server)
+            .await;
+        let http = token_client_builder().build().unwrap();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            &[("grant_type", "client_credentials")],
+            ClientAuth::Basic {
+                client_id: "MyClientID",
+                client_secret: "MyClientSecret",
+            },
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            AuthError::OAuth {
+                error_description: Some(description),
+                ..
+            } => assert_eq!(description, "[redacted] presented [redacted]"),
+            other => panic!("expected an OAuth error with a description, got {other:?}"),
+        }
     }
 
     async fn oauth_error_description(
@@ -995,9 +1173,15 @@ mod tests {
             .mount(&server)
             .await;
         let http = token_client_builder().build().unwrap();
-        let err = exchange(&http, &server.uri(), form, GrantReplay::Safe)
-            .await
-            .unwrap_err();
+        let err = exchange(
+            &http,
+            &server.uri(),
+            form,
+            ClientAuth::Form,
+            GrantReplay::Safe,
+        )
+        .await
+        .unwrap_err();
         match err {
             AuthError::OAuth {
                 error_description: Some(description),
@@ -1239,6 +1423,7 @@ mod tests {
             &http,
             &server.uri(),
             &[("grant_type", "refresh_token")],
+            ClientAuth::Form,
             GrantReplay::Never,
         )
         .await

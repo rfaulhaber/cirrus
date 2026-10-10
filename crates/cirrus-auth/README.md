@@ -107,6 +107,11 @@ uploaded certificate: both requests then carry a freshly signed RS256
 a secret is present, a builder given both fails with
 `AuthError::InvalidArgument`.
 
+When a secret is set, these flows and `ClientCredentialsAuth` send it with
+the consumer key in an `Authorization: Basic` header rather than the form
+body, as Salesforce documents for each of them; a public client sends
+`client_id` in the body and no header.
+
 ## Signing out
 
 `RefreshTokenAuth::revoke` posts the session's live refresh token — under
