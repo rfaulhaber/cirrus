@@ -14,6 +14,10 @@
 use crate::common::try_init_client;
 use cirrus::ApiVersion;
 
+/// URL of the `latest` alias entry the versions list documents. Its
+/// `version` is not guaranteed to be a `major.minor` pair.
+const LATEST_ALIAS_URL: &str = "/services/data/latest";
+
 #[tokio::test]
 #[ignore]
 async fn versions_endpoint_returns_nonempty_list() {
@@ -28,14 +32,16 @@ async fn versions_endpoint_returns_nonempty_list() {
     // Spot-check the wire shape — every entry should have all three
     // documented fields populated.
     for v in &versions {
+        let is_alias = v.url == LATEST_ALIAS_URL;
         assert!(!v.label.is_empty(), "label should be populated");
         assert!(
-            v.url.starts_with("/services/data/v"),
+            is_alias || v.url.starts_with("/services/data/v"),
             "url should be path-rooted, got {}",
             v.url,
         );
         assert!(
-            !v.version.is_empty() && v.version.contains('.'),
+            (is_alias && v.version_number().is_none())
+                || (!v.version.is_empty() && v.version.contains('.')),
             "version should be major.minor, got {}",
             v.version,
         );
@@ -51,11 +57,15 @@ async fn versions_are_sortable_via_version_number() {
         return;
     };
     let versions = sf.versions().await.unwrap();
-    let parsed: Vec<_> = versions.iter().filter_map(|v| v.version_number()).collect();
+    let numeric: Vec<_> = versions
+        .iter()
+        .filter(|v| v.url != LATEST_ALIAS_URL)
+        .collect();
+    let parsed: Vec<_> = numeric.iter().filter_map(|v| v.version_number()).collect();
     assert_eq!(
         parsed.len(),
-        versions.len(),
-        "every version should parse cleanly",
+        numeric.len(),
+        "every numeric version should parse cleanly",
     );
 
     let latest = ApiVersion::latest(&versions).expect("at least one version");
