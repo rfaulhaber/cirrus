@@ -3450,6 +3450,17 @@ mod tests {
             }
         }
 
+        // Every backoff step is 10 s, so a retry that finishes in a
+        // fraction of that did not wait on the schedule.
+        fn slow_backoff_policy() -> RetryPolicy {
+            RetryPolicy {
+                base_delay: Duration::from_secs(10),
+                max_delay: Duration::from_secs(10),
+                jitter: false,
+                ..RetryPolicy::default()
+            }
+        }
+
         fn fixture_with_policy(uri: String, policy: RetryPolicy) -> Cirrus {
             let auth = Arc::new(StaticTokenAuth::new("tok", uri));
             Cirrus::builder()
@@ -4088,10 +4099,8 @@ mod tests {
         #[tokio::test]
         async fn retry_after_header_overrides_backoff() {
             // The Retry-After hint, if present, takes precedence over
-            // the policy's exponential schedule. We don't test the
-            // *duration* directly (jitter would muddy that anyway) —
-            // we just verify the retry happens and the request count
-            // advances.
+            // the policy's exponential schedule, which would sleep the
+            // full 10 s here.
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -4106,9 +4115,48 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let sf = fixture_with_policy(server.uri(), slow_backoff_policy());
+            let started = std::time::Instant::now();
             let v: Value = sf.get("limits").await.unwrap();
             assert_eq!(v["ok"], true);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry waited on the backoff schedule: {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn retry_after_http_date_overrides_backoff() {
+            // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+            // Retry-After may be an HTTP-date in place of delta-seconds;
+            // a date already past means "now".
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "Thu, 01 Jan 2015 00:00:00 GMT"),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), slow_backoff_policy());
+            let started = std::time::Instant::now();
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry waited on the backoff schedule: {:?}",
+                started.elapsed()
+            );
         }
     }
 
