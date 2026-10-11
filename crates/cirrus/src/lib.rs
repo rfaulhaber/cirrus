@@ -3121,6 +3121,45 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_token_echoed_without_a_bearer_space_is_scrubbed_from_an_html_error_page() {
+            // An HTML gateway page renders the header with an entity in
+            // place of the space and repeats the id bare, so only the
+            // exact-token match can reach either copy.
+            let token = "00Dxx0000001gER!AQEAQxxxx";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(502).set_body_raw(
+                    format!("<td>Bearer&nbsp;{token}</td> session={token}"),
+                    "text/html",
+                ))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+
+            assert!(!err.to_string().contains(token), "{err}");
+            match err {
+                CirrusError::Api {
+                    status,
+                    raw: Some(raw),
+                    ..
+                } => {
+                    assert_eq!(status, 502);
+                    assert!(!raw.contains(token), "{raw}");
+                    assert!(raw.contains("[redacted]"), "{raw}");
+                }
+                other => panic!("expected an Api error with a raw body, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
         async fn read_timeout_aborts_a_request_the_org_never_answers() {
             // The deadline is armed at dispatch, so it fires while the
             // response head is still outstanding — not just between two
