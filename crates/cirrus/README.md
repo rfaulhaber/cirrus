@@ -8,12 +8,13 @@ This project is in no way affiliated with Salesforce.
 
 `cirrus` is a strongly-typed, async-first client built on `reqwest` and
 `tokio`. It covers the everyday surface of the Salesforce REST API — CRUD,
-SOQL/SOSL, Bulk 2.0, composite, Tooling, Apex REST, Event Monitoring — plus a
-small set of cross-cutting niceties (retry/backoff, auto-refresh on 401, a
-streaming pagination iterator, conditional-request helpers, structured
-`tracing` events) that you'd otherwise have to assemble by hand.
+SOQL/SOSL, Bulk 2.0, composite, Tooling, Apex REST, Event Monitoring, Metadata
+REST deploys — plus a small set of cross-cutting niceties (retry/backoff,
+auto-refresh on 401, a streaming pagination iterator, conditional-request
+helpers, structured `tracing` events) that you'd otherwise have to assemble by
+hand.
 
-It also exposes an [open-ended escape hatch](#design-the-escape-hatch) so any
+It also exposes an [open-ended escape hatch](#the-escape-hatch) so any
 endpoint not yet typed is a one-liner away.
 
 ## Quick start
@@ -88,6 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   binary `EventLogFile` CSV downloads held whole, and
   `{download_stream, download_url_stream}` for a `ByteStream` of chunks that
   is not bounded by the response-size cap.
+- **Metadata REST deploy** — `metadata().{deploy, check_deploy_status,
+  cancel_deploy, deploy_recent_validation}`, the four `deployRequest`
+  endpoints: a zip deploy as a multipart POST, polled to a `DeployResult`,
+  without the zip-size limit of the SOAP call (the 400 MB uncompressed limit
+  still applies). Retrieve, `listMetadata`, `describeMetadata` and the
+  CRUD-based calls are SOAP-only and live in the sibling
+  [`cirrus-metadata`](../cirrus-metadata/) crate.
 - **Versions, limits, describe** — `sf.versions()`, `sf.limits()`,
   `sf.sobjects().describe_global()`, `sf.sobject(name).describe()`.
 
@@ -127,15 +135,19 @@ boundary between auth and REST without extra plumbing.
   per-operation pages print; keys beyond `message`/`errorCode`/`fields` stay
   on `SalesforceError::extra`), the raw body when neither parsed, and the
   response's `Retry-After` hint, so destructure it with `..`.
-- **Retry + backoff** — `RetryPolicy` covers 429, 503, and transient 5xx with
-  full jitter; honors `Retry-After` up to `max_delay` and surfaces the response
-  when the hint is longer, with the hint on `CirrusError::Api::retry_after` for
-  a caller that owns its own retries. Configurable; off by default for non-idempotent 5xx,
-  and a read timeout is surfaced rather than replayed unless
-  `retry_read_timeouts` is set.
-  GET, PUT and DELETE are replayed after a 5xx or a lost response and POST and
-  PATCH are not; `send_with_replay` takes an explicit `Replay` when the method
-  misstates what an endpoint does, and Apex REST never replays.
+- **Retry + backoff** — `RetryPolicy` retries 429 for any method, with full
+  jitter. On idempotent methods (GET, PUT, DELETE) it also retries 503 always
+  and 500/502/504 when `retry_idempotent_5xx` is on (the default), and
+  replays a lost response. POST and PATCH are never replayed on a 5xx or a
+  lost response, and neither are `execute_anonymous`, the Bulk 2.0 job-data
+  upload and every Apex REST call, whose GET and PUT understate what they do;
+  `send_with_replay` takes an explicit `Replay` when the method misstates
+  what an endpoint does, and the sObject Collections retrieve replays its
+  read-only POST. `Retry-After` is honored up to `max_delay` and a longer
+  hint surfaces the response, with the hint on
+  `CirrusError::Api::retry_after` for a caller that owns its own retries. A
+  read timeout is surfaced rather than replayed unless `retry_read_timeouts`
+  is set.
 - **Sforce-Limit-Info capture** — every response sent through the typed verb
   methods and handlers has its API quota header parsed and surfaced via
   `sf.last_limit_info()`. `request_builder` and `execute` step outside the
@@ -185,10 +197,18 @@ The Salesforce REST surface is too large to wrap every endpoint. The client
 exposes verb methods that handle path resolution, auth, retry, and the
 `Sforce-Limit-Info` capture for *any* endpoint:
 
-```rust,ignore
-sf.get::<MyShape>("limits").await?;                        // versioned
-sf.post::<_, MyShape>("/services/apexrest/foo", &body).await?;  // instance-rooted
-sf.get::<MyShape>("https://...").await?;                   // fully-qualified
+```rust,no_run
+use cirrus::{Cirrus, CirrusError};
+use serde_json::Value;
+
+async fn three_modes(sf: &Cirrus, body: &Value) -> Result<(), CirrusError> {
+    // The response type comes first on every verb; a body type is inferred.
+    let limits: Value = sf.get("limits").await?;                                  // versioned
+    let created = sf.post::<Value, _>("/services/apexrest/foo", body).await?;    // instance-rooted
+    let versions: Value = sf.get("https://x.my.salesforce.com/services/data").await?; // fully-qualified
+    println!("{limits}\n{created}\n{versions}");
+    Ok(())
+}
 ```
 
 Three-mode path resolution: relative → `/services/data/{version}/...`,
