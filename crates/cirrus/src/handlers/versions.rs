@@ -69,8 +69,8 @@ mod tests {
             .and(path("/services/data"))
             .and(header("authorization", "Bearer tok"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"label": "Winter '24", "url": "/services/data/v66.0", "version": "60.0"},
-                {"label": "Spring '24", "url": "/services/data/v61.0", "version": "61.0"}
+                {"label": "Winter '24", "url": "/services/data/v59.0", "version": "59.0"},
+                {"label": "Spring '24", "url": "/services/data/v60.0", "version": "60.0"}
             ])))
             .mount(&server)
             .await;
@@ -80,7 +80,7 @@ mod tests {
 
         let versions = sf.versions().await.unwrap();
         assert_eq!(versions.len(), 2);
-        assert_eq!(versions[0].version, "60.0");
+        assert_eq!(versions[0].version, "59.0");
         assert_eq!(versions[1].label, "Spring '24");
     }
 
@@ -205,7 +205,7 @@ mod tests {
             crate::ApiVersion {
                 label: "y".into(),
                 url: "/y".into(),
-                version: "latest".into(),
+                version: "XX.0".into(),
             },
         ];
         let latest = crate::ApiVersion::latest(&versions).unwrap();
@@ -223,10 +223,35 @@ mod tests {
             crate::ApiVersion {
                 label: "y".into(),
                 url: "/y".into(),
-                version: "latest".into(),
+                version: "XX.0".into(),
             },
         ];
         assert!(crate::ApiVersion::latest(&versions).is_none());
+    }
+
+    #[test]
+    fn latest_prefers_the_versioned_url_when_the_alias_ties() {
+        // The `latest` alias entry may carry the newest numeric version;
+        // `url` must come back as a versioned path whichever entry is
+        // listed first.
+        let versioned = crate::ApiVersion {
+            label: "Summer '24".into(),
+            url: "/services/data/v61.0".into(),
+            version: "61.0".into(),
+        };
+        let alias = crate::ApiVersion {
+            label: "Latest Release".into(),
+            url: "/services/data/latest".into(),
+            version: "61.0".into(),
+        };
+
+        let alias_last = vec![versioned.clone(), alias.clone()];
+        let latest = crate::ApiVersion::latest(&alias_last).unwrap();
+        assert_eq!(latest.url, "/services/data/v61.0");
+
+        let alias_first = vec![alias, versioned];
+        let latest = crate::ApiVersion::latest(&alias_first).unwrap();
+        assert_eq!(latest.url, "/services/data/v61.0");
     }
 
     #[tokio::test]
@@ -236,7 +261,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/services/data"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"label": "x", "url": "/services/data/latest", "version": "latest"}
+                {"label": "Latest Release", "url": "/services/data/latest", "version": "XX.0"}
             ])))
             .mount(&server)
             .await;
@@ -261,7 +286,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/services/data"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"label": "x", "url": "/services/data/latest", "version": "latest"}
+                {"label": "Latest Release", "url": "/services/data/latest", "version": "XX.0"}
             ])))
             .mount(&server)
             .await;
@@ -320,7 +345,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/services/data"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"label": "Winter '24", "url": "/services/data/v66.0", "version": "60.0"},
+                {"label": "Winter '24", "url": "/services/data/v59.0", "version": "59.0"},
                 {"label": "Spring '26", "url": "/services/data/v66.0", "version": "66.0"},
                 {"label": "Summer '25", "url": "/services/data/v64.0", "version": "64.0"}
             ])))
@@ -335,6 +360,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_api_version_skips_the_documented_alias_entry() {
+        // The last four entries of the "List Available REST API Versions"
+        // example:
+        // https://developer.salesforce.com/docs/platform/api-rest/guide/dome-versions.html
+        // The page ends the list with a `Latest Release` entry for the
+        // `/services/data/latest` alias; its `version` of `XX.0` is the
+        // page's placeholder, not a value an org has been seen to return.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "Winter '24", "url": "/services/data/v59.0", "version": "59.0"},
+                {"label": "Spring '24", "url": "/services/data/v60.0", "version": "60.0"},
+                {"label": "Summer '24", "url": "/services/data/v61.0", "version": "61.0"},
+                {"label": "Latest Release", "url": "/services/data/latest", "version": "XX.0"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+        let sf = Cirrus::builder().auth(auth).build().unwrap();
+
+        let versions = sf.versions().await.unwrap();
+        assert_eq!(versions.len(), 4);
+        let latest = crate::ApiVersion::latest(&versions).unwrap();
+        assert_eq!(latest.url, "/services/data/v61.0");
+        assert_eq!(sf.latest_api_version().await.unwrap(), "v61.0");
+    }
+
+    #[tokio::test]
     async fn build_with_latest_version_reconfigures_client() {
         let server = MockServer::start().await;
 
@@ -342,7 +398,7 @@ mod tests {
             .and(path("/services/data"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"label": "Spring '26", "url": "/services/data/v66.0", "version": "66.0"},
-                {"label": "Winter '24", "url": "/services/data/v66.0", "version": "60.0"}
+                {"label": "Winter '24", "url": "/services/data/v59.0", "version": "59.0"}
             ])))
             .mount(&server)
             .await;

@@ -799,7 +799,8 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use wiremock::matchers::{
-        body_json, header, method, path, query_param, query_param_is_missing,
+        body_json, body_string_contains, header, header_regex, method, path, query_param,
+        query_param_is_missing,
     };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -880,9 +881,29 @@ mod tests {
     async fn deploy_initiates_with_multipart_and_returns_request() {
         let server = MockServer::start().await;
 
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_rest_deploy.htm
+        // The request body example is `Content-Type: multipart/form-data`
+        // with a first subpart `name="json"` / `Content-Type:
+        // application/json` holding `deployOptions`, and a second
+        // `name="file"; filename="deploy.zip"` / `Content-Type:
+        // application/zip` holding the zip.
         Mock::given(method("POST"))
             .and(path("/services/data/v66.0/metadata/deployRequest"))
             .and(header("authorization", "Bearer tok"))
+            .and(header_regex(
+                "content-type",
+                r"^multipart/form-data; boundary=",
+            ))
+            .and(body_string_contains(r#"name="json""#))
+            .and(body_string_contains(
+                r#"name="file"; filename="deploy.zip""#,
+            ))
+            .and(body_string_contains("Content-Type: application/zip"))
+            .and(body_string_contains("fake-zip-bytes"))
+            .and(body_string_contains(r#""deployOptions":{"#))
+            .and(body_string_contains(r#""checkOnly":true"#))
+            .and(body_string_contains(r#""rollbackOnError":true"#))
+            .and(body_string_contains(r#""testLevel":"RunLocalTests""#))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "id": "0Afxx00000001VPCAY",
                 "deployOptions": {
@@ -1443,6 +1464,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/data/v66.0/metadata/deployRequest"))
+            .and(body_string_contains(r#"name="json""#))
+            .and(body_string_contains(
+                r#"name="file"; filename="deploy.zip""#,
+            ))
+            .and(body_string_contains(r#""deployOptions":{"#))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!([{
                 "errorCode": "INVALID_DEPLOY_OPTIONS",
                 "message": "rollbackOnError must be true for production"

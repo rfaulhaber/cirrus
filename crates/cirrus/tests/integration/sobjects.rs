@@ -18,8 +18,7 @@
 //! deletes the record. Salesforce's REST API tolerates double-deletes
 //! (returns 404), so re-runs are idempotent.
 
-use crate::common::try_init_client;
-use cirrus::Cirrus;
+use crate::common::{AccountCleanup, try_init_client};
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,48 +30,6 @@ fn unique_name(test: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("cirrus-it-{test}-{nanos}")
-}
-
-/// RAII cleanup guard. On drop, attempts a best-effort delete of the
-/// given Account id. Uses `tokio::runtime::Handle::current()` via
-/// `block_in_place` is overkill here — we instead spawn into the
-/// current runtime via a blocking send.
-struct AccountCleanup<'a> {
-    sf: &'a Cirrus,
-    id: Option<String>,
-}
-
-impl<'a> AccountCleanup<'a> {
-    fn new(sf: &'a Cirrus, id: String) -> Self {
-        Self { sf, id: Some(id) }
-    }
-
-    /// Disarm the guard — call this after an explicit successful
-    /// delete so the destructor doesn't try a second time.
-    fn disarm(&mut self) {
-        self.id = None;
-    }
-}
-
-impl Drop for AccountCleanup<'_> {
-    fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            // Best-effort delete on drop. We're inside a sync Drop, so
-            // we have to bridge to async. block_in_place + spawn is
-            // the standard trick for in-Drop cleanup within #[tokio::test].
-            let sf = self.sf.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    if let Err(e) = sf.sobject("Account").delete(&id).await {
-                        eprintln!(
-                            "cleanup warning: failed to delete Account {id}: {e} \
-                             (will need manual cleanup)",
-                        );
-                    }
-                });
-            });
-        }
-    }
 }
 
 #[derive(Deserialize)]

@@ -3121,6 +3121,45 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_token_echoed_without_a_bearer_space_is_scrubbed_from_an_html_error_page() {
+            // An HTML gateway page renders the header with an entity in
+            // place of the space and repeats the id bare, so only the
+            // exact-token match can reach either copy.
+            let token = "00Dxx0000001gER!AQEAQxxxx";
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(502).set_body_raw(
+                    format!("<td>Bearer&nbsp;{token}</td> session={token}"),
+                    "text/html",
+                ))
+                .mount(&server)
+                .await;
+
+            let auth = Arc::new(StaticTokenAuth::new(token, server.uri()));
+            let sf = Cirrus::builder()
+                .auth(auth)
+                .retry_policy(RetryPolicy::none())
+                .build()
+                .unwrap();
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+
+            assert!(!err.to_string().contains(token), "{err}");
+            match err {
+                CirrusError::Api {
+                    status,
+                    raw: Some(raw),
+                    ..
+                } => {
+                    assert_eq!(status, 502);
+                    assert!(!raw.contains(token), "{raw}");
+                    assert!(raw.contains("[redacted]"), "{raw}");
+                }
+                other => panic!("expected an Api error with a raw body, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
         async fn read_timeout_aborts_a_request_the_org_never_answers() {
             // The deadline is armed at dispatch, so it fires while the
             // response head is still outstanding — not just between two
@@ -3406,6 +3445,17 @@ mod tests {
             RetryPolicy {
                 base_delay: Duration::ZERO,
                 max_delay: Duration::ZERO,
+                jitter: false,
+                ..RetryPolicy::default()
+            }
+        }
+
+        // Every backoff step is 10 s, so a retry that finishes in a
+        // fraction of that did not wait on the schedule.
+        fn slow_backoff_policy() -> RetryPolicy {
+            RetryPolicy {
+                base_delay: Duration::from_secs(10),
+                max_delay: Duration::from_secs(10),
                 jitter: false,
                 ..RetryPolicy::default()
             }
@@ -3931,6 +3981,101 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn limit_info_is_captured_from_an_error_response() {
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/errorcodes.html
+            // 403: "If the error code is REQUEST_LIMIT_EXCEEDED, you’ve
+            // exceeded API request limits in your org." The refusal is
+            // the response a caller most wants the counts from, and it
+            // is never retried; the message text is illustrative.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .set_body_json(json!([{
+                            "message": "TotalRequests Limit exceeded.",
+                            "errorCode": "REQUEST_LIMIT_EXCEEDED"
+                        }]))
+                        .insert_header("Sforce-Limit-Info", "api-usage=15000/15000"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 403, .. }), "{err}");
+
+            let info = sf.last_limit_info().expect("limit info should be set");
+            assert_eq!(info.used, 15000);
+            assert_eq!(info.allowed, 15000);
+        }
+
+        #[tokio::test]
+        async fn limit_info_from_a_retried_response_outlives_a_headerless_success() {
+            // The header is read from every attempt, not only the one
+            // that settles the call, and a response without it leaves
+            // the last value in place.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .insert_header("Sforce-Limit-Info", "api-usage=20/100"),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+
+            let info = sf.last_limit_info().expect("limit info should be set");
+            assert_eq!(info.used, 20);
+            assert_eq!(info.allowed, 100);
+        }
+
+        #[tokio::test]
+        async fn cloned_clients_share_the_last_limit_info() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"ok": true}))
+                        .insert_header("Sforce-Limit-Info", "api-usage=30/100"),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"ok": true}))
+                        .insert_header("Sforce-Limit-Info", "api-usage=31/100"),
+                )
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), RetryPolicy::none());
+            let sf2 = sf.clone();
+            assert!(sf2.last_limit_info().is_none());
+
+            let _: Value = sf.get("limits").await.unwrap();
+            assert_eq!(sf2.last_limit_info().unwrap().used, 30);
+
+            let _: Value = sf2.get("limits").await.unwrap();
+            assert_eq!(sf.last_limit_info().unwrap().used, 31);
+        }
+
+        #[tokio::test]
         async fn malformed_limit_info_header_is_ignored() {
             let server = MockServer::start().await;
 
@@ -3954,10 +4099,8 @@ mod tests {
         #[tokio::test]
         async fn retry_after_header_overrides_backoff() {
             // The Retry-After hint, if present, takes precedence over
-            // the policy's exponential schedule. We don't test the
-            // *duration* directly (jitter would muddy that anyway) —
-            // we just verify the retry happens and the request count
-            // advances.
+            // the policy's exponential schedule, which would sleep the
+            // full 10 s here.
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -3972,9 +4115,48 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let sf = fixture_with_policy(server.uri(), slow_backoff_policy());
+            let started = std::time::Instant::now();
             let v: Value = sf.get("limits").await.unwrap();
             assert_eq!(v["ok"], true);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry waited on the backoff schedule: {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn retry_after_http_date_overrides_backoff() {
+            // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
+            // Retry-After may be an HTTP-date in place of a seconds count;
+            // `parse_retry_after` clamps a date already past to zero.
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "Thu, 01 Jan 2015 00:00:00 GMT"),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), slow_backoff_policy());
+            let started = std::time::Instant::now();
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry waited on the backoff schedule: {:?}",
+                started.elapsed()
+            );
         }
     }
 
@@ -4379,9 +4561,19 @@ mod property_tests {
     use proptest::prelude::*;
     use std::sync::Arc;
 
+    // Building a client builds a TLS verifier that reloads the system
+    // root certificates, which costs far more than the string work under
+    // test. One client per process, not one per proptest case.
+    static CLIENT: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::builder().build().unwrap());
+
     fn fixture(instance: &str) -> Cirrus {
         let auth = Arc::new(StaticTokenAuth::new("tok", instance));
-        Cirrus::builder().auth(auth).build().unwrap()
+        Cirrus::builder()
+            .auth(auth)
+            .http_client(CLIENT.clone())
+            .build()
+            .unwrap()
     }
 
     /// Path-shaped strings: ASCII alphanumerics plus characters that

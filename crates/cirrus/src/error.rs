@@ -545,6 +545,30 @@ mod tests {
     }
 
     #[test]
+    fn redact_secrets_masks_a_token_the_keyword_scan_cannot_reach() {
+        // An HTML gateway page that renders the header with an entity
+        // for the space, plus a bare copy of the id. Neither follows
+        // "bearer" with a space or tab, so only the exact-token pass
+        // catches them.
+        let token = "00D5f000000ABCD!AQcAQK_entity_session_id";
+        let err = CirrusError::Api {
+            status: 502,
+            errors: vec![],
+            raw: Some(format!("<td>Bearer&nbsp;{token}</td> session={token}")),
+            retry_after: None,
+        }
+        .redact_secrets(token);
+
+        let CirrusError::Api { raw: Some(raw), .. } = &err else {
+            panic!("expected an Api error with a raw body");
+        };
+        assert!(!raw.contains(token), "token survived redaction: {raw}");
+        assert_eq!(raw.matches("[redacted]").count(), 2, "{raw}");
+        assert!(raw.contains("<td>Bearer&nbsp;"), "{raw}");
+        assert!(!err.to_string().contains(token));
+    }
+
+    #[test]
     fn redact_secrets_strips_bearer_credentials_the_token_match_misses() {
         // A stale or re-encoded credential in the echoed request is not
         // the token this attempt used, so the keyword scan has to catch

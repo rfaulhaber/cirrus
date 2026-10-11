@@ -16,7 +16,7 @@
 //! against wiremock for the multi-page state machine; here we just
 //! prove it terminates cleanly against real responses.
 
-use crate::common::try_init_client;
+use crate::common::{AccountCleanup, try_init_client};
 use cirrus::soql;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -91,29 +91,21 @@ async fn query_as_deserializes_into_typed_records() {
         .create(&serde_json::json!({ "Name": &name }))
         .await
         .unwrap();
-    let cleanup_id = created.id.clone();
+    let _cleanup = AccountCleanup::new(&sf, created.id.clone());
 
-    let result = async {
-        let soql = format!(
-            "SELECT Id, Name FROM Account WHERE Name = {}",
-            soql::quote(&name)
-        );
-        let result = sf
-            .query_as::<AccountRow>(&soql)
-            .await
-            .expect("typed query should succeed");
-        assert_eq!(result.total_size, 1, "exactly our planted record matches");
-        assert_eq!(result.records.len(), 1);
-        let row = &result.records[0];
-        assert_eq!(row.id, created.id);
-        assert_eq!(row.name, name);
-    }
-    .await;
-
-    // Manual cleanup — RAII guard would be nicer but query.rs doesn't
-    // need a third copy. Best-effort.
-    let _ = sf.sobject("Account").delete(&cleanup_id).await;
-    result
+    let soql = format!(
+        "SELECT Id, Name FROM Account WHERE Name = {}",
+        soql::quote(&name)
+    );
+    let result = sf
+        .query_as::<AccountRow>(&soql)
+        .await
+        .expect("typed query should succeed");
+    assert_eq!(result.total_size, 1, "exactly our planted record matches");
+    assert_eq!(result.records.len(), 1);
+    let row = &result.records[0];
+    assert_eq!(row.id, created.id);
+    assert_eq!(row.name, name);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -150,42 +142,33 @@ async fn query_stream_matches_eager_query_results() {
     };
     let base_marker = marker("stream");
     let accounts = sf.sobject("Account");
-    let mut planted_ids = Vec::new();
+    let mut cleanups = Vec::new();
     for i in 0..4 {
         let row_name = format!("{base_marker}-{i}");
         let created = accounts
             .create(&serde_json::json!({ "Name": &row_name }))
             .await
             .unwrap();
-        planted_ids.push(created.id);
+        cleanups.push(AccountCleanup::new(&sf, created.id));
     }
 
-    let result = async {
-        // Bound the WHERE clause by our marker prefix; LIKE with %
-        // suffix matches all four numbered records.
-        let soql = format!(
-            "SELECT Id, Name FROM Account WHERE Name LIKE '{}-%' ORDER BY Name",
-            soql::escape_like(&base_marker)
-        );
-        let stream = sf.query_stream_as::<AccountRow>(&soql);
-        let rows: Vec<_> = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|r| r.expect("stream items should all be Ok"))
-            .collect();
-        assert_eq!(rows.len(), 4, "should yield all 4 planted records");
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(row.name, format!("{base_marker}-{i}"));
-        }
+    // Bound the WHERE clause by our marker prefix; LIKE with %
+    // suffix matches all four numbered records.
+    let soql = format!(
+        "SELECT Id, Name FROM Account WHERE Name LIKE '{}-%' ORDER BY Name",
+        soql::escape_like(&base_marker)
+    );
+    let stream = sf.query_stream_as::<AccountRow>(&soql);
+    let rows: Vec<_> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.expect("stream items should all be Ok"))
+        .collect();
+    assert_eq!(rows.len(), 4, "should yield all 4 planted records");
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.name, format!("{base_marker}-{i}"));
     }
-    .await;
-
-    // Cleanup.
-    for id in planted_ids {
-        let _ = sf.sobject("Account").delete(&id).await;
-    }
-    result
 }
 
 #[tokio::test(flavor = "multi_thread")]

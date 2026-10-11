@@ -1191,13 +1191,24 @@ impl ApiVersion {
     ///
     /// Entries whose [`version`](Self::version) isn't a `major.minor`
     /// pair are ignored, so the returned entry always carries a version
-    /// string usable as a `vXX.X` path segment. Returns `None` when the
-    /// slice is empty or holds nothing parseable.
+    /// string usable as a `vXX.X` path segment. When the `latest` alias
+    /// entry ties with the newest numeric version, the entry whose URL
+    /// names that version is returned, so `url` is the versioned path
+    /// whenever an entry with one carries that version. Returns `None`
+    /// when the slice is empty or holds nothing parseable.
     pub fn latest(versions: &[Self]) -> Option<&Self> {
         versions
             .iter()
             .filter(|v| v.version_number().is_some())
-            .max_by_key(|v| v.version_number())
+            .max_by_key(|v| {
+                // `max_by_key` keeps the last of equal maxima, so the
+                // alias entry would win a tie on position alone.
+                let url_names_version = v
+                    .url
+                    .strip_suffix(v.version.as_str())
+                    .is_some_and(|rest| rest.ends_with("/v"));
+                (v.version_number(), url_names_version)
+            })
     }
 }
 
