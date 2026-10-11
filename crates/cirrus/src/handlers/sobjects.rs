@@ -2137,7 +2137,10 @@ mod tests {
             // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
             // Mirrors the documented ContentVersion insert: the example's
             // JSON part name `entity_content`, and the required binary
-            // part name `VersionData`.
+            // part name `VersionData`. The page's Content-Type Header
+            // rules: "Supports the `application/json` and
+            // `application/xml` content types for the non-binary part"
+            // and "any content type for the binary part".
             let server = MockServer::start().await;
 
             Mock::given(method("POST"))
@@ -2151,6 +2154,9 @@ mod tests {
                 .and(body_string_contains(r#"name="VersionData""#))
                 .and(body_string_contains(r#"filename="brochure.pdf""#))
                 .and(body_string_contains(r#""PathOnClient":"brochure.pdf""#))
+                .and(body_string_contains("Content-Type: application/json"))
+                .and(body_string_contains("Content-Type: application/pdf"))
+                .and(body_string_contains("%PDF-1.4 fake pdf bytes"))
                 .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                     "id": "068D00000000pgOIAQ",
                     "errors": [],
@@ -2324,7 +2330,8 @@ mod tests {
             // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
             // Mirrors the doc's "Updating a Document with Blob Data"
             // example: an arbitrary JSON part name, and the binary part
-            // named for Document's blob field, `Body`.
+            // named for Document's blob field, `Body`, with the JSON part
+            // labelled `application/json`.
             Mock::given(method("PATCH"))
                 .and(path("/services/data/v66.0/sobjects/Document/015D000000000"))
                 .and(header_regex(
@@ -2333,6 +2340,8 @@ mod tests {
                 ))
                 .and(body_string_contains(r#"name="entity_content""#))
                 .and(body_string_contains(r#"name="Body""#))
+                .and(body_string_contains("Content-Type: application/json"))
+                .and(body_string_contains("%PDF updated"))
                 .respond_with(ResponseTemplate::new(204))
                 .mount(&server)
                 .await;
