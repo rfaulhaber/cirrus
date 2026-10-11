@@ -39,21 +39,29 @@
 //! and (on failure) where the error occurred.
 //!
 //! The Apex source is passed as a URL query parameter (`anonymousBody=...`)
-//! on a GET request, not a JSON body on POST. This caps the practical size
-//! of the supplied source — long Apex scripts may exceed URL-length limits
-//! in proxies, gateways, or logging infrastructure even when the Salesforce
-//! front-end accepts them. For large jobs, prefer creating an [`ApexClass`]
-//! via [`sobject("ApexClass").create(...)`](ToolingSObjectHandler::create)
-//! and invoking it through a runner, or use the [`MetadataContainer`] /
-//! [`ContainerAsyncRequest`] flow.
+//! on a GET request, not a JSON body on POST, so the script has to fit
+//! Salesforce's own request-line limits. The [Status Codes] page answers
+//! a URI over 16,384 bytes with HTTP 414 and a URI plus headers over
+//! 16,384 bytes with 431; both surface as [`crate::CirrusError::Api`]
+//! with no error entries. Percent-encoding expands the source on the
+//! way (a quote, brace, parenthesis or semicolon costs three bytes once
+//! encoded), so the practical ceiling is roughly 11–12 KB of typical
+//! Apex, less for punctuation-heavy code. A longer script cannot be
+//! stored as an [`ApexClass`] through the Tooling sObject resources
+//! either: that page says "a runtime exception occurs if you try to
+//! create, update, or delete them using the API" and that Apex classes
+//! "can't be created, edited, or deleted in a production org". Deploy
+//! the code as a class through the Metadata API instead
+//! ([`Cirrus::metadata`] for a REST `deployRequest`, or the
+//! `cirrus-metadata` crate), then run it from a one-line anonymous
+//! block that calls the class.
 //!
 //! [`apex_log_body`](ToolingHandler::apex_log_body) fetches the debug log
 //! of an `ApexLog` record, such as one an anonymous run produces, as raw
 //! text, which a JSON verb cannot read.
 //!
 //! [`ApexClass`]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_apexclass.htm
-//! [`MetadataContainer`]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_metadatacontainer.htm
-//! [`ContainerAsyncRequest`]: https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/tooling_api_objects_containerasyncrequest.htm
+//! [Status Codes]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
 //!
 //! # Errors
 //!
@@ -232,8 +240,9 @@ impl<'a> ToolingHandler<'a> {
     /// Calls
     /// `GET /services/data/{api_version}/tooling/executeAnonymous?anonymousBody={apex}`.
     /// The Apex source is percent-encoded into the query string by
-    /// reqwest — see the module-level docs for the URL-length caveat
-    /// that applies to long scripts.
+    /// reqwest, and the request line has to fit Salesforce's 16,384-byte
+    /// URI cap — see the module-level docs for what that leaves a long
+    /// script.
     ///
     /// The returned envelope encodes three outcomes (success, compile
     /// error, runtime error); see [`ExecuteAnonymousResult`] for the
