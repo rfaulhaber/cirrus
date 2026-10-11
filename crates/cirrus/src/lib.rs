@@ -4561,9 +4561,19 @@ mod property_tests {
     use proptest::prelude::*;
     use std::sync::Arc;
 
+    // Building a client builds a TLS verifier that reloads the system
+    // root certificates, which costs far more than the string work under
+    // test. One client per process, not one per proptest case.
+    static CLIENT: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::builder().build().unwrap());
+
     fn fixture(instance: &str) -> Cirrus {
         let auth = Arc::new(StaticTokenAuth::new("tok", instance));
-        Cirrus::builder().auth(auth).build().unwrap()
+        Cirrus::builder()
+            .auth(auth)
+            .http_client(CLIENT.clone())
+            .build()
+            .unwrap()
     }
 
     /// Path-shaped strings: ASCII alphanumerics plus characters that
