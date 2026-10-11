@@ -2331,7 +2331,9 @@ mod tests {
             // Mirrors the doc's "Updating a Document with Blob Data"
             // example: an arbitrary JSON part name, and the binary part
             // named for Document's blob field, `Body`, with the JSON part
-            // labelled `application/json`.
+            // labelled `application/json` and the binary part carrying the
+            // spec's content type and filename (the page requires a
+            // `filename` attribute on the binary part).
             Mock::given(method("PATCH"))
                 .and(path("/services/data/v66.0/sobjects/Document/015D000000000"))
                 .and(header_regex(
@@ -2342,6 +2344,8 @@ mod tests {
                 .and(body_string_contains(r#"name="Body""#))
                 .and(body_string_contains("Content-Type: application/json"))
                 .and(body_string_contains("%PDF updated"))
+                .and(body_string_contains("Content-Type: application/pdf"))
+                .and(body_string_contains(r#"filename="updated.pdf""#))
                 .respond_with(ResponseTemplate::new(204))
                 .mount(&server)
                 .await;

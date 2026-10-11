@@ -899,6 +899,7 @@ mod tests {
                 r#"name="file"; filename="deploy.zip""#,
             ))
             .and(body_string_contains("Content-Type: application/zip"))
+            .and(body_string_contains("fake-zip-bytes"))
             .and(body_string_contains(r#""deployOptions":{"#))
             .and(body_string_contains(r#""checkOnly":true"#))
             .and(body_string_contains(r#""rollbackOnError":true"#))
