@@ -54,7 +54,7 @@ Tests: ~1000 unit + ~45 doctest workspace-wide, all wiremock-backed, fast (<10s 
 
 ### Open-ended client (escape hatch)
 
-Every typed handler layers over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` / `send_json_with_headers` (the header-carrying verbs, bodiless and with a JSON body — they stay inside the retry / 401-refresh / limit-info loop, unlike the two below), `send_with_replay` / `send_json_with_replay` (same loop, with an explicit `Replay` for endpoints whose HTTP method misstates their effect — Apex REST uses `Replay::Never` throughout), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
+Most typed handlers layer over a small set of public verb methods on `Cirrus`: `get`, `get_with_query`, `post`, `put`, `patch`, `delete`, `send_with_headers` / `send_json_with_headers` (the header-carrying verbs, bodiless and with a JSON body — they stay inside the retry / 401-refresh / limit-info loop, unlike the two below), `send_with_replay` / `send_json_with_replay` (same loop, with an explicit `Replay` for endpoints whose HTTP method misstates their effect — Apex REST uses `Replay::Never` throughout), plus `request_builder` (auth-injected) and `execute` (hands-off bypass). Path resolution is three-mode:
 
 - **Relative** (`limits`) → versioned: `{instance}/services/data/{version}/limits`
 - **Leading slash** (`/services/apexrest/foo`) → instance-rooted
@@ -62,20 +62,23 @@ Every typed handler layers over a small set of public verb methods on `Cirrus`: 
 
 When adding a new typed handler, **layer over the public verbs** — don't introduce parallel transport code. Use `versioned_url` + `send_at` only if a path segment needs percent-encoding (e.g., upsert by external ID with `/` in the value).
 
+The public verbs replay by HTTP method (`Replay::ByMethod`, the `retry` module's default): a GET, PUT or DELETE is re-sent after a 5xx or a lost response, a POST or PATCH is not. That is the one thing a handler built on them cannot change, so an endpoint whose method misstates its effect must name its `Replay` itself rather than call `get` / `get_with_query` / `put`: `send_with_replay` / `send_json_with_replay` (public; Apex REST passes `Replay::Never` on every verb), `get_with_query_no_replay` (the crate-private GET with a query; `execute_anonymous` and the Apex REST GET), the `replay` argument of `send_with_body` (the Bulk 2.0 job-data `PUT` passes `Replay::Never`, since it submits data rather than replacing a resource) and of `send_at_with_replay` / `send_at_parsed`. `Replay::Always` is for a documented read on a POST (the sObject Collections retrieve). The handlers that do not go through the verbs at all are the conditional, raw, streaming and multipart paths in the table below, each of which fixes its own `Replay`.
+
 ### Send-method family
 
-Six send paths cover every wire shape we've needed, five internal and one public. Pick by request/response shape, not by handler name. All six go through the same retry policy, 401 auto-refresh, and `Sforce-Limit-Info` capture, which live in one loop, `dispatch_with`; its `finish` step is what varies, deciding what a response becomes once its status has passed the retry check (`dispatch` collects and parses the body, `fetch_stream` hands it over uncollected).
+Seven send paths cover every wire shape we've needed, six internal and one public. Pick by request/response shape, not by handler name. All seven go through the same retry policy, 401 auto-refresh, and `Sforce-Limit-Info` capture, which live in one loop, `dispatch_with`; its `finish` step is what varies, deciding what a response becomes once its status has passed the retry check (`dispatch` collects and parses the body, `fetch_stream` hands it over uncollected). Each path takes a `Replay` or fixes one; the escape-hatch section above says which handlers must opt out of the by-method default.
 
 | Helper | Request body | Response | Used by |
 |---|---|---|---|
 | `Cirrus::send` (and public verbs) | `Serialize` JSON or none | typed JSON → `R` | most REST |
+| `get_if_modified_since` | none; sends `If-Modified-Since` | typed JSON → `Option<R>`, a 304 is `None` | `describe_global_if_modified_since`, `describe_if_modified_since[_as]`, `retrieve_if_modified_since[_as]` |
 | `send_with_body` | raw `bytes::Bytes` + Content-Type | typed JSON → `R` | Bulk 2.0 CSV ingest upload |
 | `fetch_raw` | query params only | `(HeaderMap, bytes::Bytes)` | Bulk 2.0 query results, Event Monitoring downloads, sObject blob downloads, the Tooling Apex log body |
 | `fetch_stream` | query params only | `ByteStream` (status, headers, body as `Stream<Item = CirrusResult<Bytes>>`), outside `max_response_size`; a non-2xx body is collected and parsed as usual | Event Monitoring streaming downloads |
 | `send_multipart` | JSON metadata part + binary part | typed JSON → `R` | sObject blob inserts/updates (ContentVersion / Document / Attachment) |
 | `send_raw` (public) | optional `RawBody` (bytes + its Content-Type) or none | `RawResponse` (status, headers, bytes) for any status; only an `INVALID_SESSION_ID` 401 is an error, and a non-2xx body is token-scrubbed | `Cirrus::send_raw`, `ApexHandler::send_raw` |
 
-If you find yourself wanting a seventh, first check whether the existing six would work with caller-side adaptation.
+If you find yourself wanting an eighth, first check whether the existing seven would work with caller-side adaptation.
 
 ### Handler module conventions (cirrus)
 

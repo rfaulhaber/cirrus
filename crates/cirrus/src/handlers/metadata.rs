@@ -285,8 +285,9 @@ pub enum TestLevel {
     RunSpecifiedTests,
     /// (Beta) Salesforce-selected relevant tests.
     RunRelevantTests,
-    /// All non-managed-package tests in the org. Default for prod
-    /// deploys that include Apex.
+    /// All tests in the org except those from installed managed and
+    /// unlocked packages. Default for production deploys that include
+    /// Apex classes or triggers.
     RunLocalTests,
     /// Every test in the org, including managed-package tests.
     RunAllTestsInOrg,

@@ -1111,6 +1111,11 @@ fn query_value(url: &str, name: &str) -> Option<String> {
 ///   not the same as `LogDate` (when the events occurred). Use
 ///   `CreatedDate > <last-fetch>` to drive incremental ingestion (per
 ///   Salesforce's documented best practice).
+/// - `LogFileFieldNames` and `LogFileFieldTypes` are the CSV's column
+///   names and types for this file's `EventType`, carried on every
+///   record rather than on the object's describe; `ApiVersion` is the
+///   API version the file was written for. Select them next to
+///   `LogFile` to learn the columns before parsing.
 ///
 /// All Optional fields are `None` when the SELECT clause didn't ask
 /// for them; serde's `default` attribute keeps deserialization robust
@@ -1153,6 +1158,26 @@ pub struct EventLogFileRecord {
     /// ingestion). UTC, ISO-8601.
     #[serde(rename = "CreatedDate", default)]
     pub created_date: Option<String>,
+    /// The ordered list of the CSV's column names for this file's
+    /// `EventType`, as one string, from the record's `LogFileFieldNames`
+    /// field. The [EventLogFile] object reference says to read it each
+    /// release, since a type's schema can change. `None` when the SELECT
+    /// clause didn't ask for it.
+    ///
+    /// [EventLogFile]: https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile.htm
+    #[serde(rename = "LogFileFieldNames", default)]
+    pub log_file_field_names: Option<String>,
+    /// The ordered list of the CSV's column types (`String`, `Id`, and
+    /// so forth) matching [`log_file_field_names`](Self::log_file_field_names),
+    /// from the record's `LogFileFieldTypes` field. `None` when the
+    /// SELECT clause didn't ask for it.
+    #[serde(rename = "LogFileFieldTypes", default)]
+    pub log_file_field_types: Option<String>,
+    /// API version the log file was written for, from the record's
+    /// `ApiVersion` field (a `double` on the object, so `66.0`). `None`
+    /// when the SELECT clause didn't ask for it.
+    #[serde(rename = "ApiVersion", default)]
+    pub api_version: Option<f64>,
 }
 
 /// One entry from `GET /services/data` — a Salesforce REST API version.

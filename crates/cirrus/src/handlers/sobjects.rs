@@ -921,10 +921,17 @@ pub struct BlobUploadSpec<'a, B: ?Sized> {
     /// must be the sObject's blob field API name — `Body` for
     /// `Document`, `VersionData` for `ContentVersion`.
     pub blob_field_name: &'a str,
-    /// Filename to declare in the binary part's `Content-Disposition`.
-    /// Salesforce surfaces this as the `PathOnClient` / `Name` /
-    /// `FileName` attribute on most blob objects (varies; check the
-    /// object's documented field set).
+    /// Filename declared in the binary part's `Content-Disposition`.
+    /// Required: per the [Insert or Update Blob Data] doc the request
+    /// "must contain a `filename` attribute for the binary part that
+    /// represents the name of the local file", and that is all
+    /// Salesforce documents for it. The record's own name fields, such
+    /// as `ContentVersion.PathOnClient` or `Document.Name`, are set in
+    /// [`metadata`](Self::metadata); the doc's `Document` example names
+    /// the record "Marketing Brochure Q1" while uploading
+    /// `2011Q1MktgBrochure.pdf`.
+    ///
+    /// [Insert or Update Blob Data]: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_insert_update_blob.htm
     pub filename: &'a str,
     /// MIME type for the binary part. Defaults to
     /// `application/octet-stream` when `None`. Setting it correctly

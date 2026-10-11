@@ -38,7 +38,8 @@
 //! ```text
 //! GET /services/data/{v}/query?q=SELECT+Id,EventType,LogFile,LogDate,LogFileLength+FROM+EventLogFile
 //! → JSON: standard QueryResult envelope, records have shape:
-//!   { Id, EventType, LogFile, LogDate, LogFileLength, [Interval, Sequence, CreatedDate] }
+//!   { Id, EventType, LogFile, LogDate, LogFileLength,
+//!     [Interval, Sequence, CreatedDate, LogFileFieldNames, LogFileFieldTypes, ApiVersion] }
 //!
 //! GET /services/data/{v}/sobjects/EventLogFile/{id}/LogFile
 //! → CSV bytes
@@ -64,18 +65,30 @@
 //!
 //! # Decoding the CSV
 //!
-//! The CSV columns vary by `EventType` — the `LogFileFieldNames` and
-//! `LogFileFieldTypes` fields on `EventLogFile`'s describe metadata
-//! enumerate them per type. This handler intentionally does not decode
-//! the CSV: column sets are large, evolve across releases, and most
-//! callers want to ferry the raw bytes into a downstream analytics
-//! pipeline (Splunk, Snowflake, etc.) anyway. The `csv` crate or a
-//! tabular DataFrame library is the right next step on the caller side.
+//! The CSV columns vary by `EventType`, and each record carries its own
+//! column list: the [EventLogFile] object reference defines
+//! `LogFileFieldNames` ("the ordered list of fields in the log file
+//! data") and `LogFileFieldTypes` (their types) as string fields on the
+//! record, different per type, and says to read them each release to
+//! pick up schema changes. They are record values, not describe
+//! metadata, so `describe()` on the object does not list the columns;
+//! select the two fields next to `LogFile` and read them off
+//! [`EventLogFileRecord::log_file_field_names`] and
+//! [`EventLogFileRecord::log_file_field_types`]. This handler
+//! intentionally does not decode the CSV: column sets are large, evolve
+//! across releases, and most callers want to ferry the raw bytes into a
+//! downstream analytics pipeline (Splunk, Snowflake, etc.) anyway. The
+//! `csv` crate or a tabular DataFrame library is the right next step on
+//! the caller side.
+//!
+//! [EventLogFile]: https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile.htm
 //!
 //! [`Cirrus::query`]: crate::Cirrus::query
 //! [`Cirrus::query_as`]: crate::Cirrus::query_as
 //! [`ByteStream`]: crate::ByteStream
 //! [`EventLogFileRecord`]: crate::EventLogFileRecord
+//! [`EventLogFileRecord::log_file_field_names`]: crate::EventLogFileRecord::log_file_field_names
+//! [`EventLogFileRecord::log_file_field_types`]: crate::EventLogFileRecord::log_file_field_types
 
 use crate::error::{CirrusError, CirrusResult};
 use crate::locator::{self, Segment};
@@ -584,6 +597,59 @@ mod tests {
         assert_eq!(rec.interval.as_deref(), Some("Hourly"));
         assert_eq!(rec.sequence, Some(3));
         assert!(rec.created_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn query_with_schema_fields_populates_field_names_types_and_api_version() {
+        // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile.htm
+        // The object reference lists `LogFileFieldNames` and
+        // `LogFileFieldTypes` as nillable string fields on each record
+        // ("The ordered list of fields in the log file data" and "The
+        // ordered list of field types in the log file data (String, Id,
+        // and so forth)"), different per EventType, and `ApiVersion` as
+        // a double. No page prints a JSON example of the three, so the
+        // values below are composed from that field table.
+        use crate::EventLogFileRecord;
+        use crate::QueryResult;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/data/v66.0/query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "totalSize": 1,
+                "done": true,
+                "records": [{
+                    "attributes": {"type": "EventLogFile"},
+                    "Id": "0ATxx",
+                    "EventType": "Login",
+                    "LogFile": "/services/data/v66.0/sobjects/EventLogFile/0ATxx/LogFile",
+                    "LogDate": "2024-03-14T00:00:00.000+0000",
+                    "LogFileFieldNames": "EVENT_TYPE,TIMESTAMP,REQUEST_ID,ORGANIZATION_ID,USER_ID",
+                    "LogFileFieldTypes": "String,DateTime,String,Id,Id",
+                    "ApiVersion": 66.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let sf = fixture(server.uri());
+        let result: QueryResult<EventLogFileRecord> = sf
+            .query_as(
+                "SELECT Id, EventType, LogFile, LogDate, LogFileFieldNames, LogFileFieldTypes, \
+                 ApiVersion FROM EventLogFile",
+            )
+            .await
+            .unwrap();
+        let rec = &result.records[0];
+        assert_eq!(
+            rec.log_file_field_names.as_deref(),
+            Some("EVENT_TYPE,TIMESTAMP,REQUEST_ID,ORGANIZATION_ID,USER_ID")
+        );
+        assert_eq!(
+            rec.log_file_field_types.as_deref(),
+            Some("String,DateTime,String,Id,Id")
+        );
+        assert_eq!(rec.api_version, Some(66.0));
     }
 
     const LOG_PATH: &str = "/services/data/v66.0/sobjects/EventLogFile/0ATD000000001bROAQ/LogFile";
