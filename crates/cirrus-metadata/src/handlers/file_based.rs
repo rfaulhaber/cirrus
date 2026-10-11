@@ -1018,6 +1018,75 @@ mod tests {
     }
 
     /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
+    /// The DeployOptions section includes allowMissingFiles,
+    /// autoUpdatePackage, checkOnly, ignoreWarnings, performRetrieve,
+    /// purgeOnDelete, rollbackOnError, runTests, singlePackage and
+    /// testLevel; the deprecated runAllTests (API version 33.0 and
+    /// earlier) is not modeled. A `false` goes out as `false` rather
+    /// than being omitted: ignoreWarnings says whether deployments with
+    /// warnings "complete successfully (`true`) or not (`false`)", a
+    /// choice the caller stated.
+    #[test]
+    fn deploy_op_renders_every_option_with_its_own_value() {
+        // Neighbouring booleans alternate, so reading an option from
+        // the field next to it changes the rendering.
+        let opts = DeployOptions {
+            allow_missing_files: Some(true),
+            auto_update_package: Some(false),
+            check_only: Some(true),
+            ignore_warnings: Some(false),
+            perform_retrieve: Some(true),
+            purge_on_delete: Some(false),
+            rollback_on_error: Some(true),
+            run_tests: vec!["AccountTriggerTest".into(), "ContactTriggerTest".into()],
+            single_package: Some(false),
+            test_level: Some(TestLevel::RunSpecifiedTests),
+        };
+        let body = deploy_op(b"", opts).render_body().unwrap();
+        assert_eq!(
+            body,
+            "<met:ZipFile></met:ZipFile><met:DeployOptions>\
+             <met:allowMissingFiles>true</met:allowMissingFiles>\
+             <met:autoUpdatePackage>false</met:autoUpdatePackage>\
+             <met:checkOnly>true</met:checkOnly>\
+             <met:ignoreWarnings>false</met:ignoreWarnings>\
+             <met:performRetrieve>true</met:performRetrieve>\
+             <met:purgeOnDelete>false</met:purgeOnDelete>\
+             <met:rollbackOnError>true</met:rollbackOnError>\
+             <met:runTests>AccountTriggerTest</met:runTests>\
+             <met:runTests>ContactTriggerTest</met:runTests>\
+             <met:singlePackage>false</met:singlePackage>\
+             <met:testLevel>RunSpecifiedTests</met:testLevel>\
+             </met:DeployOptions>"
+        );
+    }
+
+    /// Eight booleans share two values in the full-set rendering, so it
+    /// cannot tell two options of the same value apart; set alone, each
+    /// renders as the only element, under its own name.
+    #[test]
+    fn each_boolean_deploy_option_renders_only_its_own_element() {
+        type Setter = fn(&mut DeployOptions);
+        let setters: [(&str, Setter); 8] = [
+            ("allowMissingFiles", |o| o.allow_missing_files = Some(true)),
+            ("autoUpdatePackage", |o| o.auto_update_package = Some(true)),
+            ("checkOnly", |o| o.check_only = Some(true)),
+            ("ignoreWarnings", |o| o.ignore_warnings = Some(true)),
+            ("performRetrieve", |o| o.perform_retrieve = Some(true)),
+            ("purgeOnDelete", |o| o.purge_on_delete = Some(true)),
+            ("rollbackOnError", |o| o.rollback_on_error = Some(true)),
+            ("singlePackage", |o| o.single_package = Some(true)),
+        ];
+        for (name, set) in setters {
+            let mut opts = DeployOptions::default();
+            set(&mut opts);
+            let mut rendered = String::new();
+            render_deploy_options(&opts, &mut rendered);
+            assert_eq!(rendered, format!("<met:{name}>true</met:{name}>"));
+        }
+    }
+
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deploy.htm
     /// DeployOptions.runTests: "To use this option, set testLevel to
     /// RunSpecifiedTests." The server rejects any other pairing, so the
     /// client refuses it before encoding and uploading the zip.
@@ -1188,6 +1257,25 @@ mod tests {
         assert!(body.contains("<met:members>OtherClass</met:members>"));
         assert!(body.contains("<met:name>ApexClass</met:name>"));
         assert!(body.contains("<met:version>66.0</met:version>"));
+    }
+
+    /// `singlePackage` is always sent on a retrieve, so `false` is
+    /// rendered rather than omitted.
+    #[test]
+    fn retrieve_op_renders_single_package_false() {
+        let req = RetrieveRequest {
+            api_version: "66.0".into(),
+            single_package: false,
+            ..Default::default()
+        };
+        let body = RetrieveOp { request: req }.render_body().unwrap();
+        assert_eq!(
+            body,
+            "<met:RetrieveRequest>\
+             <met:apiVersion>66.0</met:apiVersion>\
+             <met:singlePackage>false</met:singlePackage>\
+             </met:RetrieveRequest>"
+        );
     }
 
     #[test]

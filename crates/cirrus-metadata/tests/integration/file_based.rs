@@ -26,7 +26,7 @@ use crate::common::try_init_client;
 use bytes::Bytes;
 use cirrus_metadata::{
     DeployOptions, MetadataClient, MetadataError, MetadataType, PackageManifest, RetrieveRequest,
-    RetrieveStatus, WaitConfig,
+    RetrieveStatus, SoapFault, WaitConfig,
 };
 use std::io::Write;
 use std::time::Duration;
@@ -56,6 +56,30 @@ fn build_zip(files: &[(&str, &[u8])]) -> Bytes {
 /// both use the bare numeric form.
 fn pkg_version(md: &MetadataClient) -> String {
     md.api_version().trim_start_matches('v').to_string()
+}
+
+/// True when a fault's message calls the id argument invalid, unknown,
+/// missing or not found: the whole word `id` plus one of those flaws.
+/// Salesforce faultstrings begin with the fault code (`INVALID_ID_FIELD:
+/// ...`), so that prefix is dropped before the words are read, and the
+/// code itself is not tested because Salesforce files refusals about
+/// the state of a valid id under `INVALID_ID_FIELD` too. A test that
+/// passes an id the org just issued reads such a message as a request
+/// element the server did not bind to the id.
+fn faults_the_id(fault: &SoapFault) -> bool {
+    let prefix = format!("{}: ", fault.code());
+    let remainder = fault
+        .faultstring
+        .strip_prefix(&prefix)
+        .unwrap_or(&fault.faultstring)
+        .to_ascii_lowercase();
+    let names_an_id = remainder
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "id");
+    names_an_id
+        && ["invalid", "unknown", "missing", "not found"]
+            .iter()
+            .any(|flaw| remainder.contains(flaw))
 }
 
 /// In-memory deploy zip containing a single empty `<CustomLabels/>`
@@ -261,8 +285,11 @@ async fn deploy_recent_validation_quick_deploys_or_surfaces_typed_error() {
     // no code coverage validated, no components to deploy). What
     // we're exercising is the wire path — the request body, the
     // response shape, the error parsing. *Either* a success
-    // (AsyncResult-with-new-id) or a typed fault is a valid outcome;
-    // only a hard panic or a malformed response shape fails the test.
+    // (AsyncResult-with-new-id) or a typed fault about the validation's
+    // eligibility, `INVALID_ID_FIELD` included, is a valid outcome. A
+    // message calling the id invalid, unknown, missing or not found, a
+    // SOAP `Client` fault, an `UNKNOWN_EXCEPTION` fault, an unexpected
+    // error variant or a malformed response shape fails the test.
     let Some(md) = try_init_client().await else {
         return;
     };
@@ -298,12 +325,46 @@ async fn deploy_recent_validation_quick_deploys_or_surfaces_typed_error() {
             );
         }
         Err(MetadataError::Soap { fault, .. }) => {
-            // Expected on dev/sandbox orgs where the validation has
-            // no Apex tests and no enforced coverage — the server
-            // declines. The contract we care about: the fault parses
-            // to a typed SoapFault with a non-empty faultcode and
-            // faultstring (we'd otherwise be staring at empty strings
-            // and not know what went wrong).
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployRecentValidation.htm
+            // The page lists no faults. It states what a quick deploy
+            // needs: "The components have been validated successfully
+            // for the target environment within the last 10 days.",
+            // "As part of the validation, Apex tests in the target org
+            // have passed." and "Code coverage requirements are met."
+            // The validation phase 1 produced ran no tests, so a
+            // refusal over those requirements is the usual outcome.
+            //
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
+            // That page reports a refusal about the state of a valid
+            // id ("Deployment already completed") under
+            // `INVALID_ID_FIELD`, so the code alone is read as the
+            // eligibility refusal and accepted. What fails the test is a
+            // message calling the id itself invalid, unknown, missing or
+            // not found: the id is the one deploy() just returned, so
+            // the `validationId` element is then not the argument the
+            // server reads.
+            //
+            // Wire-shape provenance: unverified. No documentation page
+            // says what a mis-bound element or an unrecognised id
+            // yields. The expectation for a mis-bound element is a
+            // SOAP-level fault coded `soapenv:Client` (`Client` here)
+            // with a message such as "Element {...}x invalid at this
+            // location" that never says "id", because Salesforce
+            // reports its own application faults under an `sf:` code
+            // and a malformed envelope under the SOAP one. For an id
+            // the server does not recognise it is `UNKNOWN_EXCEPTION`
+            // with the message "invalid parameter value", which does
+            // not say "id" either.
+            if faults_the_id(&fault) || matches!(fault.code(), "Client" | "UNKNOWN_EXCEPTION") {
+                panic!(
+                    "quick-deploy faulted as if the request did not carry the id \
+                     deploy() just returned (a message calling the id invalid, \
+                     unknown, missing or not found, a SOAP Client fault or an \
+                     UNKNOWN_EXCEPTION fault); the `validationId` element may not be \
+                     the argument the server reads: {} / {}",
+                    fault.faultcode, fault.faultstring,
+                );
+            }
             assert!(
                 !fault.code().is_empty(),
                 "SOAP fault on quick-deploy refusal should carry a faultcode",
@@ -405,21 +466,27 @@ async fn failing_apex_deploy_populates_component_failures() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn cancel_deploy_lands_or_surfaces_already_done() {
+async fn cancel_deploy_lands_or_surfaces_a_documented_refusal() {
     // Race-tolerant test of the cancel wire path. Start a deploy and
     // immediately call cancel_deploy. The empty CustomLabels checkOnly
     // completes in ~2 seconds on a free Dev Edition org, so the
     // cancel may land in any of three states:
     //
-    //   1. Deploy still queued/pending — cancel succeeds, server
+    //   1. Deploy still queued or in progress — cancel succeeds, server
     //      returns CancelDeployResult { done: true|false }.
-    //   2. Deploy already in `FinalizingDeploy` or terminal — server
-    //      returns a SOAP fault (commonly INVALID_ID_FIELD or similar
-    //      "operation not allowed" variant).
+    //   2. Deploy already completed — INVALID_ID_FIELD with the message
+    //      `Deployment already completed`.
+    //   3. Deploy in Finalizing Deploy (API 65.0+) — INVALID_ID_FIELD
+    //      with the message `You cannot cancel the deployment while
+    //      finalizing is in progress`.
     //
-    // The point of this test is the wire path: the SOAP envelope
-    // shape, the response/fault parsing. Either outcome verifies the
-    // contract.
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_canceldeploy.htm
+    // Those are two of the three faults the page lists. The third,
+    // `Invalid deploy ID` ("The specified ID argument doesn't
+    // correspond to a valid deployment."), fails the test: the id came
+    // straight from deploy(), so it means the `asyncProcessId` request
+    // element, which the page does not spell out, is not the one the
+    // server reads. Any other fault fails the test too.
     let Some(md) = try_init_client().await else {
         return;
     };
@@ -449,16 +516,20 @@ async fn cancel_deploy_lands_or_surfaces_already_done() {
                 .await;
         }
         Err(MetadataError::Soap { fault, .. }) => {
-            // Deploy already finalized — server rejects the cancel.
-            // We still want the typed fault to carry usable diagnostics.
-            assert!(
-                !fault.code().is_empty(),
-                "SOAP fault on cancel-after-completion should carry a faultcode",
-            );
-            assert!(
-                !fault.faultstring.is_empty(),
-                "SOAP fault on cancel-after-completion should carry a non-empty faultstring",
-            );
+            let documented_race = fault.code() == "INVALID_ID_FIELD"
+                && [
+                    "Deployment already completed",
+                    "You cannot cancel the deployment while finalizing is in progress",
+                ]
+                .iter()
+                .any(|message| fault.faultstring.contains(message));
+            if !documented_race {
+                panic!(
+                    "cancel_deploy faulted with something other than a documented \
+                     already-completed or finalizing refusal: {} / {}",
+                    fault.faultcode, fault.faultstring,
+                );
+            }
         }
         Err(e) => {
             panic!(

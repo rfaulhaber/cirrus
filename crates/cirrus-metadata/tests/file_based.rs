@@ -912,6 +912,10 @@ async fn check_retrieve_status_parses_failure_messages() {
 /// checkDeployStatus() takes an id and an `includeDetails` flag, and
 /// the same page prescribes issuing it "in a loop until the done field
 /// of the returned DeployResult contains true".
+///
+/// Every poll asks for no details; the one fetch after the deploy is
+/// done asks for them, and the `DeployDetails` it returns reach the
+/// result.
 #[tokio::test]
 async fn wait_for_deploy_polls_until_done() {
     let server = MockServer::start().await;
@@ -920,14 +924,17 @@ async fn wait_for_deploy_polls_until_done() {
     // and the third returns Succeeded. wiremock's `up_to_n_times`
     // composes awkwardly with two paired Mocks; an AtomicUsize-keyed
     // matcher keeps the test readable.
-    let counter = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
 
     Mock::given(method("POST"))
         .and(body_string_contains("<met:checkDeployStatus>"))
+        .and(body_string_contains(
+            "<met:includeDetails>false</met:includeDetails>",
+        ))
         .respond_with({
-            let counter = counter.clone();
+            let polls = polls.clone();
             move |_: &wiremock::Request| {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let n = polls.fetch_add(1, Ordering::SeqCst);
                 let (done, status) = if n < 2 {
                     ("false", "InProgress")
                 } else {
@@ -952,6 +959,46 @@ async fn wait_for_deploy_polls_until_done() {
                     ))
             }
         })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_deployresult.htm
+    // DeployDetails `componentSuccesses`, type DeployMessage[]: "One or
+    // more DeployMessage objects containing successful deployment
+    // details for each component."
+    Mock::given(method("POST"))
+        .and(body_string_contains("<met:checkDeployStatus>"))
+        .and(body_string_contains(
+            "<met:includeDetails>true</met:includeDetails>",
+        ))
+        .respond_with(xml_response(
+            r#"<?xml version="1.0"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <checkDeployStatusResponse xmlns="http://soap.sforce.com/2006/04/metadata">
+      <result>
+        <id>0Af00000poll</id>
+        <done>true</done>
+        <success>true</success>
+        <status>Succeeded</status>
+        <details>
+          <componentSuccesses>
+            <componentType>ApexClass</componentType>
+            <fullName>Foo</fullName>
+            <fileName>classes/Foo.cls</fileName>
+            <success>true</success>
+            <changed>false</changed>
+            <created>true</created>
+            <deleted>false</deleted>
+          </componentSuccesses>
+        </details>
+      </result>
+    </checkDeployStatusResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"#,
+        ))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -971,12 +1018,15 @@ async fn wait_for_deploy_polls_until_done() {
         .unwrap();
 
     assert_eq!(result.status, Some(DeployStatus::Succeeded));
-    // 3 intermediate polls (InProgress, InProgress, Succeeded) plus 1
-    // final include_details=true fetch once the deploy reached a
-    // terminal state — the polling loop deliberately skips details on
+    let details = result.details.unwrap();
+    assert_eq!(details.component_successes.len(), 1);
+    assert_eq!(details.component_successes[0].full_name, Some("Foo".into()));
+    // 3 intermediate polls (InProgress, InProgress, Succeeded); the
+    // include_details=true fetch that follows is counted by its own
+    // mock. The polling loop deliberately skips details on
     // intermediate iterations because the response grows with every
     // processed component on large deploys.
-    assert_eq!(counter.load(Ordering::SeqCst), 4);
+    assert_eq!(polls.load(Ordering::SeqCst), 3);
 }
 
 /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_checkdeploystatus.htm

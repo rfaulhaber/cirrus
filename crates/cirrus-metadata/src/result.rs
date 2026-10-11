@@ -1749,6 +1749,40 @@ mod tests {
         }
     }
 
+    /// SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_retrieveresult.htm
+    /// FileProperties.manageableState is a "ManageableState (enumeration
+    /// of type string)" that "Indicates the manageable state of the
+    /// specified component if it's contained in a package": beta,
+    /// deleted, deprecated, deprecatedEditable, installed,
+    /// installedEditable, released, and unmanaged. The `Unknown`
+    /// fallback would absorb a literal the enum's casing failed to
+    /// match, so every documented literal is pinned here.
+    #[test]
+    fn manageable_state_literals_match_the_documented_set() {
+        #[derive(Deserialize)]
+        struct Wire {
+            state: ManageableState,
+        }
+        fn parse(literal: &str) -> ManageableState {
+            let wire: Wire =
+                quick_xml::de::from_str(&format!("<Wire><state>{literal}</state></Wire>")).unwrap();
+            wire.state
+        }
+
+        for (literal, expected) in [
+            ("beta", ManageableState::Beta),
+            ("deleted", ManageableState::Deleted),
+            ("deprecated", ManageableState::Deprecated),
+            ("deprecatedEditable", ManageableState::DeprecatedEditable),
+            ("installed", ManageableState::Installed),
+            ("installedEditable", ManageableState::InstalledEditable),
+            ("released", ManageableState::Released),
+            ("unmanaged", ManageableState::Unmanaged),
+        ] {
+            assert_eq!(parse(literal), expected, "literal {literal}");
+        }
+    }
+
     const EVERY_TEST_LEVEL: [TestLevel; 5] = [
         TestLevel::NoTestRun,
         TestLevel::RunSpecifiedTests,

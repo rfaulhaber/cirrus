@@ -11,7 +11,8 @@
 //! - non-envelope body → `MetadataError::Http4xx5xx`,
 //! - 3xx redirect → surfaced as an error, never followed,
 //! - builder read timeout → transport error once the deadline passes,
-//! - a body that stops mid-stream → replayed like a failed send.
+//! - a body that stops mid-stream → replayed like a failed send for a
+//!   replay-safe op, surfaced for any other.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -23,7 +24,7 @@ use cirrus_metadata::{
 };
 use serde::Deserialize;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
@@ -375,13 +376,15 @@ async fn invalid_session_triggers_token_refresh_and_retry() {
 async fn invalid_session_with_unrefreshable_auth_surfaces_fault() {
     let server = MockServer::start().await;
 
-    // Static auth can't refresh — every request uses the same token.
+    // Static auth can't refresh — every request uses the same token, so
+    // the fault surfaces without a second request.
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(500)
                 .insert_header("content-type", "text/xml; charset=UTF-8")
                 .set_body_string(fault_body("INVALID_SESSION_ID", "session expired")),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -399,6 +402,36 @@ async fn invalid_session_with_unrefreshable_auth_surfaces_fault() {
         }
         other => panic!("expected Soap error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_refreshed_token_the_org_also_rejects_surfaces_the_fault() {
+    let server = MockServer::start().await;
+
+    // The session is refreshed once per call: when the org rejects the
+    // fresh token as well, the fault surfaces rather than rotating
+    // through every token the session can mint.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(fault_body("INVALID_SESSION_ID", "session expired")),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let auth = RotatingAuth::new(server.uri(), vec!["a", "b", "c"]);
+    let md = client_for(&server, auth.clone());
+
+    let err = md.call(&Ping).await.unwrap_err();
+    match err {
+        MetadataError::Soap { fault, .. } => {
+            assert_eq!(fault.code(), "INVALID_SESSION_ID");
+        }
+        other => panic!("expected Soap error, got {other:?}"),
+    }
+    assert_eq!(auth.invalidations(), vec!["a".to_string()]);
 }
 
 #[tokio::test]
@@ -650,6 +683,89 @@ async fn transient_fault_on_idempotent_op_is_retried() {
 }
 
 #[tokio::test]
+async fn a_transient_fault_is_not_retried_for_a_non_idempotent_op() {
+    let server = MockServer::start().await;
+
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_calls_concepts_core_data_objects.htm
+    // ExceptionCode SERVER_UNAVAILABLE: "A server that's necessary for
+    // this call is unavailable. Other types of requests could still
+    // work." A 5xx can follow work the org already did, so a mutating
+    // operation surfaces even a transient fault rather than replaying
+    // it.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(fault_body("SERVER_UNAVAILABLE", "try again")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = client_for(&server, auth);
+
+    // The bound keeps a retry loop that lost its guard from hanging the
+    // suite.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), md.call(&Mutate))
+        .await
+        .expect("the call was replayed instead of surfacing the fault");
+    match result.unwrap_err() {
+        MetadataError::Soap { status, fault, .. } => {
+            assert_eq!(status, 500);
+            assert_eq!(fault.code(), "SERVER_UNAVAILABLE");
+        }
+        other => panic!("expected Soap error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_transient_fault_is_retried_only_up_to_max_retries() {
+    let server = MockServer::start().await;
+
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_calls_concepts_core_data_objects.htm
+    // ExceptionCode SERVER_UNAVAILABLE: "A server that's necessary for
+    // this call is unavailable. Other types of requests could still
+    // work." A fault that never clears is replayed `max_retries` times
+    // and then surfaces.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/xml; charset=UTF-8")
+                .set_body_string(fault_body("SERVER_UNAVAILABLE", "try again")),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", server.uri()));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .retry_policy(RetryPolicy {
+            max_retries: 2,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            jitter: false,
+            ..RetryPolicy::default()
+        })
+        .build()
+        .unwrap();
+
+    // The bound keeps a retry loop that lost its cap from hanging the
+    // suite.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), md.call(&Ping))
+        .await
+        .expect("the retry loop did not stop at max_retries");
+    match result.unwrap_err() {
+        MetadataError::Soap { status, fault, .. } => {
+            assert_eq!(status, 500);
+            assert_eq!(fault.code(), "SERVER_UNAVAILABLE");
+        }
+        other => panic!("expected Soap error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn invalid_session_refresh_does_not_resend_the_stale_token() {
     let server = MockServer::start().await;
 
@@ -770,6 +886,23 @@ async fn the_builder_read_timeout_bounds_a_call_the_org_never_answers() {
     }
 }
 
+/// Serves one connection on `listener` a response whose body dies
+/// early: headers promising 400 bytes, a fragment, then a hang-up.
+async fn answer_with_a_truncated_body(listener: &tokio::net::TcpListener) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 8192];
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let _ = sock.read(&mut buf).await;
+    sock.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 400\r\n\r\n<?xml version=\"1.0\"?><soapenv:Envelope",
+    )
+    .await
+    .unwrap();
+    sock.flush().await.unwrap();
+    drop(sock);
+}
+
 #[tokio::test]
 async fn a_response_body_that_stops_mid_stream_is_replayed() {
     // A body failure arrives after the response head, so it can't be
@@ -786,18 +919,9 @@ async fn a_response_body_that_stops_mid_stream_is_replayed() {
     let addr = listener.local_addr().unwrap();
     let body = success_body("hello");
     let server = tokio::spawn(async move {
+        answer_with_a_truncated_body(&listener).await;
+
         let mut buf = [0u8; 8192];
-
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let _ = sock.read(&mut buf).await;
-        sock.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 400\r\n\r\n<?xml version=\"1.0\"?><soapenv:Envelope",
-        )
-        .await
-        .unwrap();
-        sock.flush().await.unwrap();
-        drop(sock);
-
         let (mut sock, _) = listener.accept().await.unwrap();
         let _ = sock.read(&mut buf).await;
         sock.write_all(
@@ -835,6 +959,59 @@ async fn a_response_body_that_stops_mid_stream_is_replayed() {
         }
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_response_body_that_stops_mid_stream_is_not_replayed_for_a_non_idempotent_op() {
+    // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_checkretrievestatus.htm
+    // "By default, `checkRetrieveStatus()` returns the zip file on the
+    // last call to this operation when the retrieval is completed
+    // (`RetrieveResult.isDone() == true)` and then deletes the zip file
+    // from the server." A body that dies after the head may mean the
+    // org already served it, so an operation not declared replay-safe
+    // surfaces the failure instead of asking again. The listener counts
+    // every connection after the first as it accepts it. A replay
+    // cannot end until the listener has accepted, counted and hung up
+    // on it, or the client would sit out its read timeout, so no timer
+    // is needed to see one.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let replays = Arc::new(AtomicUsize::new(0));
+    let server = tokio::spawn({
+        let replays = replays.clone();
+        async move {
+            answer_with_a_truncated_body(&listener).await;
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                replays.fetch_add(1, Ordering::SeqCst);
+                drop(sock);
+            }
+        }
+    });
+
+    let auth = Arc::new(StaticTokenAuth::new("tok", format!("http://{addr}")));
+    let md = MetadataClient::builder()
+        .auth(auth)
+        .retry_policy(RetryPolicy {
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            jitter: false,
+            ..RetryPolicy::default()
+        })
+        .build()
+        .unwrap();
+
+    let err = md.call(&Mutate).await.unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Http(_)),
+        "expected a transport error, got {err:?}"
+    );
+    server.abort();
+    assert_eq!(
+        replays.load(Ordering::SeqCst),
+        0,
+        "a second connection was opened to replay the request"
+    );
 }
 
 // -- Transport security (shared rule with cirrus) -----------------------------

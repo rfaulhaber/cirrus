@@ -881,6 +881,22 @@ mod tests {
     }
 
     #[test]
+    fn rename_op_escapes_special_chars_in_type_and_both_names() {
+        let op = RenameMetadataOp {
+            type_name: r#"Custom"Type"#,
+            old_full_name: "A&B",
+            new_full_name: "C<D",
+        };
+        let body = op.render_body().unwrap();
+        assert_eq!(
+            body,
+            "<met:type>Custom&quot;Type</met:type>\
+             <met:oldFullName>A&amp;B</met:oldFullName>\
+             <met:newFullName>C&lt;D</met:newFullName>"
+        );
+    }
+
+    #[test]
     fn render_escapes_special_chars_in_type_and_names() {
         let op = DeleteMetadataOp {
             type_name: "Weird<>",
