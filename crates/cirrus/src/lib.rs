@@ -3970,6 +3970,101 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn limit_info_is_captured_from_an_error_response() {
+            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
+            // 403: "If the error code is REQUEST_LIMIT_EXCEEDED, you've
+            // exceeded API request limits in your org." The refusal is
+            // the response a caller most wants the counts from, and it
+            // is never retried; the message text is illustrative.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .set_body_json(json!([{
+                            "message": "TotalRequests Limit exceeded.",
+                            "errorCode": "REQUEST_LIMIT_EXCEEDED"
+                        }]))
+                        .insert_header("Sforce-Limit-Info", "api-usage=15000/15000"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let err = sf.get::<Value>("limits").await.unwrap_err();
+            assert!(matches!(err, CirrusError::Api { status: 403, .. }), "{err}");
+
+            let info = sf.last_limit_info().expect("limit info should be set");
+            assert_eq!(info.used, 15000);
+            assert_eq!(info.allowed, 15000);
+        }
+
+        #[tokio::test]
+        async fn limit_info_from_a_retried_response_outlives_a_headerless_success() {
+            // The header is read from every attempt, not only the one
+            // that settles the call, and a response without it leaves
+            // the last value in place.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .insert_header("Sforce-Limit-Info", "api-usage=20/100"),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), fast_retry_policy());
+            let v: Value = sf.get("limits").await.unwrap();
+            assert_eq!(v["ok"], true);
+
+            let info = sf.last_limit_info().expect("limit info should be set");
+            assert_eq!(info.used, 20);
+            assert_eq!(info.allowed, 100);
+        }
+
+        #[tokio::test]
+        async fn cloned_clients_share_the_last_limit_info() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"ok": true}))
+                        .insert_header("Sforce-Limit-Info", "api-usage=30/100"),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/services/data/v66.0/limits"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"ok": true}))
+                        .insert_header("Sforce-Limit-Info", "api-usage=31/100"),
+                )
+                .mount(&server)
+                .await;
+
+            let sf = fixture_with_policy(server.uri(), RetryPolicy::none());
+            let sf2 = sf.clone();
+            assert!(sf2.last_limit_info().is_none());
+
+            let _: Value = sf.get("limits").await.unwrap();
+            assert_eq!(sf2.last_limit_info().unwrap().used, 30);
+
+            let _: Value = sf2.get("limits").await.unwrap();
+            assert_eq!(sf.last_limit_info().unwrap().used, 31);
+        }
+
+        #[tokio::test]
         async fn malformed_limit_info_header_is_ignored() {
             let server = MockServer::start().await;
 
