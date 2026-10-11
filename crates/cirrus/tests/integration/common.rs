@@ -288,6 +288,53 @@ fn build_auth(instance_url: &str) -> SharedAuth {
     Arc::new(auth)
 }
 
+/// RAII guard that deletes a planted Account when dropped, so a test
+/// that panics after its create still removes the record. The delete is
+/// best-effort: a failure is reported on stderr and never panics.
+///
+/// `Drop` is synchronous, so the delete bridges to async through
+/// `block_in_place`, which requires a multi-thread runtime. Every test
+/// that holds a guard must be `#[tokio::test(flavor = "multi_thread")]`.
+///
+/// Salesforce answers a repeated delete with 404, so a guard that fires
+/// after an explicit delete is harmless; [`disarm`](Self::disarm) only
+/// skips the extra call.
+pub struct AccountCleanup<'a> {
+    sf: &'a Cirrus,
+    id: Option<String>,
+}
+
+impl<'a> AccountCleanup<'a> {
+    /// Arms a guard that deletes the Account `id` on drop.
+    pub fn new(sf: &'a Cirrus, id: String) -> Self {
+        Self { sf, id: Some(id) }
+    }
+
+    /// Cancels the delete on drop. Call it after the record has been
+    /// deleted explicitly.
+    pub fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for AccountCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let sf = self.sf.clone();
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    if let Err(e) = sf.sobject("Account").delete(&id).await {
+                        eprintln!(
+                            "cleanup warning: failed to delete Account {id}: {e} \
+                             (will need manual cleanup)",
+                        );
+                    }
+                });
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_safe_test_url;

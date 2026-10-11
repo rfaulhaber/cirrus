@@ -16,7 +16,7 @@
 //!   moderate-frequency use; can be added later when there's a real
 //!   regression to guard against.
 
-use crate::common::try_init_client;
+use crate::common::{AccountCleanup, try_init_client};
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -51,6 +51,12 @@ async fn composite_sobjects_create_then_delete() {
         .create(&body)
         .await
         .expect("composite create should succeed");
+    let ids: Vec<String> = results.iter().filter_map(|r| r.id.clone()).collect();
+    let mut cleanups: Vec<_> = ids
+        .iter()
+        .map(|id| AccountCleanup::new(&sf, id.clone()))
+        .collect();
+
     assert_eq!(results.len(), 3, "should get one result per input record");
     for r in &results {
         assert!(r.success, "all three creates should succeed: {r:?}");
@@ -61,7 +67,6 @@ async fn composite_sobjects_create_then_delete() {
             "Account IDs start with 001, got {id}"
         );
     }
-    let ids: Vec<String> = results.iter().filter_map(|r| r.id.clone()).collect();
 
     // Now delete them via composite — exercises the delete variant too.
     let del_results = sf
@@ -73,6 +78,9 @@ async fn composite_sobjects_create_then_delete() {
     assert_eq!(del_results.len(), 3, "one result per id");
     for r in &del_results {
         assert!(r.success, "all deletes should succeed: {r:?}");
+    }
+    for cleanup in &mut cleanups {
+        cleanup.disarm();
     }
 }
 
@@ -144,20 +152,15 @@ async fn composite_sobjects_retrieve_typed() {
         .await
         .unwrap();
     let id = created.id.clone();
+    let _cleanup = AccountCleanup::new(&sf, created.id);
 
-    let result = async {
-        let rows: Vec<IdEnvelope> = sf
-            .composite()
-            .sobjects()
-            .retrieve_as("Account", &[&id], &["Id", "Name"])
-            .await
-            .expect("composite retrieve_as should succeed");
-        assert_eq!(rows.len(), 1, "asked for one id, expect one row");
-        assert_eq!(rows[0].id, id);
-        assert_eq!(rows[0].name, name);
-    }
-    .await;
-
-    let _ = sf.sobject("Account").delete(&id).await;
-    result
+    let rows: Vec<IdEnvelope> = sf
+        .composite()
+        .sobjects()
+        .retrieve_as("Account", &[&id], &["Id", "Name"])
+        .await
+        .expect("composite retrieve_as should succeed");
+    assert_eq!(rows.len(), 1, "asked for one id, expect one row");
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].name, name);
 }
