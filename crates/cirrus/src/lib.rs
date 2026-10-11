@@ -3982,8 +3982,8 @@ mod tests {
 
         #[tokio::test]
         async fn limit_info_is_captured_from_an_error_response() {
-            // SOURCE: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/errorcodes.htm
-            // 403: "If the error code is REQUEST_LIMIT_EXCEEDED, you've
+            // SOURCE: https://developer.salesforce.com/docs/platform/api-rest/guide/errorcodes.html
+            // 403: "If the error code is REQUEST_LIMIT_EXCEEDED, you’ve
             // exceeded API request limits in your org." The refusal is
             // the response a caller most wants the counts from, and it
             // is never retried; the message text is illustrative.
@@ -4129,8 +4129,8 @@ mod tests {
         #[tokio::test]
         async fn retry_after_http_date_overrides_backoff() {
             // SOURCE: https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3
-            // Retry-After may be an HTTP-date in place of delta-seconds;
-            // a date already past means "now".
+            // Retry-After may be an HTTP-date in place of a seconds count;
+            // `parse_retry_after` clamps a date already past to zero.
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))

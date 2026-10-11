@@ -1193,9 +1193,9 @@ impl ApiVersion {
     /// pair are ignored, so the returned entry always carries a version
     /// string usable as a `vXX.X` path segment. When the `latest` alias
     /// entry ties with the newest numeric version, the entry whose URL
-    /// names that version is returned, so `url` is always a versioned
-    /// path when one exists. Returns `None` when the slice is empty or
-    /// holds nothing parseable.
+    /// names that version is returned, so `url` is the versioned path
+    /// whenever an entry with one carries that version. Returns `None`
+    /// when the slice is empty or holds nothing parseable.
     pub fn latest(versions: &[Self]) -> Option<&Self> {
         versions
             .iter()

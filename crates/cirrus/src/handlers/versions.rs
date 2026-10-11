@@ -361,7 +361,8 @@ mod tests {
 
     #[tokio::test]
     async fn latest_api_version_skips_the_documented_alias_entry() {
-        // Copied from the "List Available REST API Versions" example:
+        // The last four entries of the "List Available REST API Versions"
+        // example:
         // https://developer.salesforce.com/docs/platform/api-rest/guide/dome-versions.html
         // The page ends the list with a `Latest Release` entry for the
         // `/services/data/latest` alias; its `version` of `XX.0` is the
