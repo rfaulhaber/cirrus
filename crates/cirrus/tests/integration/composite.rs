@@ -76,11 +76,18 @@ async fn composite_sobjects_create_then_delete() {
         .await
         .expect("composite delete should succeed");
     assert_eq!(del_results.len(), 3, "one result per id");
+    // Disarm a guard only once its own delete has succeeded, so a partial
+    // failure leaves exactly the surviving records to the guards.
+    for (id, cleanup) in ids.iter().zip(&mut cleanups) {
+        if del_results
+            .iter()
+            .any(|r| r.success && r.id.as_deref() == Some(id))
+        {
+            cleanup.disarm();
+        }
+    }
     for r in &del_results {
         assert!(r.success, "all deletes should succeed: {r:?}");
-    }
-    for cleanup in &mut cleanups {
-        cleanup.disarm();
     }
 }
 
