@@ -100,24 +100,15 @@ async fn latest_api_version_returns_v_prefixed_string() {
 #[ignore]
 async fn build_with_latest_version_uses_negotiated_value() {
     use cirrus::Cirrus;
-    use cirrus::auth::StaticTokenAuth;
-    use std::sync::Arc;
 
     let Some(bootstrap) = try_init_client().await else {
         return;
     };
     let latest = bootstrap.latest_api_version().await.unwrap();
 
-    // Reconstruct via build_with_latest_version using the same auth/url.
-    // We can't easily re-use bootstrap's auth (it's behind dyn AuthSession),
-    // so reach into env directly for the static-token path. JWT path is
-    // already covered by mint events in unit tests.
-    let Ok(token) = std::env::var(super::common::ENV_ACCESS_TOKEN) else {
-        eprintln!("skipping: build_with_latest_version test requires static-token mode");
-        return;
-    };
-    let url = std::env::var(super::common::ENV_INSTANCE_URL).unwrap();
-    let auth = Arc::new(StaticTokenAuth::new(token, url));
+    // Reusing the bootstrap session's auth runs this in both static-token
+    // and JWT mode.
+    let auth = bootstrap.auth().clone();
     let sf = Cirrus::builder()
         .auth(auth)
         .build_with_latest_version()
