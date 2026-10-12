@@ -130,7 +130,7 @@ you need anything beyond `deployRequest`.
 
 ```toml
 [dependencies]
-cirrus-metadata = "0.4.0"
+cirrus-metadata = "0.5.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -217,7 +217,7 @@ full table:
 
 ```toml
 [dependencies]
-cirrus-metadata = { version = "0.4.0", default-features = false, features = ["native-tls"] }
+cirrus-metadata = { version = "0.5.0", default-features = false, features = ["native-tls"] }
 ```
 
 The features forward to reqwest and unify across the build like reqwest's own,

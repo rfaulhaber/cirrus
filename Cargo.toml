@@ -22,8 +22,8 @@ homepage = "https://github.com/rfaulhaber/cirrus"
 # Without defaults so that each consumer crate's own feature table, not
 # cirrus-auth's default, decides the TLS backend; Cargo only lets a
 # member turn defaults off when the workspace entry already has.
-cirrus-auth = { path = "crates/cirrus-auth", version = "0.4.2", default-features = false }
-cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.4.0" }
+cirrus-auth = { path = "crates/cirrus-auth", version = "0.5.0", default-features = false }
+cirrus-metadata = { path = "crates/cirrus-metadata", version = "0.5.0" }
 
 # Runtime / HTTP
 # Only what every client needs. `gzip` makes reqwest send

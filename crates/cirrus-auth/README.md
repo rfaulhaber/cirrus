@@ -180,7 +180,7 @@ Pick a backend other than the default with `default-features = false`:
 
 ```toml
 [dependencies]
-cirrus-auth = { version = "0.4.2", default-features = false, features = ["native-tls"] }
+cirrus-auth = { version = "0.5.0", default-features = false, features = ["native-tls"] }
 ```
 
 Enabling both backends is allowed and makes reqwest default to `native-tls`.
