@@ -82,7 +82,7 @@ tracing-core = "0.1"
 # `zip` is used only by integration tests that build a minimal deploy
 # zip (cirrus-metadata). Pulling it into dev-dependencies keeps the
 # published crate's dependency surface unchanged.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 [workspace.lints.clippy]
 await_holding_invalid_type = "deny"
