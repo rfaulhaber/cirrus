@@ -11,7 +11,10 @@
 
 use crate::error::{AuthError, AuthResult};
 use crate::transport::{CollectBodyError, collect_body};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 /// Margin subtracted from a cached token's lifetime when deciding whether
@@ -380,44 +383,68 @@ const REDACTED: &str = "[redacted]";
 
 /// The [`AuthError::OAuth`] for a parsed error body: the description is
 /// scrubbed of the request's own form values and of the credentials a
-/// Basic header carried in place of form values, then capped before it
-/// is stored, so no later `Display` or `Debug` can leak what the request
-/// sent.
+/// Basic header carried in place of form values, each half and the
+/// header's Base64 value alike, then capped before it is stored, so no
+/// later `Display` or `Debug` can leak what the request sent.
 fn oauth_error(
     response: OAuthErrorResponse,
     form: &[(&str, &str)],
     client_auth: ClientAuth<'_>,
 ) -> AuthError {
-    let header_pair = match client_auth {
+    let encoded_pair;
+    let header_values = match client_auth {
         ClientAuth::Form => Vec::new(),
         ClientAuth::Basic {
             client_id,
             client_secret,
-        } => vec![("client_id", client_id), ("client_secret", client_secret)],
+        } => {
+            // The value reqwest's `basic_auth` puts on the wire: standard
+            // Base64, padded.
+            encoded_pair = BASE64_STANDARD.encode(format!("{client_id}:{client_secret}"));
+            vec![
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("authorization", encoded_pair.as_str()),
+            ]
+        }
     };
     AuthError::OAuth {
         error: response.error,
         error_description: response.error_description.map(|description| {
-            scrub_description(description, form.iter().copied().chain(header_pair))
+            scrub_description(description, form.iter().copied().chain(header_values))
         }),
     }
 }
 
-/// Replaces every non-public value the request sent that appears
-/// verbatim in `description` with [`REDACTED`], then cuts the text to
-/// [`OAUTH_ERROR_DESCRIPTION_CAP`] characters. Scrubbing runs first so a
-/// value straddling the cut cannot survive it in part.
+/// Replaces every non-public value the request sent with [`REDACTED`]
+/// wherever `description` quotes it, then cuts the text to
+/// [`OAUTH_ERROR_DESCRIPTION_CAP`] characters. A value is matched both
+/// as written and in the `application/x-www-form-urlencoded` spelling
+/// the form body carried it in, since a server may echo either. Longer
+/// values are replaced first, so a value containing another is redacted
+/// whole rather than split around the shorter one's redaction, and
+/// scrubbing runs before the cut so a value straddling it cannot survive
+/// in part.
 fn scrub_description<'a>(
     description: String,
     sent: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
-    let mut text = description;
+    let mut spellings: Vec<Cow<'a, str>> = Vec::new();
     for (name, value) in sent {
         if value.is_empty() || PUBLIC_FORM_PARAMETERS.contains(&name) {
             continue;
         }
-        if text.contains(value) {
-            text = text.replace(value, REDACTED);
+        let encoded: String = url::form_urlencoded::byte_serialize(value.as_bytes()).collect();
+        if encoded != value {
+            spellings.push(Cow::Owned(encoded));
+        }
+        spellings.push(Cow::Borrowed(value));
+    }
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    let mut text = description;
+    for spelling in &spellings {
+        if text.contains(spelling.as_ref()) {
+            text = text.replace(spelling.as_ref(), REDACTED);
         }
     }
     if let Some((cut, _)) = text.char_indices().nth(OAUTH_ERROR_DESCRIPTION_CAP) {
@@ -1172,61 +1199,124 @@ mod tests {
         // The credentials leave the form when they move to the header,
         // and the form is what the scrub reads, so the header's pair is
         // scrubbed on its own.
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
-        let server = wiremock::MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/services/oauth2/token"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        let description = oauth_error_description(
+            serde_json::json!({
                 "error": "invalid_client",
                 "error_description": "MyClientID presented MyClientSecret",
-            })))
-            .mount(&server)
-            .await;
-        let http = token_client_builder().build().unwrap();
-        let err = exchange(
-            &http,
-            &server.uri(),
+            }),
             &[("grant_type", "client_credentials")],
             ClientAuth::Basic {
                 client_id: "MyClientID",
                 client_secret: "MyClientSecret",
             },
-            GrantReplay::Safe,
+            wiremock::matchers::any(),
         )
-        .await
-        .unwrap_err();
-        match err {
-            AuthError::OAuth {
-                error_description: Some(description),
-                ..
-            } => assert_eq!(description, "[redacted] presented [redacted]"),
-            other => panic!("expected an OAuth error with a description, got {other:?}"),
-        }
+        .await;
+        assert_eq!(description, "[redacted] presented [redacted]");
     }
 
+    #[tokio::test]
+    async fn a_description_quoting_the_basic_header_is_scrubbed() {
+        // The header carries the pair as one Base64 value, which hands
+        // over the secret to anyone who decodes it. The value is the one
+        // `basic_client_auth_puts_the_credentials_in_the_header_and_not_the_body`
+        // pins from the client credentials page, and the stub answers only
+        // a request whose header carries it.
+        let description = oauth_error_description(
+            serde_json::json!({
+                "error": "invalid_client",
+                "error_description":
+                    "invalid client credentials: Basic TXlDbGllbnRJRDpNeUNsaWVudFNlY3JldA==",
+            }),
+            &[("grant_type", "client_credentials")],
+            ClientAuth::Basic {
+                client_id: "MyClientID",
+                client_secret: "MyClientSecret",
+            },
+            wiremock::matchers::header(
+                "authorization",
+                "Basic TXlDbGllbnRJRDpNeUNsaWVudFNlY3JldA==",
+            ),
+        )
+        .await;
+        assert_eq!(description, "invalid client credentials: Basic [redacted]");
+    }
+
+    #[tokio::test]
+    async fn a_description_quoting_a_form_encoded_value_is_scrubbed() {
+        // SOURCE: https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5
+        // (release 264): the token request example's code ends in `==`,
+        // which the form body carries as `%3D%3D`; the stub answers only a
+        // body carrying that spelling. A public parameter stays readable
+        // in its encoded spelling too.
+        let description = oauth_error_description(
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "code aPrxhgZ2MIpkSy0aOdn07LjKFvsFOis6RGcWXz7p8JQCjcqfed5NQLe7sxWwMY_JQFuLwHRaRA%3D%3D \
+                    was not issued for https%3A%2F%2Fwww.mycustomerorderstatus.com%2Foauth2%2Fcallback",
+            }),
+            &[
+                ("grant_type", "authorization_code"),
+                (
+                    "code",
+                    "aPrxhgZ2MIpkSy0aOdn07LjKFvsFOis6RGcWXz7p8JQCjcqfed5NQLe7sxWwMY_JQFuLwHRaRA==",
+                ),
+                (
+                    "redirect_uri",
+                    "https://www.mycustomerorderstatus.com/oauth2/callback",
+                ),
+            ],
+            ClientAuth::Form,
+            wiremock::matchers::body_string_contains(
+                "code=aPrxhgZ2MIpkSy0aOdn07LjKFvsFOis6RGcWXz7p8JQCjcqfed5NQLe7sxWwMY_JQFuLwHRaRA%3D%3D&",
+            ),
+        )
+        .await;
+        assert_eq!(
+            description,
+            "code [redacted] was not issued for \
+             https%3A%2F%2Fwww.mycustomerorderstatus.com%2Foauth2%2Fcallback"
+        );
+    }
+
+    #[test]
+    fn a_value_containing_another_is_scrubbed_whole() {
+        // Replacing the shorter value first would split the longer one
+        // and leave the rest of it readable, whatever order the request
+        // listed them in.
+        let description = scrub_description(
+            "refresh token consumer-key-123.rotated is revoked".to_string(),
+            [
+                ("client_id", "consumer-key-123"),
+                ("refresh_token", "consumer-key-123.rotated"),
+            ],
+        );
+        assert_eq!(description, "refresh token [redacted] is revoked");
+    }
+
+    /// Runs one token request against a stub that answers `server_body`
+    /// with a 400 and returns the stored description. The stub answers
+    /// only a request `sent` matches, so a test can pin the spelling a
+    /// value had on the wire.
     async fn oauth_error_description(
         server_body: serde_json::Value,
         form: &[(&str, &str)],
+        client_auth: ClientAuth<'_>,
+        sent: impl wiremock::Match + 'static,
     ) -> String {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/services/oauth2/token"))
+            .and(sent)
             .respond_with(ResponseTemplate::new(400).set_body_json(server_body))
             .mount(&server)
             .await;
         let http = token_client_builder().build().unwrap();
-        let err = exchange(
-            &http,
-            &server.uri(),
-            form,
-            ClientAuth::Form,
-            GrantReplay::Safe,
-        )
-        .await
-        .unwrap_err();
+        let err = exchange(&http, &server.uri(), form, client_auth, GrantReplay::Safe)
+            .await
+            .unwrap_err();
         match err {
             AuthError::OAuth {
                 error_description: Some(description),
@@ -1252,6 +1342,8 @@ mod tests {
                 ("client_id", "consumer-key-123"),
                 ("client_secret", "hunter2"),
             ],
+            ClientAuth::Form,
+            wiremock::matchers::any(),
         )
         .await;
         assert_eq!(
@@ -1268,6 +1360,8 @@ mod tests {
                 "error_description": "é".repeat(2_000),
             }),
             &[("grant_type", "client_credentials")],
+            ClientAuth::Form,
+            wiremock::matchers::any(),
         )
         .await;
         assert!(description.chars().count() <= 300, "{}", description.len());
