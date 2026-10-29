@@ -9,3 +9,12 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # One flake.lock bump per week rather than one PR per input.
+    groups:
+      flake-inputs:
+        patterns:
+          - "*"
