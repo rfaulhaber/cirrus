@@ -68,7 +68,7 @@ base64 = "0.22"
 sha2 = "0.11"
 
 # Auth
-jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+jsonwebtoken = { version = "12.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 # Dev-only
 dotenvy = "0.15"
